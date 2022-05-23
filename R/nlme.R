@@ -436,8 +436,7 @@ nmObjGetFoceiControl.nlme <- function(x, ...) {
   # - $origData -- Original Data
   # - $dataSav -- Processed data from .foceiPreProcessData
   # - $idLvl -- Level information for ID factor added
-  # - $ui for ui object
-  # - $fullTheta Full theta information
+  # - $ui for ui fullTheta Full theta information
   # - $etaObf data frame with ID, etas and OBJI
   # - $cov For covariance
   # - $covMethod for the method of calculating the covariance
@@ -515,9 +514,6 @@ nmObjGetFoceiControl.nlme <- function(x, ...) {
 #' @rdname nlmixr2Est
 #' @export
 nlmixr2Est.nlme <- function(env, ...) {
-  .op <- options() # nolint
-  options(nlmixr2.saemMuRefCov=FALSE) # nolint
-  on.exit(options(.op), add=TRUE) # nolint
   .ui <- env$ui
   rxode2::assertRxUiMixedOnly(.ui, " for the estimation routine 'nlme', try 'focei'", .var.name=.ui$modelName)
   rxode2::assertRxUiNormal(.ui, " for the estimation routine 'nlme'", .var.name=.ui$modelName)

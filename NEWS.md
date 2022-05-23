@@ -1,4 +1,21 @@
-# nlmixr2est 1.0.0 -- new package
+# nlmixr2est 2.0.7
+
+- Use `.zeros()` for the matrices in armadillo in addition to relying
+  on `calloc` to give zero matrices.
+  
+- Fixed one uninitialized object
+
+- Fix for `augPred` so it works on population only models
+
+- `nlme` no longer sets options to treat all covariates as non
+  mu-referenced covariates, but directly calls a function that can
+  turn on or off the mu-reference covariate selection.
+  
+- `vpcSim` now tries to simulate IDs that didn't simulate correctly (with a warning)
+
+- Export nmObjHandleControlObject
+
+# nlmixr2est 2.0.6 -- new package
 
 `nlmixr2est` contains the estimation functions within `nlmixr2`.
 
