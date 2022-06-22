@@ -7,6 +7,7 @@
 #include <RcppArmadillo.h>
 #include <rxode2.h>
 #include "utilc.h"
+#include "censEst.h"
 
 #ifdef ENABLE_NLS
 #include <libintl.h>
@@ -15,6 +16,8 @@
 #else
 #define _(String) (String)
 #endif
+
+#define PHI(x) 0.5*(1.0+erf((x)/M_SQRT2))
 
 
 #ifndef __SAEM_CLASS_RCPP_HPP__
@@ -753,6 +756,9 @@ public:
       RSprintf("initialization successful\n");
     }
     fsaveMat = user_fn(phiM, evtM, optM);
+    limit = fsaveMat.col(2);
+    limitT = fsaveMat.col(2);
+    cens = fsaveMat.col(1);
     fsave = fsaveMat.col(0);
     if (DEBUG>0){
       RSprintf("initial user_fn successful\n");
@@ -796,6 +802,7 @@ public:
         vec yt = yM;
         for (int i = ft.size(); i--;) {
           int cur = ix_endpnt(i);
+          limitT[i] = _powerD(limit[i], lambda(cur), yj(cur), low(cur), hi(cur));
           ft(i)   = _powerD(f(i), lambda(cur), yj(cur), low(cur), hi(cur));
           yt(i)   = _powerD(yM(i), lambda(cur), yj(cur), low(cur), hi(cur));
           ftT(i)  = handleF(propT(cur), ft(i), f(i), false, true);
@@ -810,6 +817,7 @@ public:
         g.elem( find(g > xmax)).fill(xmax);
 
         DYF(indioM)=0.5*(((yt-ft)/g)%((yt-ft)/g)) + log(g);
+        doCens(DYF, cens, limitT, f, g, yM);
       } else if (distribution == 2){
         DYF(indioM)=-yM%log(f)+f;
       } else if (distribution == 3) {
@@ -1815,6 +1823,7 @@ private:
   mat fsaveMat;
   vec cens;
   vec limit;
+  vec limitT;
   vec fsave;
 
   int DEBUG;
@@ -1835,23 +1844,9 @@ private:
     mphi1.mprior_phiM = repmat(mprior_phi1,nmc,1);
   }
 
-  void doCens(mat &DYF, vec &cens, vec &limit, vec &fc, vec &r, const vec &dv, int &distribution) {
+  static inline void doCens(mat &DYF, vec &cens, vec &limit, vec &fc, vec &r, const vec &dv) {
     for (int j = (int)cens.size(); j--;) {
-      double lim = limit[j];
-      if (distribution == 4) {
-        lim = log(lim);
-      }
-      if (cens[j] == 0.0) {
-        // M2 adds likelihood even when the observation is defined
-        if (R_FINITE(lim) && !ISNA(lim)) {
-          DYF(j) = DYF(j) - log(1.0 - 0.5*(1.0 + erf(((lim<fc[j])*2.0 - 1.0)*(lim - fc[j])/sqrt(r[j])/M_SQRT2)));
-        }
-      } else if (cens[j] == 1.0 || cens[j] == -1.0) {
-        DYF(j) = log(0.5*(1+erf(((double)(cens[j])*(dv[j]-fc[j]))/sqrt(r[j])/M_SQRT2)));
-        if (R_FINITE(lim) && !ISNA(lim)) {
-          DYF(j) = DYF(j) - log(1.0 - 0.5*(1.0 + erf((double)(cens[j])*(lim - fc[j])/sqrt(r[j])/M_SQRT2)));
-        }
-      }
+      DYF(j) = doCensNormal1(cens[j], dv[j], limit[j], DYF(j), fc[j], r[j], 0);
     }
   }
 
@@ -1867,6 +1862,7 @@ private:
     vec fc, fs, Uc_y, Uc_phi, deltu;
     uvec ind;
     vec gc;
+
     uvec i=mphi.i;
     double double_xmin = 1.0e-200;                               //FIXME hard-coded xmin, also in neldermean.hpp
     double xmax = 1e300;
@@ -1887,15 +1883,20 @@ private:
         }
 
         fcMat = user_fn(phiMc, mx.evtM, mx.optM);
+        limit = fcMat.col(2);
+        limitT = fcMat.col(2);
+        cens = fcMat.col(1);
+
         fc = fcMat.col(0);
         vec fcT(fc.size());
         fs = fc;
         vec yt(fc.size());
         for (int i = fc.size(); i--;) {
           int cur = ix_endpnt(i);
-          fc(i)  = _powerD(fc(i), lambda(cur), yj(cur), low(cur), hi(cur));
-          yt(i)  = _powerD(mx.yM(i), lambda(cur), yj(cur), low(cur), hi(cur));
-          fcT(i) = handleF(propT(cur), fs(i), fc(i), false, true);
+          limitT[i] = _powerD(limit[i], lambda(cur), yj(cur), low(cur), hi(cur));
+          fc(i)     = _powerD(fc(i), lambda(cur), yj(cur), low(cur), hi(cur));
+          yt(i)     = _powerD(mx.yM(i), lambda(cur), yj(cur), low(cur), hi(cur));
+          fcT(i)    = handleF(propT(cur), fs(i), fc(i), false, true);
         }
         gc = vecares + vecbres % abs(fcT); //make sure gc > 0
         gc.elem( find( gc == 0.0) ).fill(1);
@@ -1913,7 +1914,7 @@ private:
           DYF(mx.indioM)=-mx.yM%log(fc)-(1-mx.yM)%log(1-fc);
           break;
         }
-        doCens(DYF, cens, limit, fc, gc, mx.yM, distribution);
+        doCens(DYF, cens, limitT, fc, gc, mx.yM);
 
         Uc_y=sum(DYF,0).t();
         if (method==1) {
@@ -2084,6 +2085,19 @@ mv_t rxModelVarsS;
 
 void setupRx(List &opt, SEXP evt, SEXP evtM) {
   RObject obj = opt[".rx"];
+  bool doIni = false;
+  if (getRx_ == NULL) {
+    getRx_ = (getRxSolve_t) R_GetCCallable("rxode2","getRxSolve_");
+    getTimeS = (getTime_t) R_GetCCallable("rxode2", "getTime");
+    getRxLhs = (getRxLhs_t) R_GetCCallable("rxode2","getRxLhs");
+    sortIds = (sortIds_t) R_GetCCallable("rxode2", "sortIds");
+    getUpdateInis = (getUpdateInis_t) R_GetCCallable("rxode2", "getUpdateInis");
+    saem_solve = (par_solve_t) R_GetCCallable("rxode2","par_solve");
+    iniSubjectE = (iniSubjectE_t) R_GetCCallable("rxode2","iniSubjectE");
+    rxGetIdS = (rxGetId_t) R_GetCCallable("rxode2", "rxGetId");
+    rxModelVarsS = (mv_t)R_GetCCallable("rxode2", "_rxode2_rxModelVars_");
+    doIni=true;
+  }
   List mv = rxModelVarsS(obj);
   parNames = mv[RxMv_params];
 
@@ -2122,6 +2136,7 @@ SEXP saem_do_pred(SEXP in_phi, SEXP in_evt, SEXP in_opt) {
   setupRx(opt, in_evt, in_evt);
   saem_lhs = getRxLhs();
   saem_inis = getUpdateInis();
+  _rx=getRx_();
   mat phi = as<mat>(in_phi);
   mat evt = as<mat>(in_evt);
   mat gMat = user_function(phi, evt, opt);
