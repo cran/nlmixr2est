@@ -173,7 +173,8 @@ print.nlmixr2FitCore <- function(x, ...) {
     cat(cli::cli_format_method({
       .h2(paste0(
         crayon::bold$blue("nlmix"),
-        crayon::bold$red("r"), " ",
+        crayon::bold$red(paste0("r", ifelse(use.utf(), "\u00B2"), "")), " ",
+        crayon::bold(ifelse(any(x$ui$predDf$distribution != "norm"), "log-likelihood ", "")),
         crayon::bold$yellow(x$method),
         x$extra, x$posthoc
       ))
@@ -254,10 +255,14 @@ print.nlmixr2FitCore <- function(x, ...) {
     }
     cat(paste(.pf, collapse = "\n"), "\n")
     ## Correlations
-    cat(paste0(
-      "  Covariance Type (", crayon::yellow(.bound), crayon::bold$blue("$covMethod"), "): ",
-      crayon::bold(x$covMethod), "\n"
-    ))
+    .covMethod <- x$covMethod
+    if (!checkmate::testCharacter(.covMethod, len=1)) .covMethod <- ""
+    if (.covMethod != "") {
+      cat(paste0(
+        "  Covariance Type (", crayon::yellow(.bound), crayon::bold$blue("$covMethod"), "): ",
+        crayon::bold(x$covMethod), "\n"
+      ))
+    }
     if (exists("covList", x$env)) {
       cat("    other calculated covs (", crayon::bold$blue("setCov()"), "): ",
         paste(crayon::bold(names(x$env$covList)), collapse = ", "),
@@ -284,19 +289,19 @@ print.nlmixr2FitCore <- function(x, ...) {
           cat("  Correlations in between subject variability (BSV) matrix:\n")
           .getCorPrint(x$omegaR)
         }
-        if (.boundChar * 2 + 70 < .width & !.noEta) {
+        if (.boundChar * 2 + 70 < .width && !.noEta) {
           cat(paste0("  Full BSV covariance (", crayon::yellow(.bound), crayon::bold$blue("$omega"), ") or correlation (", crayon::yellow(.bound), crayon::bold$blue("$omegaR"), "; diagonals=SDs)"), "\n")
         } else if (!.noEta) {
           if (.boundChar + 43 < .width) {
             cat(paste0("  Full BSV covariance (", crayon::yellow(.bound), crayon::bold$blue("$omega"), ")"), "\n")
-            cat("    or correlation (", crayon::yellow(.bound), crayon::bold$blue("$omegaR"), "; diagonals=SDs)", "\n")
+            cat(paste0("    or correlation (", crayon::yellow(.bound), crayon::bold$blue("$omegaR"), "; diagonals=SDs)", "\n"))
           } else {
             cat(paste0("  Full BSV covariance (", crayon::bold$blue("$omega"), ")\n"))
-            cat("    or correlation (", crayon::bold$blue("$omegaR"), "; diagonals=SDs)\n")
+            cat(paste0("    or correlation (", crayon::bold$blue("$omegaR"), "; diagonals=SDs)\n"))
           }
         }
       }
-      if (.boundChar + 74 < .width & !.noEta) {
+      if (.boundChar + 74 < .width && !.noEta) {
         cat(paste0(
           "  Distribution stats (mean/skewness/kurtosis/p-value) available in ",
           crayon::yellow(.bound), crayon::bold$blue("$shrink")
@@ -308,6 +313,21 @@ print.nlmixr2FitCore <- function(x, ...) {
         ), "\n")
       }
     }
+
+    if (length(x$runInfo) > 0) {
+      cat(paste0("  Information about run found (", crayon::yellow(.bound),
+                 crayon::bold$blue("$runInfo"), "):\n"))
+      lapply(x$runInfo, function(msg) {
+        cat("  ", cli::cli_format_method({
+          cli::cli_li(msg)
+        }), "\n")
+      })
+    }
+    cat(paste0(
+      "  Censoring (", crayon::yellow(.bound), crayon::bold$blue("$censInformation"), "): ",
+      as.character(x$censInformation), "\n"
+    ))
+
 
     if (x$message != "") {
       cat(paste0("  Minimization message (", crayon::yellow(.bound), crayon::bold$blue("$message"), "): "), "\n")
@@ -371,10 +391,13 @@ print.nlmixr2FitCore <- function(x, ...) {
   } else {
     .bound <- ""
   }
-  .c <- c(paste0(
-    "  Covariance Type (", .bound, "$covMethod): ",
-    x$covMethod
-  ))
+  .c <- NULL
+  if (x$covMethod != "") {
+    .c <- c(.c, paste0(
+      "  Covariance Type (", .bound, "$covMethod): ",
+      x$covMethod
+    ))
+  }
   if (is.na(get("objective", x$env))) {
     .c <- c(
       .c,
@@ -388,6 +411,13 @@ print.nlmixr2FitCore <- function(x, ...) {
         .bound
       )
     )
+  }
+  .c <- c(.c, paste0(
+    "  Censoring: ",
+    as.character(x$censInformation)))
+  if (length(x$runInfo) > 0) {
+    .c <- c(.c, paste0("  Information about run found in (", .bound, "$runInfo):"),
+            paste0("    ", x$runInfo))
   }
   if (x$message != "") {
     .c <- c(

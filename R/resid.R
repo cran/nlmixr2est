@@ -27,6 +27,25 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
 }
 #attr(nmObjGet.foceiThetaEtaParameters, "desc") <- "nmObjGet.foceiThetaEtaParameters"
 
+#' This adjusts the names in the IPRED data frame to calculate censoring output correctly
+#'
+#' @param df ipred data frame
+#'
+#' @return ipred data frame with lower names dv, evid, cens, and limit
+#'   in lower case (regardless of input)
+#'
+#' @author Matthew L. Fidler
+#' @noRd
+.residAdjustIpredNames <- function(df) {
+  for (.v in c("dv", "evid", "cens", "limit")) {
+    .w <- which(tolower(names(df)) == .v)
+    if (length(.w) == 1L) {
+      names(df)[.w] <- .v
+    }
+  }
+  df
+}
+
 
 #' Solve making sure that ID is dropped
 #'
@@ -65,45 +84,85 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     stop("cannot solve with `model` NULL", call.=FALSE)
   }
   keep <- unique(c(keep, "nlmixrRowNums"))
-  .res <- .foceiSolveWithId(model, pars, fit$dataSav,
-                            returnType = returnType,
-                            atol = fit$atol[1], rtol = fit$rtol[1],
-                            maxsteps = fit$maxstepsOde,
-                            hmin = fit$hmin, hmax = fit$hmax, hini = fit$hini,
-                            maxordn = fit$maxordn,
-                            maxords = fit$maxords, method = fit$methodOde,
-                            keep=keep, addDosing=addDosing, subsetNonmem=subsetNonmem, addCov=addCov)
-  rxode2::rxSolveFree()
-  if (any(is.na(.res$rx_pred_)) && fit$methodOde == 2L) {
-    .res <- .foceiSolveWithId(model, pars, fit$dataSav,
-                              returnType = returnType,
-                              atol = fit$atol[1], rtol = fit$rtol[1],
-                              maxsteps = fit$maxstepsOde * 2,
-                              hmin = fit$hmin, hmax = fit$hmax / 2, hini = fit$hini,
-                              maxordn = fit$maxordn,
-                              maxords = fit$maxords, method = "lsoda",
-                              keep=keep, addDosing=addDosing, subsetNonmem=subsetNonmem, addCov=addCov)
-    rxode2::rxSolveFree()
-    if (any(is.na(.res$rx_pred_))) {
+  # The numeric versions are at
+  # https://github.com/nlmixr2/rxode2/blob/7e27a7842ca0b5dd849ea75833bc7c34be729e31/R/rxsolve.R#L804,
+  # but keeping them in sync will be fragile.  Only using the character
+  # versions.
+  currentOdeMethod <- fit$methodOde
+  if (!inherits(currentOdeMethod, "character")) {
+    cur <- as.integer(currentOdeMethod)+1L
+    attr(cur, "levels") <- c("dop853", "lsoda", "liblsoda", "indLin")
+    attr(cur, "class") <- "factor"
+    currentOdeMethod <- as.character(cur)
+  }
+  allOdeMethods <-
+    setdiff(
+      eval(formals(rxode2::rxSolve)$method),
+      # ignore indLin for now
+      "indLin"
+    )
+  # Fallback methods based on discussion in
+  # https://github.com/nlmixr2/nlmixr2est/issues/254
+  if (currentOdeMethod %in% "dop853") {
+    allOdeMethods <- "liblsoda"
+  } else if (currentOdeMethod %in% c("liblsoda", "lsoda")) {
+    allOdeMethods <- "dop853"
+  } # otherwise, use all the methods
+  odeMethods <-
+    append(
+      list(currentOdeMethod),
+      as.list(setdiff(allOdeMethods, currentOdeMethod))
+    )
+  failedMethods <- character()
+  isFirstFit <- TRUE
+  recalc <- TRUE
+  maxAtolRtol <- fit$foceiControl$rxControl$maxAtolRtolFactor
+  recalcFactor <- fit$foceiControl$odeRecalcFactor
+  while (recalc & length(odeMethods) > 0) {
+    # Iterate through ODE methods
+    recalcN <- 0
+    currentOdeMethod <- odeMethods[[1]]
+    odeMethods <- odeMethods[-1]
+    .atol <- fit$atol[1]
+    .rtol <- fit$rtol[1]
+    ## message(currentOdeMethod)
+    while (recalc & recalcN < fit$foceiControl$stickyRecalcN) {
+      # Iterate up atol/rtol
+      ## message("\t", .atol, " ", .rtol)
       .res <- .foceiSolveWithId(model, pars, fit$dataSav,
                                 returnType = returnType,
-                                atol = fit$atol[1], rtol = fit$rtol[1],
-                                maxsteps = fit$maxstepsOde * 2,
-                                hmin = fit$hmin, hmax = fit$hmax / 2, hini = fit$hini,
-                                maxordn = fit$maxordn,
-                                maxords = fit$maxords, method = "dop853",
+                                atol = .atol, rtol = .rtol,
+                                maxsteps = fit$maxstepsOde,
+                                hmin = fit$hmin, hmax = fit$hmax, hini = fit$hini,
+                                maxordn = fit$maxordn, maxords = fit$maxords,
+                                method = rxode2::odeMethodToInt(currentOdeMethod),
                                 keep=keep, addDosing=addDosing, subsetNonmem=subsetNonmem, addCov=addCov)
       rxode2::rxSolveFree()
-      if (any(is.na(.res$rx_pred_))) {
-        warning("Problems solving ", what, " liblsoda, lsoda and dop853")
-      } else {
-        warning("Problems solving ", what, " liblsoda and lsoda switched to dop853")
+      recalc <- any(is.na(.res$rx_pred_))
+      recalcN <- recalcN + 1
+      if (recalc) {
+        .atol <- min(.atol*recalcFactor, maxAtolRtol)
+        .rtol <- min(.rtol*recalcFactor, maxAtolRtol)
+        if (.atol == maxAtolRtol && .rtol == maxAtolRtol) {
+          recalcN <- fit$foceiControl$stickyRecalcN + 1
+        }
       }
-    } else {
-      warning("Problems solving ", what, " liblsoda switched to lsoda")
+    }
+    if (recalc) {
+      failedMethods <- c(failedMethods, currentOdeMethod)
+    }
+    if (isFirstFit) {
+      isFirstFit <- FALSE
+      .resFirst <- .res
     }
   }
-  return(.res)
+  if (recalc) {
+    .res <- .resFirst
+    warning("Problems solving ", what, " with ", paste(failedMethods, collapse = ", "), ", returning results from the first method")
+  } else if (length(failedMethods) > 0) {
+    warning("Problems solving ", what, " with ", paste(failedMethods, collapse = ", "), ", returning results from ", currentOdeMethod)
+  }
+  .res
 }
 
 #' Create a ipred/pred list from the focei style model
@@ -115,7 +174,10 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
 #' @return list with ipred and pred datasets
 #' @author Matthew Fidler
 #' @noRd
-.foceiPredIpredList <- function(fit, data=fit$dataSav, thetaEtaParameters=fit$foceiThetaEtaParameters, keep=NULL, predOnly=is.null(fit$innerModel),
+.foceiPredIpredList <- function(fit, data=fit$dataSav,
+                                thetaEtaParameters=fit$foceiThetaEtaParameters,
+                                keep=NULL,
+                                predOnly=is.null(fit$innerModel),
                                 addDosing=FALSE, subsetNonmem=TRUE) {
   keep <- unique(c(keep, "nlmixrRowNums"))
   if (!predOnly && is.null(fit$innerModel)) {
@@ -137,9 +199,10 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
   if (predOnly) {
     .ipredModel <- fit$ipredModel
   }
-  .ret <- list(ipred = .foceiSolvePars(fit, .ipredModel, thetaEtaParameters$ipred,
-                                       returnType="data.frame.TBS", keep=.keep, what="ipred",
-                                       addDosing=addDosing, subsetNonmem=subsetNonmem, addCov=predOnly),
+  .ret <- list(ipred = .residAdjustIpredNames(
+    .foceiSolvePars(fit, .ipredModel, thetaEtaParameters$ipred,
+                    returnType="data.frame.TBS", keep=.keep, what="ipred",
+                    addDosing=addDosing, subsetNonmem=subsetNonmem, addCov=predOnly)),
                pred = .foceiSolvePars(fit, .ipredModel, thetaEtaParameters$pred,returnType="data.frame", what="pred",
                                       addDosing=addDosing, subsetNonmem=subsetNonmem),
                etaLst=thetaEtaParameters$eta.lst)
@@ -182,6 +245,7 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
   }
 
   if (npde) {
+    .ni <- fit$dataNormInfo
     .sim <- vpcSim(fit, n = table$nsim, seed = table$seed,
                    addDosing=addDosing, subsetNonmem=subsetNonmem)
     .w <- which(names(.sim) == "ipred")
@@ -189,22 +253,34 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     .w <- which(names(.sim) == "sim")
     .n0 <- c(names(.sim)[seq(1, .w)], "rxLambda", "rxYj", "rxLow", "rxHi")
     .sim <- .sim[, .n0]
-    .Call(`_nlmixr2est_npdeCalc`, .sim, .prdLst$ipred$dv, .prdLst$ipred$evid,
-          .prdLst$ipred$cens, .prdLst$ipred$limit, table)
+    .ipred <- .prdLst$ipred
+    .ipred <- .ipred[.ipred$nlmixrRowNums %in% .ni$nlmixrRowNums, ]
+    .ipred <- .ipred[order(.ipred$nlmixrRowNums), ]
+    .ret <- .Call(`_nlmixr2est_npdeCalc`, .sim, .ipred$dv, .ipred$evid,
+                  .prdLst$ipred$cens, .prdLst$ipred$limit, table)
+    .df <- data.frame(nlmixrRowNums=.prdLst$ipred$nlmixrRowNums)
+    .ret1 <- .ret[[1]]
+    .ret2 <- .ret[[2]]
+    .ret2$nlmixrRowNums <- .ipred$nlmixrRowNums
+    .ret2 <- merge(.df, .ret2, all.x=TRUE, by="nlmixrRowNums")
+    .ret2 <- .ret2[,names(.ret2) != "nlmixrRowNums"]
+    .ret1 <- as.data.frame(.ret1)
+    .ret1$nlmixrRowNums <- .ipred$nlmixrRowNums
+    .ret1 <- merge(.df, .ret1, all.x=TRUE, by="nlmixrRowNums")
+    .ret1 <- .ret1[,names(.ret1) != "nlmixrRowNums"]
+    .ret1 <- as.matrix(.ret1)
+    list(.ret1, .ret2)
   } else {
-    if (predOnly){
+    if (predOnly) {
       .state <- c(fit$predOnlyModel$state, fit$predOnlyModel$stateExtra)
       .lhs <- setdiff(unique(.getRelevantLhs(fit, keep, .prdLst$ipred)), .state)
-      .params <- setdiff(intersect(names(fit$dataSav),fit$predOnlyModel$params),c("CMT","cmt","Cmt", .state, .lhs))
+      .params <- setdiff(intersect(names(fit$dataSav),fit$predOnlyModel$params),
+                         c("CMT","cmt","Cmt", .state, .lhs))
       .Call(`_nlmixr2est_resCalc`, .prdLst, fit$omega,
             fit$eta, .prdLst$ipred$dv, .prdLst$ipred$evid, .prdLst$ipred$cens,
             .prdLst$ipred$limit, .lhs, .state, .params, fit$IDlabel, table)
     } else {
       .state <- c(fit$predOnlyModel$state, fit$predOnlyModel$stateExtra)
-      ## .stateSave <- vapply(.state, function(s){
-      ##   regexpr("^rx__sens_", s) == -1
-      ## }, logical(1), USE.NAMES=FALSE)
-      ## .state <- .state[.stateSave]
       .lhs <- setdiff(unique(.getRelevantLhs(fit, keep, .prdLst$predOnly)), .state)
       .params <- setdiff(intersect(names(fit$dataSav),fit$predOnlyModel$params),c("CMT","cmt","Cmt", .state, .lhs))
       .Call(`_nlmixr2est_cwresCalc`, .prdLst, fit$omega,
@@ -260,9 +336,15 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     .n <- length(.eta) - 1
     .thetas <- c(.thetas, setNames(rep(0, .n), paste0("ETA[", seq_len(.n), "]")))
   }
-  .ipred <- .foceiSolvePars(fit, fit$ipredModel, .thetas,
-                            returnType="data.frame.TBS", keep=.keep, what="ipred",
-                            addDosing=addDosing, subsetNonmem=subsetNonmem)
+  .pars <- fit$ipredModel$params
+  .cmt <- which(tolower(.pars) == "cmt")
+  if (length(.cmt) == 1) {
+    .cmt <-.pars[.cmt]
+    .keep <- c(.cmt, .keep)
+  }
+  .ipred <- .residAdjustIpredNames(.foceiSolvePars(fit, fit$ipredModel, .thetas,
+                                                   returnType="data.frame.TBS", keep=.keep, what="ipred",
+                                                   addDosing=addDosing, subsetNonmem=subsetNonmem))
   if (!inherits(dv, "numeric")) {
     dv <- .ipred$dv
     table$doSim <- TRUE
@@ -391,6 +473,8 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
 addTable <- function(object, updateObject = FALSE, data=object$dataSav, thetaEtaParameters=object$foceiThetaEtaParameters,
                      table=tableControl(), keep=NULL, drop=NULL,
                      envir = parent.frame(1)) {
+  assignInMyNamespace(".finalUiCompressed", FALSE)
+  on.exit(assignInMyNamespace(".finalUiCompressed", TRUE))
   nlmixrWithTiming("table", {
     keep <- unique(c(keep, "nlmixrRowNums"))
     .malert("Calculating residuals/tables")

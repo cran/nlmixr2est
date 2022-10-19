@@ -23,6 +23,60 @@ nmObjGet <- function(x, ...) {
   UseMethod("nmObjGet")
 }
 
+#' @export
+nmObjGet.iniUi <- function(x, ...) {
+  .env <- x[[1]]
+  .ui <- .cloneEnv(rxode2::rxUiDecompress(get("ui", .env)))
+  .iniDf <- get("iniDf0", envir=.env)
+  if (is.null(.iniDf)) return(NULL)
+  assign("iniDf", .iniDf, envir=.ui)
+  rxode2::rxUiCompress(.ui)
+}
+attr(nmObjGet.iniUi, "desc") <- "The initial ui used to run the model"
+
+
+.finalUiCompressed <- TRUE
+
+#' Set if the nlmixr2 object will return a compressed ui
+#'
+#' 
+#' @param type is a boolean indicating if the compressed ui will be
+#'   returned (`TRUE`) or not be returned (`FALSE`)
+#' @return invisible logical type
+#' @author Matthew L. Fidler
+#' @export
+#' @examples
+#' 
+#' nmObjUiSetCompressed(FALSE) # now the $ui will return an environment
+#' nmObjUiSetCompressed(TRUE) # now the $ui will return a compressed value
+#' 
+nmObjUiSetCompressed <- function(type) {
+  checkmate::assertLogical(type,len=1, any.missing=FALSE)
+  assignInMyNamespace(".finalUiCompressed", type)
+  invisible(type)
+}
+
+#' @export
+nmObjGet.finalUi <- function(x, ...) {
+  .env <- x[[1]]
+  .ui <- .cloneEnv(rxode2::rxUiDecompress(get("ui", .env)))
+  if (.finalUiCompressed) {
+    rxode2::rxUiCompress(.ui)
+  } else {
+    rxode2::rxUiDecompress(.ui)
+  }
+}
+attr(nmObjGet.finalUi, "desc") <- "The final ui used to run the model"
+
+#' @export
+nmObjGet.finalUiEnv <- function(x, ...) {
+  .env <- x[[1]]
+  .cloneEnv(rxode2::rxUiDecompress(get("ui", .env)))
+}
+
+#' @export
+nmObjGet.ui <- nmObjGet.finalUi
+
 #' Get an item from a nlmixr2FitData object
 #'
 #' @param x A specialized list with:
@@ -39,6 +93,52 @@ nmObjGetData <- function(x, ...) {
     stop("'x' is wrong type for 'nmObjGetData'", call.=FALSE)
   }
   UseMethod("nmObjGetData")
+}
+
+#' @export
+nmObjGetData.dataLloq <- function(x, ...) {
+  .fit <- x[[1]]
+  .df <- as.data.frame(.fit)
+  if (!any(names(.df) == "CENS")) return(NULL)
+  if (!any(names(.df) == "upperLim")) return(NULL)
+  .w <- which(.df$CENS == 1)
+  if (length(.w) == 0) return(NULL)
+  mean(.df$upperLim[.w])
+}
+
+#' @export
+nmObjGetData.dataUloq <- function(x, ...) {
+  .fit <- x[[1]]
+  .df <- as.data.frame(.fit)
+  if (!any(names(.df) == "CENS")) return(NULL)
+  if (!any(names(.df) == "lowerLim")) return(NULL)
+  .w <- which(.df$CENS == -1)
+  if (length(.w) == 0) return(NULL)
+  mean(.df$lowerLim[.w])
+}
+
+#' @export
+nmObjGet.dataNormInfo <- function(x, ...) {
+  .fit <- x[[1]]
+  .ui <- .fit$ui
+  .datSav <- .fit$dataSav
+  .predDf <-.ui$predDf
+  if (all(.predDf$dist %in% c("norm", "dnorm","t", "cauchy"))) {
+    return(list(filter=rep(TRUE, length(.datSav[,1])),
+                 nnorm=length(.datSav[,1]),
+                 nlik=0,
+                 nother=0,
+                 nlmixrRowNums=.datSav$nlmixrRowNums))
+  }
+  .ret <- .Call(`_nlmixr2est_filterNormalLikeAndDoses`,
+                .datSav$CMT, .predDf$distribution, .predDf$cmt)
+  .ret$nlmixrRowNums <- .datSav[.ret$filter, "nlmixrRowNums"]
+  .ret
+}
+
+#' @export
+nmObjGet.warnings <-function(x, ...) {
+  get("runInfo", x[[1]])
 }
 
 ##' @export
@@ -58,6 +158,10 @@ nmObjGet.default <- function(x, ...) {
   }
   # Now get the ui, install the control object temporarily and use `rxUiGet`
   .ui <- get("ui", envir=.env)
+  .ui <- rxode2::rxUiDecompress(.ui)
+  on.exit({
+    assign("ui", rxode2::rxUiCompress(.ui), envir=.env)
+  })
   .ctl <- nmObjGetControl(.createEstObject(x[[1]]), ...)
   if (!is.null(.ctl)) {
     assign("control", .ctl, envir=.ui)
@@ -106,7 +210,72 @@ attr(nmObjGet.omegaR, "desc") <- "correlation matrix of omega"
 
 #' @rdname nmObjGet
 #' @export
-nmObjGet.dataSav <- function(x, ...){
+nmObjGet.phiR <- function(x, ...) {
+  .obj <- x[[1]]
+  .phi <- .obj$phiC
+  if (is.null(.phi)) return(NULL)
+  .ret <- lapply(seq_along(.phi), function(i) {
+    .cov <- .phi[[i]]
+    .d <- diag(.cov)
+    if (any(.d == 0) || any(!is.finite(.d))) {
+      .d1 <- length(.d)
+      return(matrix(rep(NA, .d1*.d1), .d1, .d1))
+    }
+    .sd2 <- sqrt(diag(.cov))
+    .cor <- stats::cov2cor(.cov)
+    dimnames(.cor) <- dimnames(.cov)
+    diag(.cor) <- .sd2
+    .cor
+  })
+  names(.ret) <- names(.phi)
+  .ret
+}
+attr(nmObjGet.phiR, "desc") <- "correlation matrix of each individual's eta (if present)"
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.phiSE <- function(x, ...) {
+  .obj <- x[[1]]
+  .phi <- .obj$phiC
+  if (is.null(.phi)) return(NULL)
+  .ret <- as.data.frame(t(vapply(seq_along(.phi), function(i) {
+    .cov <- .phi[[i]]
+    suppressWarnings(sqrt(diag(.cov)))
+  }, double(dim(.phi[[1]])[1]))))
+  names(.ret) <- paste0("se(", names(.ret), ")")
+  .id <- seq_along(.phi)
+  if (!is.null(names(.phi))) {
+    .id <- names(.phi)
+  }
+  cbind(data.frame(ID=.id), .ret)
+}
+attr(nmObjGet.phiSE, "desc") <- "standard error of each individual's eta (if present)"
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.phiRSE <- function(x, ...) {
+  .obj <- x[[1]]
+  .phi <- .obj$phiC
+  .eta <- .obj$eta[,-1]
+  if (is.null(.phi)) return(NULL)
+  .ret <- as.data.frame(t(vapply(seq_along(.phi), function(i) {
+    .cov <- .phi[[i]]
+    suppressWarnings(sqrt(diag(.cov))/unlist(.eta[i,])*100)
+  }, double(dim(.phi[[1]])[1]))))
+  names(.ret) <- paste0("rse(", names(.ret), ")%")
+  .id <- seq_along(.phi)
+  if (!is.null(names(.phi))) {
+    .id <- names(.phi)
+  }
+  cbind(data.frame(ID=.id), .ret)
+}
+attr(nmObjGet.phiRSE, "desc") <- "relative standard error of each individual's eta (if present)"
+
+
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.dataSav <- function(x, ...) {
   .obj <- x[[1]]
   .objEnv <- .obj$env
   if (exists("dataSav", .objEnv)) return(get("dataSav", envir=.objEnv))
@@ -140,6 +309,9 @@ nmObjGet.idLvl <- function(x, ...){
   .env      <- obj$env
   .origData <- obj$origData
   .origData$nlmixrRowNums <- seq_along(.origData[, 1])
+  if (exists("llikObs", obj$env)) {
+      .origData$nlmixrLlikObs <- obj$env$llikObs
+  }
   .fitData <- as.data.frame(obj)
   if (is.null(.fitData$EVID)) .fitData$EVID <- 0
   if (is.null(.fitData$AMT))  .fitData$AMT  <- 0
@@ -333,7 +505,7 @@ nmObjGet.saemEvtMDf <- function(x, ...) {
   .nmc <- nmObjGet.saemNmc(x, ...)
   if (is.na(.nmc)) stop("cannot figure out the number of mcmc simulations", call.=FALSE)
   .evt <- nmObjGet.saemEvtDf(x, ...)
-  .evtM <- .evt[rep(1:dim(.evt)[1], .nmc), ]
+  .evtM <- .evt[rep(seq_len(dim(.evt)[1]), .nmc), ]
   .evtM$ID <- cumsum(c(FALSE, diff(.evtM$ID) != 0))
   .evtM
 }

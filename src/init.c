@@ -54,7 +54,7 @@ SEXP _nlmixr2est_foceiCalcCov(SEXP);
 SEXP _nlmixr2est_foceiFitCpp_(SEXP);
 SEXP _nlmixr2est_boxCox_(SEXP, SEXP, SEXP);
 SEXP _nlmixr2est_iBoxCox_(SEXP, SEXP, SEXP);
-SEXP _nlmixr2est_freeFocei();
+SEXP _nlmixr2est_freeFocei(void);
 SEXP _nlmixr2est_nlmixr2Gill83_(SEXP, SEXP, SEXP, SEXP, SEXP,
 			   SEXP, SEXP, SEXP, SEXP);
 
@@ -80,8 +80,21 @@ SEXP _saemResidF(SEXP v);
 
 SEXP _nlmixr2est_nlmixrExpandFdParNlme_(SEXP, SEXP);
 
+//SEXP _nlmixr2est_nmNearPD_()
+SEXP _nlmixr2est_nmNearPD_(SEXP, SEXP, SEXP, SEXP, SEXP,
+                           SEXP, SEXP, SEXP, SEXP, SEXP);
+
+SEXP _nlmixr2est_filterNormalLikeAndDoses(SEXP, SEXP, SEXP);
+
+SEXP _nlmixr2est_rxode2hasLlik(void);
+
+typedef SEXP (*_rxode2random_rxRmvnSEXP_t)(SEXP nSSEXP, SEXP muSSEXP, SEXP sigmaSSEXP, SEXP lowerSSEXP, SEXP upperSSEXP, SEXP ncoresSSEXP, SEXP isCholSSEXP, SEXP keepNamesSSEXP, SEXP aSSEXP, SEXP tolSSEXP, SEXP nlTolSSEXP, SEXP nlMaxiterSSEXP);
+_rxode2random_rxRmvnSEXP_t rxRmvnSEXPnlmixrEst;
+
 static const R_CallMethodDef CallEntries[] = {
+  {"_nlmixr2est_rxode2hasLlik", (DL_FUNC) &_nlmixr2est_rxode2hasLlik, 0},
   {"_nlmixr2est_freeFocei", (DL_FUNC) &_nlmixr2est_freeFocei, 0},
+  {"_nlmixr2est_filterNormalLikeAndDoses", (DL_FUNC) &_nlmixr2est_filterNormalLikeAndDoses, 3},
   {"neldermead_wrap",      (DL_FUNC) &neldermead_wrap,      11},
   /* {"n1qn1_wrap",           (DL_FUNC) &n1qn1_wrap,           13}, */
   {"_nlmixr2est_lin_cmt_stan",  (DL_FUNC) &_nlmixr2est_lin_cmt_stan,   9},
@@ -130,6 +143,7 @@ static const R_CallMethodDef CallEntries[] = {
   {"_nlmixr2est_calcShrinkOnly", (DL_FUNC) &_nlmixr2est_calcShrinkOnly, 3},
   {"_nlmixr2est_popResFinal", (DL_FUNC) &_nlmixr2est_popResFinal, 1},
   {"_nlmixr2est_nlmixrExpandFdParNlme_", (DL_FUNC) &_nlmixr2est_nlmixrExpandFdParNlme_, 2},
+  {"_nlmixr2est_nmNearPD_", (DL_FUNC) &_nlmixr2est_nmNearPD_, 10},
   {NULL, NULL, 0}
 };
 
@@ -139,9 +153,10 @@ void R_init_nlmixr2est(DllInfo *dll)
   R_registerRoutines(dll, CEntries, CallEntries, NULL, NULL);
   R_useDynamicSymbols(dll, TRUE);
   R_forceSymbols(dll,FALSE);
+  rxRmvnSEXPnlmixrEst = (_rxode2random_rxRmvnSEXP_t)R_GetCCallable("rxode2random","_rxode2random_rxRmvnSEXP");
 }
 
-void rxOptionsFreeFocei();
+void rxOptionsFreeFocei(void);
 void R_unload_nlmixr2est(DllInfo *info){
   rxOptionsFreeFocei();
 }

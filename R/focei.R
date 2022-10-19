@@ -263,12 +263,12 @@ rxUiGet.foceiCmtPreModel <- function(x, ...) {
 
 # This handles the errors for focei
 .createFoceiLineObject <- function(x, line) {
-  .predDf <- get("predDf", x)
+  .predDf <- rxUiGet.predDfFocei(list(x, TRUE))
   if (line > nrow(.predDf)) {
     return(NULL)
   }
   .predLine <- .predDf[line, ]
-  .ret <- list(x, .predLine)
+  .ret <- list(x, .predLine, line)
   class(.ret) <- c(paste(.predLine$distribution), "rxGetDistributionFoceiLines")
   .ret
 }
@@ -285,27 +285,80 @@ rxGetDistributionFoceiLines <- function(line) {
   UseMethod("rxGetDistributionFoceiLines")
 }
 
+.rxPredLlik <- NULL
+#' Get pred only options
+#'
+#' @param env  rxode2 environment option
+#'
+#' @return  If the current method is requesting loglik instead of pred/r
+#'  (required for cwres)
+#'
+#' @author Matthew L. Fidler
+#'
+#' @noRd
+.getRxPredLlikOption <-function() {
+  if (inherits(.rxPredLlik, "logical")) {
+    return(.rxPredLlik)
+  }
+  return(FALSE)
+}
+
 #' @export
 rxGetDistributionFoceiLines.norm <- function(line) {
   env <- line[[1]]
   pred1 <- line[[2]]
-  rxode2::.handleSingleErrTypeNormOrTFoceiBase(env, pred1)
+  .errNum <- line[[3]]
+  if (rxode2hasLlik()) {
+    rxode2::.handleSingleErrTypeNormOrTFoceiBase(env, pred1, .errNum,
+                                                 rxPredLlik=.getRxPredLlikOption())
+  } else {
+    rxode2::.handleSingleErrTypeNormOrTFoceiBase(env, pred1)
+  }
 }
 
 #' @export
 rxGetDistributionFoceiLines.t <- function(line) {
-  stop("t isn't supported yet")
+  if (rxode2hasLlik()) {
+    env <- line[[1]]
+    pred1 <- line[[2]]
+    .errNum <- line[[3]]
+    rxode2::.handleSingleErrTypeNormOrTFoceiBase(env, pred1, .errNum,
+                                                 rxPredLlik=.getRxPredLlikOption())
+  } else {
+    stop("t is not supported", call.=FALSE)
+  }
+}
+
+#' @export
+rxGetDistributionFoceiLines.cauchy <- function(line) {
+  if (rxode2hasLlik()) {
+    env <- line[[1]]
+    pred1 <- line[[2]]
+    .errNum <- line[[3]]
+    rxode2::.handleSingleErrTypeNormOrTFoceiBase(env, pred1, .errNum,
+                                                 rxPredLlik=.getRxPredLlikOption())
+  } else {
+    stop("t is not supported", call.=FALSE)
+  }
 }
 
 #' @export
 rxGetDistributionFoceiLines.default  <- function(line) {
-  stop("Distribution not supported")
+  if (rxode2hasLlik()) {
+    env <- line[[1]]
+    pred1 <- line[[2]]
+    .errNum <- line[[3]]
+    rxode2::.handleSingleErrTypeNormOrTFoceiBase(env, pred1, .errNum,
+                                                 rxPredLlik=.getRxPredLlikOption())
+  } else {
+    stop("unknown distribution", call.=FALSE)
+  }
 }
 
 #' @export
 rxGetDistributionFoceiLines.rxUi <- function(line) {
-  .predDf <- get("predDf", line)
-  lapply(seq_along(.predDf$cond), function(c){
+  .predDf <- rxUiGet.predDfFocei(list(line, TRUE))
+  lapply(seq_along(.predDf$cond), function(c) {
     .mod <- .createFoceiLineObject(line, c)
     rxGetDistributionFoceiLines(.mod)
   })
@@ -323,16 +376,38 @@ rxUiGet.foceiModel0 <- function(x, ...) {
 }
 #attr(rxUiGet.foceiModel0, "desc") <- "FOCEi model base"
 
+#' @export
+rxUiGet.foceiModel0ll <- function(x, ...) {
+  assignInMyNamespace(".rxPredLlik", TRUE)
+  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
+  .f <- x[[1]]
+  rxode2::rxCombineErrorLines(.f, errLines=rxGetDistributionFoceiLines(.f),
+                              prefixLines=.uiGetThetaEta(.f),
+                              paramsLine=NA, #.uiGetThetaEtaParams(.f),
+                              modelVars=TRUE,
+                              cmtLines=FALSE,
+                              dvidLine=FALSE)
+}
+
+
 .foceiPrune <- function(x, fullModel=TRUE) {
   .x <- x[[1]]
   .x <- .x$foceiModel0[[-1]]
   .env <- new.env(parent = emptyenv())
   .env$.if <- NULL
   .env$.def1 <- NULL
-  if (fullModel) {
-    .malert("pruning branches ({.code if}/{.code else}) of full model...")
+  if (.getRxPredLlikOption()) {
+    if (fullModel) {
+      .malert(("pruning branches ({.code if}/{.code else}) of llik full model..."))
+    } else {
+      .malert("pruning branches ({.code if}/{.code else}) of llik model...")
+    }
   } else {
-    .malert("pruning branches ({.code if}/{.code else})...")
+    if (fullModel) {
+      .malert(("pruning branches ({.code if}/{.code else}) of full model..."))
+    } else {
+      .malert("pruning branches ({.code if}/{.code else}) of model...")
+    }
   }
   .ret <- rxode2::.rxPrune(.x, envir = .env)
   .mv <- rxode2::rxModelVars(.ret)
@@ -346,12 +421,24 @@ rxUiGet.foceiModel0 <- function(x, ...) {
 }
 
 .loadSymengine <- function(newmod, promoteLinSens = TRUE, fullModel = FALSE) {
-  if (fullModel) {
-    .malert("loading full model into {.pkg symengine} environment...")
+  if (.getRxPredLlikOption()) {
+    if (fullModel) {
+      .malert("loading full llik model into {.pkg symengine} environment...")
+    } else {
+      .malert("loading llik model into {.pkg symengine} environment...")
+    }
   } else {
-    .malert("loading into {.pkg symengine} environment...")
+    if (fullModel) {
+      .malert("loading full model into {.pkg symengine} environment...")
+    } else {
+      .malert("loading into {.pkg symengine} environment...")
+    }
   }
-  rxode2::rxS(newmod, TRUE, promoteLinSens = promoteLinSens)
+  .ret <- rxode2::rxS(newmod, TRUE, promoteLinSens = promoteLinSens)
+  if (inherits(.ret$rx_r_, "numeric")) {
+    assign("rx_r_", symengine::S(as.character(.ret$rx_r_)), envir=.ret)
+  }
+  .ret
 }
 
 #' @export
@@ -490,7 +577,10 @@ attr(rxUiGet.foceiHdEta, "desc") <- "Generate the d(err)/d(eta) values for FO re
     .msuccess("done")
   }
   if (optExpression) {
-    .s$..inner <- rxode2::rxOptExpr(.s$..inner, "inner model")
+    .s$..inner <- rxode2::rxOptExpr(.s$..inner,
+                                    ifelse(.getRxPredLlikOption(),
+                                           "inner llik model",
+                                           "inner model"))
   }
 }
 
@@ -576,6 +666,27 @@ rxUiGet.getEBEEnv <- function(x, ...) {
   }
 }
 
+#' @export
+rxUiGet.predDfFocei <- function(x, ...) {
+  .ui <- x[[1]]
+  if (exists(".predDfFocei", envir=.ui)) {
+    get(".predDfFocei", envir=.ui)
+  } else {
+    .predDf <- .ui$predDf
+    if (all(.predDf$distribution == "norm")) {
+      assign(".predDfFocei,", .predDf, envir=.ui)
+      .predDf
+    } else {
+      .w <- which(.predDf$distribution == "norm")
+      if (length(.w) > 0) {
+        .predDf$distribution[.w] <- "dnorm"
+      }
+      assign(".predDfFocei", .predDf, envir=.ui)
+      .predDf
+    }
+  }
+}
+
 
 .rxFinalizePred <- function(.s, sum.prod = FALSE,
                             optExpression = TRUE) {
@@ -634,7 +745,8 @@ rxUiGet.getEBEEnv <- function(x, ...) {
     .msuccess("done")
   }
   if (optExpression) {
-    .s$..pred <- rxode2::rxOptExpr(.s$..pred, "EBE model")
+    .s$..pred <- rxode2::rxOptExpr(.s$..pred,
+                                   ifelse(.getRxPredLlikOption(),"Llik EBE model","EBE model"))
   }
 }
 
@@ -654,14 +766,14 @@ rxUiGet.getEBEEnv <- function(x, ...) {
   }
   for (.v in s$..eventVars) {
     .vars <- as.character(get(.v, envir = s))
-    .vars <- rxode2::rxGetModel(paste0("rx_lhs=", .vars))$params
+    .vars <- rxode2::rxGetModel(paste0("rx_lhs=", rxode2::rxFromSE(.vars)))$params
     for (.v2 in .vars) {
-      .reg <- rex::rex(start, "ETA_", capture(any_numbers), "_", end)
+      .reg <- rex::rex(start, "ETA[", capture(any_numbers), "]", end)
       if (regexpr(.reg, .v2) != -1) {
         .num <- as.numeric(sub(.reg, "\\1", .v2))
         .eventEta[.num] <- 1L
       }
-      .reg <- rex::rex(start, "THETA_", capture(any_numbers), "_", end)
+      .reg <- rex::rex(start, "THETA[", capture(any_numbers), "]", end)
       if (regexpr(.reg, .v2) != -1) {
         .num <- as.numeric(sub(.reg, "\\1", .v2))
         .eventTheta[.num] <- 1L
@@ -680,7 +792,8 @@ rxUiGet.getEBEEnv <- function(x, ...) {
       .msuccess("done")
     }
     if (.optExpression) {
-      s$..pred.nolhs <- rxode2::rxOptExpr(s$..pred.nolhs, "FD model")
+      s$..pred.nolhs <- rxode2::rxOptExpr(s$..pred.nolhs,
+                                          ifelse(.getRxPredLlikOption(),"Llik FD model","FD model"))
     }
     s$..pred.nolhs <- paste(c(
       paste0("params(", paste(inner$params, collapse = ","), ")"),
@@ -690,10 +803,14 @@ rxUiGet.getEBEEnv <- function(x, ...) {
   }
   .ret <- list(
     inner = inner,
-    predOnly = .toRx(s$..pred, "compiling EBE model..."),
+    predOnly = .toRx(s$..pred, ifelse(.getRxPredLlikOption(),
+                                      "compiling Llik EBE model...",
+                                      "compiling EBE model...")),
     extra.pars = s$..extraPars,
     outer = .toRx(s$..outer),
-    predNoLhs = .toRx(pred.opt, "compiling events FD model..."),
+    predNoLhs = .toRx(pred.opt, ifelse(.getRxPredLlikOption(),
+                                       "compiling events Llik FD model...",
+                                       "compiling events FD model...")),
     theta = NULL,
     ## warn=.zeroSens,
     pred.minus.dv = .predMinusDv,
@@ -711,23 +828,81 @@ rxUiGet.getEBEEnv <- function(x, ...) {
 
 #' @export
 rxUiGet.focei <- function(x, ...) {
+  .ui <- x[[1]]
+  # For t/cauchy/dnorm, predOnly model
+  assignInMyNamespace(".rxPredLlik", FALSE)
+  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
   .s <- rxUiGet.foceiEnv(x, ...)
-  .innerInternal(x[[1]], .s)
+  .ret <-  .innerInternal(.ui, .s)
+  .predDf <- .ui$predDfFocei
+  if (any(.predDf$distribution %in% c("t", "cauchy", "dnorm"))) {
+    assignInMyNamespace(".rxPredLlik", TRUE)
+    .s <- rxUiGet.foceiEnv(x, ...)
+    .s2 <- .innerInternal(.ui, .s)
+    .w <- vapply(seq_along(.s2),
+                 function(i) {
+                   inherits(.s2[[i]], "rxode2")
+                 }, logical(1), USE.NAMES=FALSE)
+    .s2 <- .s2[.w]
+    names(.s2) <- paste0(names(.s2), "Llik")
+    .cls <- class(.ret)
+    .ret <- c(.ret, .s2)
+    class(.ret) <-.cls
+  }
+  .ret
 }
 #attr(rxUiGet.focei, "desc") <- "Get the FOCEi foceiModelList object"
 
 #' @export
 rxUiGet.foce <- function(x, ...) {
+  .ui <- x[[1]]
+  assignInMyNamespace(".rxPredLlik", FALSE)
+  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
   .s <- rxUiGet.foceEnv(x, ...)
-  .innerInternal(x[[1]], .s)
+  .ret <- .innerInternal(.ui, .s)
+  .predDf <- .ui$predDfFocei
+  if (any(.predDf$distribution %in% c("t", "cauchy", "dnorm"))) {
+    assignInMyNamespace(".rxPredLlik", TRUE)
+    .s <- rxUiGet.foceEnv(x, ...)
+    .s2 <- .innerInternal(.ui, .s)
+    .w <- vapply(seq_along(.s2),
+                 function(i) {
+                   inherits(.s2[[i]], "rxode2")
+                 }, logical(1), USE.NAMES=FALSE)
+    .s2 <- .s2[.w]
+    names(.s2) <- paste0(names(.s2), "Llik")
+    .cls <- class(.ret)
+    .ret <- c(.ret, .s2)
+    class(.ret) <-.cls
+  }
+  .ret
 }
 #attr(rxUiGet.foce, "desc") <- "Get the FOCE foceiModelList object"
 
 
 #' @export
 rxUiGet.ebe <- function(x, ...) {
+  .ui <-x[[1]]
+  assignInMyNamespace(".rxPredLlik", FALSE)
+  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
   .s <- rxUiGet.getEBEEnv(x, ...)
-  .innerInternal(x[[1]], .s)
+  .ret <- .innerInternal(.ui, .s)
+  .predDf <- .ui$predDfFocei
+  if (any(.predDf$distribution %in% c("t", "cauchy", "dnorm"))) {
+    assignInMyNamespace(".rxPredLlik", TRUE)
+    .s <- rxUiGet.getEBEEnv(x, ...)
+    .s2 <- .innerInternal(.ui, .s)
+    .w <- vapply(seq_along(.s2),
+                 function(i) {
+                   inherits(.s2[[i]], "rxode2")
+                 }, logical(1), USE.NAMES=FALSE)
+    .s2 <- .s2[.w]
+    names(.s2) <- paste0(names(.s2), "Llik")
+    .cls <- class(.ret)
+    .ret <- c(.ret, .s2)
+    class(.ret) <-.cls
+  }
+  .ret
 }
 #attr(rxUiGet.ebe, "desc") <- "Get the EBE foceiModelList object"
 
@@ -818,9 +993,34 @@ rxUiGet.foceiEtaNames <- function(x, ...) {
   if (!is.null(env$model$inner)) {
     .len0 <- length(env$model$inner$state)
     .len2 <- .len0 - .len
-    if (.len2 > 0){
+    if (.len2 > 0) {
       .rxControl <- rxode2::rxGetControl(ui, "rxControl", rxode2::rxControl())
       rxode2::rxAssignControlValue(ui, "rxControl", rxode2::rxControlUpdateSens(.rxControl, .len2, .len0))
+    }
+  }
+}
+#' Assign the number of log likelihood items that need to be allocated
+#'
+#' @param ui rxode2 ui
+#' @param env optimization environment
+#' @return Nothing called for side effects.  Will update env$rxControl
+#'   to have the maximum number of llik items in the model set.
+#' @author Matthew L. Fidler
+#' @noRd
+.foceiOptEnvAssignNllik <- function(ui, env) {
+  if (rxode2hasLlik()) {
+    .maxLl <- max(vapply(seq_along(env$model), function(i) {
+      .model <- env$model[[i]]
+      if (inherits(.model, "rxode2")) {
+        return(rxode2::rxModelVars(.model)$flags["nLlik"])
+      } else {
+        return(0L)
+      }
+    }, integer(1), USE.NAMES=FALSE))
+    if (.maxLl > 0) {
+      .rxControl <- rxode2::rxGetControl(ui, "rxControl", rxode2::rxControl())
+      .rxControl$nLlikAlloc <- .maxLl
+      rxode2::rxAssignControlValue(ui, "rxControl", .rxControl)
     }
   }
 }
@@ -1010,7 +1210,7 @@ rxUiGet.foceiMuRefVector <- function(x, ...) {
   if (length(.i2$name) > 0) {
     .i2 <- .i2[.i2$neta1 == .i2$neta2, ]
     .i2 <- .i2[order(.i2$neta1), ]
-    vapply(seq_along(.i2$neta1), function(i){
+    vapply(seq_along(.i2$neta1), function(i) {
       if (.i2$fix[i]) return(-1L)
       .name <- .i2$name[i]
       .w <- which(.muRefDataFrame$eta == .name)
@@ -1072,6 +1272,7 @@ rxUiGet.foceiSkipCov <- function(x, ...) {
     #env$model <- rxUiGet.ebe(list(ui))
   #}
   .foceiOptEnvAssignTol(ui, env)
+  .foceiOptEnvAssignNllik(ui, env)
   .foceiOptEnvSetupBounds(ui, env)
   .foceiOptEnvSetupScaleC(ui, env)
   .foceiOptEnvSetupTransformIndexs(ui, env)
@@ -1116,7 +1317,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
 #' @keywords internal
 #' @export
 .foceiPreProcessData <- function(data, env, ui) {
-  env$origData <- data
+  env$origData <- as.data.frame(data)
   .covNames <- ui$covariates
   colnames(data) <- vapply(names(data), function(x) {
       if (any(x == .covNames)) {
@@ -1125,18 +1326,15 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
         return(toupper(x))
       }
   }, character(1))
-  if (is.null(data$ID)) stop('"ID" not found in data')
-  if (is.null(data$DV)) stop('"DV" not found in data')
+  requiredCols <- c("ID", "DV", "TIME", .covNames)
+  checkmate::assert_names(names(data), must.include = requiredCols)
   if (is.null(data$EVID)) data$EVID <- 0
   if (is.null(data$AMT)) data$AMT <- 0
   ## Make sure they are all double amounts.
-  for (.v in c("TIME", "AMT", "DV", .covNames)) {
-    if (!any(names(data) == .v)) {
-      stop("missing '", .v, "' in data", call.=FALSE)
-    }
+  for (.v in requiredCols) {
     data[[.v]] <- as.double(data[[.v]])
   }
-  data$nlmixrRowNums <- seq_along(data[, 1])
+  data$nlmixrRowNums <- seq_len(nrow(data))
   .keep <- unique(c("nlmixrRowNums", env$table$keep))
   .et <- rxode2::etTrans(inData=data, obj=ui$mv0,
                          addCmt=TRUE, dropUnits=TRUE,
@@ -1172,7 +1370,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
   this.env <- new.env(parent=emptyenv())
   assign("err", "theta reset", this.env)
   .thetaReset$thetaNames <- .ret$thetaNames
-  if (getOption("nlmixr2.retryFocei", TRUE)){
+  if (getOption("nlmixr2.retryFocei", TRUE)) {
     while (this.env$err == "theta reset") {
       assign("err", "", this.env)
       .ret0 <- tryCatch(
@@ -1202,41 +1400,63 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
         .ret$control$etaMat <- .thetaReset$etaMat
         .ret$control$maxInnerIterations <- .thetaReset$maxInnerIterations
         .ret$control$nF <- .thetaReset$nF
-        .ret$control$gillRetC <- .thetaReset$gillRetC
-        .ret$control$gillRet <- .thetaReset$gillRet
-        .ret$control$gillRet <- .thetaReset$gillRet
-        .ret$control$gillDf <- .thetaReset$gillDf
-        .ret$control$gillDf2 <- .thetaReset$gillDf2
-        .ret$control$gillErr <- .thetaReset$gillErr
-        .ret$control$rEps <- .thetaReset$rEps
-        .ret$control$aEps <- .thetaReset$aEps
-        .ret$control$rEpsC <- .thetaReset$rEpsC
-        .ret$control$aEpsC <- .thetaReset$aEpsC
+        #.ret$control$gillRetC <- .thetaReset$gillRetC
+        #.ret$control$gillRet <- .thetaReset$gillRet
+        #.ret$control$gillRet <- .thetaReset$gillRet
+        #.ret$control$gillDf <- .thetaReset$gillDf
+        #.ret$control$gillDf2 <- .thetaReset$gillDf2
+        #.ret$control$gillErr <- .thetaReset$gillErr
+        #.ret$control$rEps <- .thetaReset$rEps
+        #.ret$control$aEps <- .thetaReset$aEps
+        #.ret$control$rEpsC <- .thetaReset$rEpsC
+        #.ret$control$aEpsC <- .thetaReset$aEpsC
         .ret$control$c1 <- .thetaReset$c1
         .ret$control$c2 <- .thetaReset$c2
         if (this.env$zeroOuter) {
           message("Posthoc reset")
           .ret$control$maxOuterIterations <- 0L
         } else if (this.env$zeroGrad) {
-          message("Theta reset (zero gradient values); Switch to bobyqa")
+          message("Theta reset (zero/bad gradient values); Switch to bobyqa")
           rxode2::rxReq("minqa")
           .ret$control$outerOptFun <- .bobyqa
           .ret$control$outerOpt <- -1L
+          .ret$control$outerOptTxt <- "bobyqa"
         } else {
           message("Theta reset (ETA drift)")
         }
-      }
-      if (this.env$err != "") {
+      } else if (this.env$err != "") {
         stop(this.env$err)
       } else {
         return(.ret0)
       }
-
     }
   } else {
     foceiFitCpp_(.ret)
   }
 }
+
+.nlmixrCheckFoceiEnvironment <- function(ret) {
+  checkmate::assertDataFrame(ret$dataSav, .var.name="focei$dataSav")
+  checkmate::assertNumeric(ret$thetaIni, any.missing=FALSE,
+                           null.ok=TRUE, .var.name="focei$thetaIni")
+  checkmate::assertLogical(ret$skipCov, null.ok=TRUE,
+                           any.missing=FALSE, .var.name="focei$skipCov")
+  if (!inherits(ret$rxInv, "rxSymInvCholEnv")) {
+    stop("focei$rxInv needs to be of class'rxSymInvCholEnv'",
+         call.=FALSE)
+  }
+  checkmate::assertNumeric(ret$lower, null.ok=TRUE,
+                           any.missing=FALSE, .var.name="focei$lower")
+  checkmate::assertNumeric(ret$upper, null.ok=TRUE,
+                           any.missing=FALSE, .var.name="focei$upper")
+  checkmate::assertMatrix(ret$etaMat, mode="double", null.ok=TRUE,
+                          any.missing=FALSE, .var.name="focei$etaMat")
+  if (!inherits(ret$control, "foceiControl")) {
+    stop("focei$control must be a focei control object",
+         call.=FALSE)
+  }
+}
+
 #'  Restart the estimation if it wasn't successful by moving the parameters (randomly)
 #'
 #' @param .ret0 Fit
@@ -1250,27 +1470,35 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
   .est0 <- .ret$thetaIni
   lower <- .ret$lower
   upper <- .ret$upper
-
   while (inherits(.ret0, "try-error") && control$maxOuterIterations != 0 && .n <= control$nRetries) {
+    .draw <- TRUE
+    if (attr(.ret0, "condition")$message == "Evaluation error: On initial gradient evaluation, one or more parameters have a zero gradient\nChange model, try different initial estimates or use outerOpt=\"bobyqa\").") {
+        message("Changing to \"bobyqa\"")
+        rxode2::rxReq("minqa")
+        .ret$control$outerOpt <- -1L
+        .ret$control$outerOptFun <- .bobyqa
+        .ret$control$outerOptTxt <- "bobyqa"
+        .draw <- FALSE
+    }
     ## Maybe change scale?
     message(sprintf("Restart %s", .n))
     .ret$control$nF <- 0
     .estNew <- .est0 + 0.2 * .n * abs(.est0) * stats::runif(length(.est0)) - 0.1 * .n
-    .estNew <- sapply(
+    .estNew <- vapply(
       seq_along(.est0),
       function(.i) {
-        if (.ret$thetaFixed[.i]) {
+        if (!.draw || .ret$thetaFixed[.i]) {
           return(.est0[.i])
         } else if (.estNew[.i] < lower[.i]) {
-          return(lower + (.Machine$double.eps)^(1 / 7))
+          return(lower[.i] + (.Machine$double.eps)^(1 / 7))
         } else if (.estNew[.i] > upper[.i]) {
-          return(upper - (.Machine$double.eps)^(1 / 7))
+          return(upper[.i] - (.Machine$double.eps)^(1 / 7))
         } else {
           return(.estNew[.i])
         }
-      }
-    )
-    .ret$thetaIni <- .estNew
+      }, numeric(1), USE.NAMES=FALSE)
+    .ret$thetaIni <- setNames(.estNew, names(.est0))
+    .nlmixrCheckFoceiEnvironment(.ret)
     if (getOption("nlmixr2.retryFocei", TRUE)) {
       .ret0 <- try(.foceiFitInternal(.ret))
     } else {
@@ -1294,8 +1522,12 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
   if (is.null(.control)) {
     .control <- foceiControl()
   }
-  if (!inherits(.control, "foceiControl")){
+  if (!inherits(.control, "foceiControl")) {
     .control <- do.call(nlmixr2est::foceiControl, .control)
+  }
+  .control$needOptimHess <- any(.ui$predDfFocei$distribution != "norm")
+  if (.control$needOptimHess) {
+    .control$interaction <- 0L
   }
   assign("control", .control, envir=.ui)
 }
@@ -1340,7 +1572,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
   .env$table <- env$table
   .data <- env$data
   .foceiPreProcessData(.data, .env, ui)
-  if (!is.null(.env$cov)){
+  if (!is.null(.env$cov)) {
     checkmate::assertMatrix(.env$cov, any.missing=FALSE, min.rows=1, .var.name="env$cov",
                             row.names="strict", col.names="strict")
   }
@@ -1427,6 +1659,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
         rm(list=.item, envir=.env)
       }
     }
+    assign("ui", rxode2::rxUiCompress(.env$ui), envir=.env)
   })
   if (any(names(.ret) == "CWRES") && regexpr("^fo", est) == -1) {
     # focei is available; add objective function
@@ -1439,8 +1672,10 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
 #'@export
 nlmixr2Est.focei <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'focei'", .var.name=.ui$modelName)
   rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'focei'", .var.name=.ui$modelName)
+  if (!rxode2hasLlik()) {
+    rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'focei'", .var.name=.ui$modelName)
+  }
 
   .foceiFamilyControl(env, ...)
   on.exit({
@@ -1456,13 +1691,15 @@ nlmixr2Est.focei <- function(env, ...) {
 #'@export
 nlmixr2Est.foce <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'foce'", .var.name=.ui$modelName)
   rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'foce'", .var.name=.ui$modelName)
+  if (!rxode2hasLlik()) {
+    rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'focei'", .var.name=.ui$modelName)
+  }
 
   .foceiFamilyControl(env, ...)
   rxode2::rxAssignControlValue(.ui, "interaction", 0L)
   on.exit({
-    if (exists("control", envir=.ui)){
+    if (exists("control", envir=.ui)) {
       rm("control", envir=.ui)
     }
   })
@@ -1474,15 +1711,13 @@ nlmixr2Est.foce <- function(env, ...) {
 #'@export
 nlmixr2Est.posthoc <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'posthoc'", .var.name=.ui$modelName)
   rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'posthoc'", .var.name=.ui$modelName)
-
   .foceiFamilyControl(env, ...)
   rxode2::rxAssignControlValue(.ui, "interaction", 0L)
   rxode2::rxAssignControlValue(.ui, "covMethod", 0L)
   rxode2::rxAssignControlValue(.ui, "maxOuterIterations", 0L)
   on.exit({
-    if (exists("control", envir=.ui)){
+    if (exists("control", envir=.ui)) {
       rm("control", envir=.ui)
     }
   })
@@ -1530,7 +1765,7 @@ nlmixr2Est.foi <- function(env, ...) {
   rxode2::rxAssignControlValue(.ui, "fo", TRUE)
   rxode2::rxAssignControlValue(.ui, "boundTol", 0)
   on.exit({
-    if (exists("control", envir=.ui)){
+    if (exists("control", envir=.ui)) {
       rm("control", envir=.ui)
     }
   })
@@ -1538,9 +1773,11 @@ nlmixr2Est.foi <- function(env, ...) {
   .ret <- .foceiFamilyReturn(env, .ui, ...)
   .objDf <- .ret$objDf
   .ui <- .ret$ui
+  assign("control", .control, envir=.ui)
   .foceiFamilyControl(env, ...)
   rxode2::rxAssignControlValue(.ui, "interaction", 1L)
   rxode2::rxAssignControlValue(.ui, "maxOuterIterations", 0L)
+  env$skipTable <- FALSE
   .ret <- .foceiFamilyReturn(env, .ui, ..., method="FO", est="foi")
   .addObjDfToReturn(.ret, .objDf)
   .ret
@@ -1562,7 +1799,7 @@ nlmixr2Est.fo <- function(env, ...) {
   rxode2::rxAssignControlValue(.ui, "fo", TRUE)
   rxode2::rxAssignControlValue(.ui, "boundTol", 0)
   on.exit({
-    if (exists("control", envir=.ui)){
+    if (exists("control", envir=.ui)) {
       rm("control", envir=.ui)
     }
   })
@@ -1570,6 +1807,7 @@ nlmixr2Est.fo <- function(env, ...) {
   .ret <- .foceiFamilyReturn(env, .ui, ...)
   .objDf <- .ret$objDf
   .ui <- .ret$ui
+  assign("control", .control, envir=.ui)
   .foceiFamilyControl(env, ...)
   rxode2::rxAssignControlValue(.ui, "interaction", 0L)
   rxode2::rxAssignControlValue(.ui, "maxOuterIterations", 0L)
@@ -1582,8 +1820,10 @@ nlmixr2Est.fo <- function(env, ...) {
 #'@export
 nlmixr2Est.output <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'output'", .var.name=.ui$modelName)
   rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'output'", .var.name=.ui$modelName)
+  if (!rxode2hasLlik()) {
+    rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'output'", .var.name=.ui$modelName)
+  }
 
   .foceiFamilyControl(env, ...)
   rxode2::rxAssignControlValue(.ui, "interaction", 0L)
@@ -1620,7 +1860,6 @@ nlmixr2Est.output <- function(env, ...) {
 #' - `$extra` Extra print information
 #' - `$method` Estimation method (for printing)
 #' - `$omega` Omega matrix
-#' - `$etaObf` Eta objective function data frame
 #' - `$theta` Is a theta data frame
 #' - `$model` a list of model information for table generation.  Needs a `predOnly` model
 #' - `$message` Message for display
@@ -1634,21 +1873,23 @@ nlmixr2Est.output <- function(env, ...) {
 #' @author Matthew L. Fidler
 #' @export
 nlmixr2CreateOutputFromUi <- function(ui, data=NULL, control=NULL, table=NULL, env=NULL, est="none") {
+  assignInMyNamespace(".finalUiCompressed", FALSE)
+  on.exit(assignInMyNamespace(".finalUiCompressed", TRUE))
   if (inherits(ui, "function")) {
     ui <- rxode2::rxode2(ui)
   }
   if (!inherits(ui, "rxUi")) {
     stop("the first argument needs to be from rxode2 ui", call.=FALSE)
   }
+  ui <- rxode2::rxUiDecompress(ui)
   if (inherits(env, "environment")) {
     assign("foceiEnv", env, envir=ui)
   }
   if (!inherits(data, "data.frame")) {
     stop("the 'data' argument must be a data.frame", call.=FALSE)
   }
-
   .env <- new.env(parent=emptyenv())
-  .env$ui <- ui
+  assign("ui", ui, envir=.env)
   .env$data <- data
   .env$control <- control
   .env$table <- table

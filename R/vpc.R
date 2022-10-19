@@ -9,6 +9,8 @@
 #' @param seed Seed to set for the VPC simulation
 #' @param nretry Number of times to retry the simulation if there is
 #'   NA values in the simulation
+#' @param normRelated should the VPC style simulation be for normal
+#'   related variables only
 #' @return data frame of the VPC simulation
 #' @author Matthew L. Fidler
 #' @export
@@ -42,7 +44,11 @@
 #' head(vpcSim(fit, pred=TRUE))
 #'
 #' }
-vpcSim <- function(object, ..., keep=NULL, n=300, pred=FALSE, seed=1009, nretry=50) {
+vpcSim <- function(object, ..., keep=NULL, n=300,
+                   pred=FALSE, seed=1009, nretry=50,
+                   normRelated=TRUE) {
+  assignInMyNamespace(".finalUiCompressed", FALSE)
+  on.exit(assignInMyNamespace(".finalUiCompressed", TRUE))
   set.seed(seed)
   .si <- object$simInfo
   .si$object <- eval(.getSimModel(object, hideIpred=FALSE))
@@ -54,6 +60,27 @@ vpcSim <- function(object, ..., keep=NULL, n=300, pred=FALSE, seed=1009, nretry=
   .si$keep <- unique(c(keep, "nlmixrRowNums"))
   .data <- .si$events
   .data$nlmixrRowNums <- seq_along(.data[, 1])
+  if (normRelated) {
+    .ui <- object$ui
+    .predDf <-.ui$predDf
+    if (all(.predDf$dist %in% c("norm", "dnorm","t", "cauchy"))) {
+    } else {
+      if (is.null(.data$CMT)) {
+        .ds <- object$dataSav
+        .data$nlmixrRowNums <- seq_along(.data[,1])
+        .ds <- .ds[, c("CMT", "nlmixrRowNums")]
+        .data <- merge(.data, .ds, by ="nlmixrRowNums")
+        .data <- .data[order(.data$nlmixrRowNums),]
+      }
+      .lst <- .Call(`_nlmixr2est_filterNormalLikeAndDoses`,
+                    .data$CMT, .predDf$distribution, .predDf$cmt)
+      .lst$nlmixrRowNums <- .data[.lst$filter, "nlmixrRowNums"]
+      if (.lst$nnorm == 0L) {
+        stop("need normal data for vpcSim (or use normRelated=FALSE)")
+      }
+      .data <- .data[.lst$filter, ]
+    }
+  }
   .si$events <- .data
   .si$thetaMat <- NULL
   .si$dfSub <- NULL
@@ -101,7 +128,13 @@ vpcSim <- function(object, ..., keep=NULL, n=300, pred=FALSE, seed=1009, nretry=
     .sim$pred <- .sim2$sim
   }
   .sim <- vpcNameDataCmts(object, .sim)
-  class(.sim) <- c("nlmixr2vpcSim", class(.sim))
+  .cls <- c("nlmixr2vpcSim", class(.sim))
+  .fit <- object
+  .cls0 <- c("rxHidden", class(.fit))
+  attr(.cls0, ".foceiEnv") <- attr(class(.fit), ".foceiEnv")
+  class(.fit) <- .cls0
+  attr(.cls, "fit") <- .fit
+  class(.sim) <- .cls
   return(.sim)
 }
 #' Name the data and compartments
@@ -113,10 +146,15 @@ vpcSim <- function(object, ..., keep=NULL, n=300, pred=FALSE, seed=1009, nretry=
 #' @keywords internal
 #' @export
 vpcNameDataCmts <- function(object, data) {
+  assignInMyNamespace(".finalUiCompressed", FALSE)
+  on.exit(assignInMyNamespace(".finalUiCompressed", TRUE))
   .wdvid <- which(tolower(names(data)) == "dvid")
   .wcmt <- which(tolower(names(data)) == "cmt")
   .info <- get("predDf", object$ui)
   if (is.null(.info)) {
+    return(invisible(data))
+  }
+  if (length(.info$cond) == 1L) {
     return(invisible(data))
   }
   .state0 <- rxode2::rxModelVars(object$ui)$state
@@ -131,7 +169,9 @@ vpcNameDataCmts <- function(object, data) {
     .dvidF[.i] <- paste(.info$cond[.i])
   }
   if (length(.wdvid) == 1) {
-    if (inherits(data[[.wdvid]], "numeric")) data[[.wdvid]] <- as.integer(data[[.wdvid]])
+    if (inherits(data[[.wdvid]], "numeric")) {
+      data[[.wdvid]] <- as.integer(data[[.wdvid]])
+    }
     if (!inherits(data[[.wdvid]], "factor") &&
           inherits(data[[.wdvid]], "integer")) {
       .tmp <- data[[.wdvid]]
@@ -143,7 +183,9 @@ vpcNameDataCmts <- function(object, data) {
     }
   }
   if (length(.wcmt) == 1) {
-    if (inherits(data[[.wcmt]], "numeric")) data[[.wcmt]] <- as.integer(data[[.wcmt]])
+    if (inherits(data[[.wcmt]], "numeric")) {
+      data[[.wcmt]] <- as.integer(data[[.wcmt]])
+    }
     if (!inherits(data[[.wcmt]], "factor") &&
           inherits(data[[.wcmt]], "integer")) {
       .tmp <- data[[.wcmt]]
@@ -163,13 +205,19 @@ vpcNameDataCmts <- function(object, data) {
 #' @param object nlmixr fit object
 #' @param sim vpc simulation object
 #' @param extra extra data from original fit to add
+#' @param fullData is the full data (possibly modified); This is used
+#'   for the vpc tad calculation
 #' @return Expanded data frame with extra pieces added
 #' @author Matthew L. Fidler
 #' @export
 #' @keywords internal
-vpcSimExpand <- function(object, sim, extra) {
+vpcSimExpand <- function(object, sim, extra, fullData=NULL) {
   if (is.null(extra)) return(sim)
-  .fullData <- object$origData
+  if (is.null(fullData)) {
+    .fullData <- object$origData
+  } else {
+    .fullData <- fullData
+  }
   .fullData$nlmixrRowNums <- seq_along(.fullData[, 1])
   .extra <- extra[extra %in% names(.fullData)]
   .extra <- extra[!(extra %in% names(sim))]
@@ -192,45 +240,4 @@ vpcSimExpand <- function(object, sim, extra) {
 #' @keywords internal
 .nlmixr2estLastPredSimulationInfo <- function() {
   .lastPredSimulationInfo
-}
-
-#' Setup Observation data for VPC
-#'
-#' @param fit nlmixr2 fit
-#' @param data replacement data
-#' @return List with `namesObs`, `namesObsLower`, `obs` and `obsCols`
-#' @author Matthew L. Fidler
-#' @noRd
-.vpcUiSetupObservationData <- function(fit, data=NULL) {
-  if (!is.null(data)) {
-    .obs <- data
-  } else {
-    .obs <- fit$origData
-  }
-  .no <- names(.obs)
-  .nol <- tolower(.no)
-  .wo <- which(.nol == "id")
-  if (length(.wo) != 1) {
-    stop("cannot find 'id' in original dataset",
-         call.=FALSE)
-  }
-  .obsCols <- list(id=.no[.wo])
-  .wo <- which(.nol == "dv")
-  if (length(.wo) != 1) {
-    stop("cannot find 'dv' in original dataset",
-         call.=FALSE)
-  }
-  .obsCols <- c(.obsCols,
-                list(dv=.no[.wo]))
-  .wo <- which(.nol == "time")
-  if (length(.wo) != 1) {
-    stop("cannot find 'time' in original dataset",
-         call.=FALSE)
-  }
-  .obsCols <- c(.obsCols,
-                list(idv=.no[.wo]))
-  list(namesObs=.no,
-       namesObsLower=.nol,
-       obs=.obs,
-       obsCols=.obsCols)
 }

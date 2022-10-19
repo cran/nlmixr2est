@@ -291,7 +291,12 @@
   "saem.cfg"="saemCfg",
   "objf"="objective",
   "OBJF"="objective",
-  "theta"="fixef"
+  "theta"="fixef",
+  "etaR"="phiR",
+  "etaH"="phiH",
+  "etaC"="phiC",
+  "etaSE"="phiSE",
+  "etaRSE"="phiRSE"
 )
 
 #' @export
@@ -350,7 +355,7 @@ VarCorr.nlmixr2FitCoreSilent <- VarCorr.nlmixr2FitCore
 .sigma <- function(x) {
   .ret <- x$nlme
   if (is.null(.ret)) {
-    if (exists("uif", envir = x$env)) {
+    if (exists("ui", envir = x$env)) {
       .df <- as.data.frame(x$uif$ini)
       .errs <- paste(.df[which(!is.na(.df$err)), "name"])
       return(fixef(x)[.errs])
@@ -516,7 +521,7 @@ vcov.nlmixr2FitCoreSilent <- vcov.nlmixr2FitCore
   # Update initial estimates to match current initial estimates
   .ui <- x$ui
   .iniDf <- .ui$iniDf
-
+  assign("iniDf0", .iniDf, envir=x)
   if (exists("fullTheta", x)) {
     .thetas <- x$fullTheta
   } else if (exists("fixef", x)) {
@@ -538,7 +543,10 @@ vcov.nlmixr2FitCoreSilent <- vcov.nlmixr2FitCore
   .omega <- x$omega
   if (is.null(.omega)) {
     assign("iniDf", .iniDf, envir=.ui)
+    assign("ui", .ui, envir=x)
   } else {
+    .fixComps <- .iniDf[is.na(.iniDf$ntheta),]
+    .fixComps <- setNames(.fixComps$fix, .fixComps$name)
     .lotri <- lotri::as.lotri(.iniDf)
     attr(.omega, "lotriEst") <- attr(.lotri, "lotriEst")
     class(.omega) <- class(.lotri)
@@ -549,6 +557,11 @@ vcov.nlmixr2FitCoreSilent <- vcov.nlmixr2FitCore
     .names <- names(.iniDf)
     .iniDf <- rbind(.iniDf1, .iniDf2)
     .iniDf <- .iniDf[, .names]
+    for (.n in names(.fixComps)) {
+      .w  <- which(.iniDf$name == .n)
+      if (length(.w) == 1L) .iniDf[.w, "fix"] <- .fixComps[.n]
+    }
     assign("iniDf", .iniDf, envir=.ui)
+    assign("ui", .ui, envir=x)
   }
 }

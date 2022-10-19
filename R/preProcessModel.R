@@ -117,10 +117,10 @@
 #' @noRd
 .nlmixrPreprocessUi <- function(ui) {
   ui <- rxode2::assertRxUi(ui)
-  .ret <- ui
+  .ret <- rxode2::rxUiDecompress(ui)
   .zeroEtas <- .getZeroEtasFromModel(.ret)
   if (length(.zeroEtas) > 0) {
-    assignInMyNamespace(".nlmixrPureInputUi", .ret)
+    assignInMyNamespace(".nlmixrPureInputUi", rxode2::rxUiDecompress(.ret))
     .minfo(paste0("the following etas are removed from the model since their initial estimates are zero: ",
            paste(.zeroEtas, collapse=", ")))
     .ret <- .downgradeEtas(ui, zeroEtas=.zeroEtas)

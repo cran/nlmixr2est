@@ -113,6 +113,8 @@ nlmixr2Est.default <- function(env, ...) {
 #' @noRd
 nlmixr2Est0 <- function(env, ...) {
   rxode2::rxUnloadAll()
+  .ui <- rxode2::rxUiDecompress(get("ui", env))
+  assign("ui", .ui, envir=env)
   if (!exists("missingTable", envir=env)) {
     assign("missingTable", FALSE, envir=env)
   }
@@ -124,6 +126,13 @@ nlmixr2Est0 <- function(env, ...) {
   }
   if (!exists("missingTable", envir=env)) {
     assign("missingTable", TRUE, envir=env)
+  }
+  if (inherits(env$ui, "rxUi")) {
+    .modelName <- env$ui$modelName
+    assign("ui",
+           rxode2::rxUiDecompress(env$ui$fun()),
+           envir=env) # re-evaluate so it doesn't overwrite inital ui
+    assign("modelName", .modelName, envir=env$ui)
   }
   .doIt <- TRUE
   if (is.null(get("missingTable", envir=env))) {
@@ -150,8 +159,8 @@ nlmixr2Est0 <- function(env, ...) {
   .envReset <- new.env(parent=emptyenv())
   .envReset$reset <- TRUE
   if (!getOption("nlmixr2.resetCache", TRUE)) {
-    .envReset$ret <- .collectWarnings(nlmixr2Est(env, ...), lst = TRUE)
-  } else{
+    .envReset$ret <- .collectWarn(nlmixr2Est(env, ...), lst = TRUE)
+  } else {
     .envReset$reset <- TRUE
     .envReset$env <- new.env(parent=emptyenv())
     lapply(ls(envir = env, all.names = TRUE), function(item) {
@@ -163,7 +172,7 @@ nlmixr2Est0 <- function(env, ...) {
     if (length(get("reset", envir=.envReset)) != 1) assign("reset", TRUE, envir=.envReset)
     while (get("reset", envir=.envReset)) {
       assign("reset", FALSE, envir=.envReset)
-      assign("ret", try(.collectWarnings(nlmixr2Est(env, ...), lst = TRUE)), envir=.envReset)
+      assign("ret", try(.collectWarn(nlmixr2Est(env, ...), lst = TRUE)), envir=.envReset)
       if (inherits(get("ret", envir=.envReset), "try-error")) {
         .msg <- attr(get("ret", envir=.envReset), "condition")$message
         if (regexpr("not provided by package", .msg) != -1) {
@@ -226,13 +235,12 @@ nlmixr2Est0 <- function(env, ...) {
   .lst <- get("ret", envir=.envReset)
   .ret <- .lst[[1]]
   if (is.environment(.ret)) {
-    try(assign("warnings", .lst[[2]], .ret), silent=TRUE)
+    try(assign("runInfo", .lst[[2]], .ret), silent=TRUE)
   } else {
-    try(assign("warnings", .lst[[2]], .ret$env), silent=TRUE)
+    try(assign("runInfo", .lst[[2]], .ret$env), silent=TRUE)
   }
   if (!is.null(.nlmixrPureInputUi)) {
     .nlmixrEstUpdatesOrigModel(.ret)
   }
-  lapply(.lst[[2]], warning, call.=FALSE)
   .ret
 }

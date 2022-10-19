@@ -2,7 +2,7 @@ Type: Package
 Package: nlmixr2est
 Title: Nonlinear Mixed Effects Models in Population PK/PD, Estimation
         Routines
-Version: 2.0.8
+Version: 2.1.0
 Authors@R: c(
     person("Matthew", "Fidler", , "matthew.fidler@gmail.com", role = c("aut", "cre"),
            comment = c(ORCID = "0000-0001-8538-6691")),
@@ -48,17 +48,17 @@ Imports: backports, checkmate, cli, graphics, knitr, lbfgsb3c, lotri,
         utils, vpc
 Suggests: broom.mixed, crayon, data.table, devtools, digest, dparser
         (>= 0.1.8), dplyr, generics, nloptr, qs, sys, testthat, tibble,
-        withr, xgxr
+        withr, xgxr, sfsmisc, rxode2parse, rxode2random
 LinkingTo: BH, dparser (>= 0.1.8), lbfgsb3c, Rcpp, RcppArmadillo (>=
-        0.5.600.2.0), RcppEigen (>= 0.3.3.3.0), rxode2 (>= 2.0.7),
-        StanHeaders (>= 2.18.0)
+        0.11.2.3.1), RcppEigen (>= 0.3.3.3.0), rxode2 (>= 2.0.7),
+        StanHeaders (>= 2.18.0), rxode2parse, rxode2random
 Biarch: true
 Config/testthat/edition: 3
 Encoding: UTF-8
 Language: en-US
 NeedsCompilation: yes
-RoxygenNote: 7.2.0
-Packaged: 2022-06-21 20:00:39 UTC; matt
+RoxygenNote: 7.2.1
+Packaged: 2022-10-19 11:36:06 UTC; matt
 Author: Matthew Fidler [aut, cre] (<https://orcid.org/0000-0001-8538-6691>),
   Yuan Xiong [aut],
   Rik Schoemaker [aut] (<https://orcid.org/0000-0002-7538-3005>),
@@ -83,4 +83,4 @@ Author: Matthew Fidler [aut, cre] (<https://orcid.org/0000-0001-8538-6691>),
   Katharine Mullen [cph],
   Ben Goodrich [ctb]
 Repository: CRAN
-Date/Publication: 2022-06-22 08:00:02 UTC
+Date/Publication: 2022-10-19 20:02:36 UTC
