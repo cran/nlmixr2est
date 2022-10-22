@@ -1,6 +1,6 @@
-d5954e12b3a6bc0ebea92b0f4623eaa6 *DESCRIPTION
+aebc942cdb797e2f3a4be655294b028a *DESCRIPTION
 9e1bf8bfa3510770eb1999b0827499b1 *NAMESPACE
-37da0ea6c32759108c611a34c08d3567 *NEWS.md
+990c57696e1a7100e716100244ad00e2 *NEWS.md
 121a76317dbdf3e38352c7d1205ffc42 *R/RcppExports.R
 fc974ceec1a240033871e5e08e24eec0 *R/addCwres.R
 408f44d7fcb8295b707991cbeca7ba9d *R/asFunction.R
@@ -10,7 +10,7 @@ d30a0c8b67fe4d3fb8afb3e2f6da36ae *R/augPred.R
 271668d394a28b1b4d31bfb4f2d69661 *R/cloneNlmixr.R
 f12308dba6fa4321c6deba13f4f7f81d *R/complete.R
 4dd6fdd4be3e0795ff1333e358e93c3a *R/cov.R
-cde9dd097cc6c030d72a4fdcca56fe6f *R/focei.R
+5a0b237cff000b6120bea5e1eef51996 *R/focei.R
 7c068adb2e0c79ac0a762bf36f104d92 *R/foceiControl.R
 837da2fb45e9181ae29fd53ac0ea3f1e *R/ini.R
 a5fbeb3d563e51b2091a9318831a47d9 *R/md5.R
@@ -19,13 +19,13 @@ c4880683cd809e0b6b52762dca0d4ffe *R/nlme.R
 576b076c7f98ebb8ddd25bd88bc3c3f6 *R/nlmeRxUiGet.R
 ee88f1ad98c108f0982b271fe30f1035 *R/nlmixr2.R
 4279b7c57123fca2cb1fd5e03a25a280 *R/nlmixr2Est.R
-e231584f6658b3b6042f83621e87b48a *R/nlmixr2_md5.R
+6ff153b92a2180e4e3f1d5028c79e5db *R/nlmixr2_md5.R
 65db0e766763e89c2b41e9fb740aff60 *R/nlmixr2output.R
 6f74699dc9666eccd49e282474684a6d *R/nlmixrAddObjectiveFunction.R
 fa788b94f74bb87ae7b8f2a774265513 *R/nlmixrCbind.R
 8127ff4daf2251496454db55e6c933c4 *R/nlmixrGrad.R
 e77a7c472210b99563da7237d8559995 *R/nlmixrUpdateObject.R
-d56cd23567a929eaf871d665f3cdf605 *R/nmObjGet.R
+4818b283c34710129c131642c927e227 *R/nmObjGet.R
 3f408662b0efeb5d1b530fe3e951893c *R/nmObjHandle.R
 f8f5995d8ceb1af2e188143f65cd8fd0 *R/npde.R
 4abe07aead9ef6a3d189d0b721d33aa5 *R/ofv.R
@@ -123,7 +123,7 @@ da7b20a26f309839649e3727dcbf8d8b *man/nmSuppressMsg.Rd
 92b0347e801e748fb1ec834eb344cdd4 *man/nmsimplex.Rd
 966c8105dd188da0222d60b985e891ea *man/ofv.Rd
 825b53dee450c01286f2f694712b5e4f *man/print.saemFit.Rd
-b6323a1694a45f70f7c9afc8c1151150 *man/reexports.Rd
+76dda5e078834d21da81a9939c984d03 *man/reexports.Rd
 afbc5a253a8f8e6b39a5d988dde0c888 *man/residuals.nlmixr2FitData.Rd
 e2165d1fbd0cdfce4ae2085dba65fe1f *man/rxGetDistributionFoceiLines.Rd
 f2c5c9c3513a88c6668436e3bbef1fae *man/rxGetDistributionNlmeLines.Rd
@@ -161,7 +161,7 @@ caa81b90b3421c69a08fc1f16a913660 *src/ires.h
 50acdd61510171501665e20af9b68f15 *src/nearPD.cpp
 c5c2e02b192f57235bbd73a03bdb8957 *src/nearPD.h
 d0920d475d9f2b8407bfe4bc4a8e7064 *src/neldermead.cpp
-8818c399dfb59647a6fb917ca207c255 *src/npde.cpp
+afc2fc6fe297d02e6266651862f5a3fd *src/npde.cpp
 c03f49fe47145198c6029bcaa84323ed *src/npde.h
 559b357f5edb2cffd310be0f77034819 *src/ode_cmt1.cpp
 3f89ed5d87e77b75f53c0875a5c193b7 *src/res.cpp
@@ -190,8 +190,8 @@ f38d95367f20e1a22d6aef683bc519f2 *tests/testthat/test-augpred.R
 9b50d6264456a80e012d6ea4568464be *tests/testthat/test-focei-cens.R
 e1b1017f63d7e109d4fc27bf05d8fe96 *tests/testthat/test-focei-inner.R
 e1fee05a11fa7fd42da1d8669255bc14 *tests/testthat/test-focei-llik.R
+586dce77790c686474d4815c200aeed8 *tests/testthat/test-focei-preprocess.R
 eec6c6b8fd47eac50b7ea5a9c1fc8e9a *tests/testthat/test-focei-wang2007.R
-b2a1315ffefff765e6a55f6854cbd332 *tests/testthat/test-focei.R
 bce6d848d8a86bd6ae7240521bb8a360 *tests/testthat/test-integerish-focei-print.R
 f466450b58b9724c2c1cb562ab37a6ee *tests/testthat/test-issue-281.R
 1721aa0215b2b57ab36b01e52f9e8f27 *tests/testthat/test-issue-429.R
@@ -202,6 +202,7 @@ f466450b58b9724c2c1cb562ab37a6ee *tests/testthat/test-issue-281.R
 31c2c60c361c9e044539dab6d3ecc839 *tests/testthat/test-nearPd.R
 6f618687d2cb1adfec78b8bb82fb55ca *tests/testthat/test-nlme.R
 66f0e0c48e15665105875e61265b3bcf *tests/testthat/test-nmobj.R
+4bbd0446f09d52bba059f7074a89b24b *tests/testthat/test-nonmu.R
 e26fc1144d7054b1f2abe91f3a267c27 *tests/testthat/test-np.R
 e6bc8297ff1d3c34a79b2e15e3afb032 *tests/testthat/test-npde.R
 8dfea9df4466d949125b12048ab31aaa *tests/testthat/test-restart.R

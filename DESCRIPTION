@@ -2,7 +2,7 @@ Type: Package
 Package: nlmixr2est
 Title: Nonlinear Mixed Effects Models in Population PK/PD, Estimation
         Routines
-Version: 2.1.0
+Version: 2.1.1
 Authors@R: c(
     person("Matthew", "Fidler", , "matthew.fidler@gmail.com", role = c("aut", "cre"),
            comment = c(ORCID = "0000-0001-8538-6691")),
@@ -44,21 +44,23 @@ URL: https://github.com/nlmixr2/nlmixr2est
 Depends: nlmixr2data, R (>= 4.0)
 Imports: backports, checkmate, cli, graphics, knitr, lbfgsb3c, lotri,
         magrittr, Matrix, methods, minqa, n1qn1 (>= 6.0.1-10), nlme,
-        Rcpp, rex, Rvmmin, rxode2 (>= 2.0.7), stats, symengine, ucminf,
-        utils, vpc
+        Rcpp, rex, Rvmmin, rxode2 (>= 2.0.10), stats, symengine,
+        ucminf, utils, vpc
 Suggests: broom.mixed, crayon, data.table, devtools, digest, dparser
         (>= 0.1.8), dplyr, generics, nloptr, qs, sys, testthat, tibble,
-        withr, xgxr, sfsmisc, rxode2parse, rxode2random
+        withr, xgxr, sfsmisc, rxode2parse (>= 2.0.11), rxode2random (>=
+        2.0.9)
 LinkingTo: BH, dparser (>= 0.1.8), lbfgsb3c, Rcpp, RcppArmadillo (>=
-        0.11.2.3.1), RcppEigen (>= 0.3.3.3.0), rxode2 (>= 2.0.7),
-        StanHeaders (>= 2.18.0), rxode2parse, rxode2random
+        0.11.2.3.1), RcppEigen (>= 0.3.3.3.0), rxode2 (>= 2.0.10),
+        StanHeaders (>= 2.18.0), rxode2parse (>= 2.0.11), rxode2random
+        (>= 2.0.9)
 Biarch: true
 Config/testthat/edition: 3
 Encoding: UTF-8
 Language: en-US
 NeedsCompilation: yes
 RoxygenNote: 7.2.1
-Packaged: 2022-10-19 11:36:06 UTC; matt
+Packaged: 2022-10-21 13:51:22 UTC; matt
 Author: Matthew Fidler [aut, cre] (<https://orcid.org/0000-0001-8538-6691>),
   Yuan Xiong [aut],
   Rik Schoemaker [aut] (<https://orcid.org/0000-0002-7538-3005>),
@@ -83,4 +85,4 @@ Author: Matthew Fidler [aut, cre] (<https://orcid.org/0000-0001-8538-6691>),
   Katharine Mullen [cph],
   Ben Goodrich [ctb]
 Repository: CRAN
-Date/Publication: 2022-10-19 20:02:36 UTC
+Date/Publication: 2022-10-22 13:12:35 UTC
