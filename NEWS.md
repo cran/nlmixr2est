@@ -1,3 +1,12 @@
+# nlmixr2est (development version)
+
+- Fixes `$etaH` memory corruption so the standard errors of etas are now correct
+
+- Removed the memory requirements for focei by `neta*neta*nsub`
+
+- Fixed character based covariates so the work correctly (again) with
+  focei.  Added a test for this as well.
+
 # nlmixr2est 2.1.1
 
 - Fixes `$dataMergeInner` so that observation-based log-likelihoods

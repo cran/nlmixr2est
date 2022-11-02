@@ -109,7 +109,7 @@ nmObjGetData.dataLloq <- function(x, ...) {
 #' @export
 nmObjGetData.dataUloq <- function(x, ...) {
   .fit <- x[[1]]
-  .df <- as.data.frame(.fit)
+  .df <- as.data.frame(.fit) 
   if (!any(names(.df) == "CENS")) return(NULL)
   if (!any(names(.df) == "lowerLim")) return(NULL)
   .w <- which(.df$CENS == -1)
@@ -310,6 +310,18 @@ nmObjGet.idLvl <- function(x, ...){
   .env <- new.env(emptyenv())
   .foceiPreProcessData(.data, .env, .obj$ui)
   .env$idLvl
+}
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.covLvl <- function(x, ...) {
+  .obj <- x[[1]]
+  .objEnv <- .obj$env
+  if (exists("covLvl", .objEnv)) return(get("covLvl", envir=.objEnv))
+  .data <- .obj$origData
+  .env <- new.env(emptyenv())
+  .foceiPreProcessData(.data, .env, .obj$ui)
+  .env$covLvl
 }
 #attr(nmObjGet.dataSav, "desc") <- "data that focei sees for optimization"
 
