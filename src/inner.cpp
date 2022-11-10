@@ -324,6 +324,7 @@ struct focei_options {
   int optimHessType = 1;
   int optimHessCovType = 1;
   double smatPer;
+  bool didLikCalc=false;
 };
 
 focei_options op_focei;
@@ -843,6 +844,7 @@ double likInner0(double *eta, int id){
   int i, j;
   bool recalc = false;
   focei_ind *fInd= &(inds_focei[id]);
+  op_focei.didLikCalc = true;
   if (op_focei.neta > 0){
     if (!fInd->setup){
       recalc = true;
@@ -3113,6 +3115,7 @@ static inline void foceiSetupNoEta_(){
   if (op_focei.gthetaGrad != NULL && op_focei.mGthetaGrad) R_Free(op_focei.gthetaGrad);
   op_focei.gthetaGrad = R_Calloc(op_focei.gEtaGTransN + rx->nall, double);
   op_focei.llikObsFull = op_focei.gthetaGrad + op_focei.gEtaGTransN; // [rx->nall]
+  std::fill_n(op_focei.llikObsFull, rx->nall, NA_REAL);
   op_focei.mGthetaGrad = true;
   focei_ind *fInd;
   int jj = 0, iLO=0;
@@ -3294,6 +3297,7 @@ NumericVector foceiSetup_(const RObject &obj,
     niter.clear();
     niterGrad.clear();
   }
+  op_focei.didLikCalc = false;
   op_focei.maxOuterIterations = as<int>(foceiO["maxOuterIterations"]);
   op_focei.maxInnerIterations = as<int>(foceiO["maxInnerIterations"]);
   op_focei.maxOdeRecalc = as<int>(foceiO["maxOdeRecalc"]);
@@ -5746,10 +5750,12 @@ NumericMatrix foceiCalcCov(Environment e){
 }
 
 void addLlikObs(Environment e) {
-  rx = getRx();
-  NumericVector llikObs(rx->nall);
-  std::copy(&op_focei.llikObsFull[0], &op_focei.llikObsFull[0] + rx->nall, llikObs.begin());
-  e["llikObs"] = llikObs;
+  if (op_focei.didLikCalc) {
+    rx = getRx();
+    NumericVector llikObs(rx->nall);
+    std::copy(&op_focei.llikObsFull[0], &op_focei.llikObsFull[0] + rx->nall, llikObs.begin());
+    e["llikObs"] = llikObs;    
+  }
 }
 
 void parHistData(Environment e, bool focei){

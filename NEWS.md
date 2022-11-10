@@ -1,4 +1,18 @@
-# nlmixr2est (development version)
+# nlmixr2est 2.1.3
+
+- Allows `$etaH` and related family to be integrated into a `saem` fit
+  if `cwres` is calculated.
+
+- Fixed a bug where `nlmixrLlikObs` in the merged dataset is sometimes
+  named `llikObs`, now it is always named `nlmixrLlikObs`
+
+- Fixed a bug where `nlmixrLlikObs` shows up in merged dataset when
+  `cwres` is not calculated (it was always `0`), also allow `cwres`
+  calculation to pick up `nlmixrLlikObs` in merged dataset.
+
+- Dropped `dparser` dependency
+
+# nlmixr2est 2.1.2
 
 - Fixes `$etaH` memory corruption so the standard errors of etas are now correct
 
