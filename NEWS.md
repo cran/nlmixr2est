@@ -1,3 +1,20 @@
+# nlmixr2est (development version)
+
+
+- Add `$fitMergeFull`, `$fitMergInner`, `$fitMergeLeft`,
+  `$fitMergeRight` as a complement to `$dataMergeFull`,
+  `$dataMergInner`, `$dataMergeLeft`, `$dataMergeRight`.  The fit
+  variants prefer columns in the fit dataset instead of the original
+  dataset.  This is useful for goodness of fit plots with censoring
+  since the `DV` in the fit simulates values under the ipred/residual
+  assumption and will give more appropriate goodness of fits,
+  otherwise these values are the limit of whatever censoring is
+  applied
+  
+- Moved the mu reference fix for the split mu referenced model here
+  (from babelmixr2)
+
+
 # nlmixr2est 2.1.4
 
 - Breaking change, now calculate condition number based on covariance
