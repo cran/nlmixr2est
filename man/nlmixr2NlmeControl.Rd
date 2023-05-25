@@ -296,6 +296,12 @@ a list with all possible arguments is returned.  The returned list
 is used as the ‘control’ argument to the ‘nlme’ function.
 }
 \examples{
-nlmixr2est::nlmeControl()
+nlmeControl()
 nlmixr2NlmeControl()
 }
+\seealso{
+Other Estimation control: 
+\code{\link{foceiControl}()},
+\code{\link{saemControl}()}
+}
+\concept{Estimation control}

@@ -1,5 +1,25 @@
-# nlmixr2est (development version)
+# nlmixr2est 2.1.6
 
+## Breaking changes
+
+- Since `rxode2` now allows simulation with `omega` having diagonal
+  zero elements, `$omega` and `$omegaR` now reflects this information
+  including the zero omega elements in the output. On the other hand,
+  the other eta-information and standard error information for zero
+  etas are still excluded in `$phiR`, `$phiSE`, `$eta` etc.
+
+## Bug fixes
+
+- `vpcSim()` works when an eta value is fixed to 0 (#341)
+
+- `augPred()` now consistently uses the simulation model (instead of
+  the inner model used for `CWRES` calculation).
+  
+## Other changes
+
+- Dropped dependence on orphaned package `ucminf`
+
+# nlmixr2est 2.1.5
 
 - Add `$fitMergeFull`, `$fitMergInner`, `$fitMergeLeft`,
   `$fitMergeRight` as a complement to `$dataMergeFull`,
@@ -10,7 +30,7 @@
   assumption and will give more appropriate goodness of fits,
   otherwise these values are the limit of whatever censoring is
   applied
-  
+
 - Moved the mu reference fix for the split mu referenced model here
   (from babelmixr2)
 
@@ -30,14 +50,14 @@
 
 - A bug in model piping which did not allow models to be appended to was fixed
   (rxode2#364)
-  
+
 - An internal change was made in `nlmixr2.rxUi()` to better support the
   babelmixr2 PKNCA estimation method (babelmixr2#75)
 
 - Fixed bug where `$iniUi` did not return the initial ui when running
   non `focei` related methods.  Also added alias of `$uiIni` to the
   same function.
-  
+
 - Dropped Stan headers for this package, also updated to C++17
 
 # nlmixr2est 2.1.3
