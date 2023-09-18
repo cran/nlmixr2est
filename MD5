@@ -1,7 +1,7 @@
-8f7e5bbcd52ffb93eebad244761272da *DESCRIPTION
+8d8fca85a72db1a5b5f92f8b5717f401 *DESCRIPTION
 315af92875f5c00020d2dc37c5600764 *NAMESPACE
-741843fb0449550561e017315958f8ba *NEWS.md
-a28f2cba0ea5b7ca992c1b41d3388476 *R/RcppExports.R
+948fc6540144fd65f56a31542a0f24b5 *NEWS.md
+db412d168928e32006dfe932d394605c *R/RcppExports.R
 17e5a4c1fbbddb88a3e0b0b0ed773fdb *R/addCwres.R
 408f44d7fcb8295b707991cbeca7ba9d *R/asFunction.R
 a60634c7cb089667c0574645484f448a *R/assert.R
@@ -11,8 +11,8 @@ a60634c7cb089667c0574645484f448a *R/assert.R
 62711b9c28378f16a25def3afd4dbb25 *R/complete.R
 27bba1cce90640a774dcf69375f06c4a *R/cov.R
 7e93518abdb7008c1fd31c8be5f7eb77 *R/fitSim.R
-55d87aedfbebcbd0cfae2fe86733934f *R/focei.R
-c3d02df8cc1e37810e090cf8e05fc191 *R/foceiControl.R
+4cb24aebcdf4e18a60e913f592fca595 *R/focei.R
+4df9f517c1b4a76b5be6ee1a178611ca *R/foceiControl.R
 837da2fb45e9181ae29fd53ac0ea3f1e *R/ini.R
 a5fbeb3d563e51b2091a9318831a47d9 *R/md5.R
 c6bdb48e8102d006cc6e959ceee125ad *R/model.R
@@ -21,9 +21,9 @@ fe02778697f84818cc01c5972ec6bec9 *R/nlme.R
 460322e5b3ad928c37529e50f33895e7 *R/nlmixr2.R
 1b0aac6842906548afd1dfbe1a737c09 *R/nlmixr2Est.R
 ee60851f641d47afa14e8c7e33595d91 *R/nlmixr2Keywords.R
-1aea1aad39f4d63ddf1d4d28230a69a8 *R/nlmixr2_md5.R
-eef74f47b1e344e3987fa8b90883d172 *R/nlmixr2output.R
-54768d8f041218bb034ddd37dfb38040 *R/nlmixrAddObjectiveFunction.R
+37f8b06457db64bc7a72109c83a0d1c3 *R/nlmixr2_md5.R
+d66a8329f0ac7ea37b4fbec2842f7165 *R/nlmixr2output.R
+dbe313dbb46970545c033ef9840507ab *R/nlmixrAddObjectiveFunction.R
 fa788b94f74bb87ae7b8f2a774265513 *R/nlmixrCbind.R
 fae9abfeb2d6e28f9e25e8bb80f962f4 *R/nlmixrGrad.R
 e77a7c472210b99563da7237d8559995 *R/nlmixrUpdateObject.R
@@ -112,7 +112,7 @@ e44ec6165f0c299b7d2d9583eef76603 *man/nlmixrAddTiming.Rd
 b21fd250ddc962a496dbc253ce5428ad *man/nlmixrUpdateObject.Rd
 654d4ed6b9ba3d24dc20889d44d4f87a *man/nlmixrWithTiming.Rd
 c8b82c1cfc8dd8921776ac859fe60d87 *man/nmGetDistributionSaemLines.Rd
-9b12e0949343778cc38f911e3ffb00dc *man/nmNearPD.Rd
+eeaee4eee377265a07f6cb4fb9595c29 *man/nmNearPD.Rd
 566180a52bf78d7479aa5dc03163d154 *man/nmObjGet.Rd
 7504b215de3b029970f1ca3809908acd *man/nmObjGetControl.Rd
 6a4f4c65cf7a736b79973282c66ba97b *man/nmObjGetData.Rd
@@ -157,7 +157,7 @@ d51f2cd4b4252d7154ac1ac5bac4d6be *src/cholse.cpp
 6076dbdac367f18993aaac0402eb8595 *src/evaluate.h
 45ff2d1b96980f2188e07d62250cb9f4 *src/expandNlme.cpp
 8e9cfcfdb6e1f3af3588b2e29adfb7bf *src/filterNormalLike.cpp
-abea78a1d41557f9f50ca56902890952 *src/init.c
+348438592175e53058ac89f40bbe6356 *src/init.c
 378a38a8fab4126259ed47d90f5edf42 *src/inner.cpp
 c894a06e57578889e94fd5f75d523e69 *src/ires.cpp
 caa81b90b3421c69a08fc1f16a913660 *src/ires.h
@@ -209,6 +209,7 @@ f466450b58b9724c2c1cb562ab37a6ee *tests/testthat/test-issue-281.R
 a5c5ef141b2ec62fdde248f552e47cc8 *tests/testthat/test-model.R
 31c2c60c361c9e044539dab6d3ecc839 *tests/testthat/test-nearPd.R
 6f618687d2cb1adfec78b8bb82fb55ca *tests/testthat/test-nlme.R
+6f11367c93fb42d02bdb86551da48164 *tests/testthat/test-nlmixr2output.R
 66f0e0c48e15665105875e61265b3bcf *tests/testthat/test-nmobj.R
 21b5c1d9966dfeffd5fa1ad9cc003443 *tests/testthat/test-nonmu.R
 e26fc1144d7054b1f2abe91f3a267c27 *tests/testthat/test-np.R
@@ -219,6 +220,7 @@ e4488f6587a275d232bf3edb707e7547 *tests/testthat/test-rx-model-props.R
 5ad37219e2387798a0314c410b4329f6 *tests/testthat/test-saem-aic.R
 7fef277c10186888c4e5b0a50d55cb1a *tests/testthat/test-saem-drop.R
 c01e2f20eb7fbd94edd0c68787d80541 *tests/testthat/test-saem-funny-mu.R
+d41d8cd98f00b204e9800998ecf8427e *tests/testthat/test-saem-regressor.R
 068d3a649be237b64d6bdfb077190384 *tests/testthat/test-saem-theo_sd.R
 79d6b7ac50fda3359aab2f11190b9741 *tests/testthat/test-saem-theo_sd.qs
 c62c2ff788d7eda7de0f812201abe1c0 *tests/testthat/test-saem-translate.R
