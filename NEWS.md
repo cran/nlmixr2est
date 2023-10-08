@@ -1,3 +1,10 @@
+# nlmixr2est 2.1.8
+
+- Version bump and a minor documentation update (same as nlmixr2est
+  2.1.7).  This version bump is to simply allow correct binary linkage
+  to rxode2 2.0.14. Otherwise `nlmixr2` models will crash R.
+
+
 # nlmixr2est 2.1.7
 
 - As requested by CRAN, remove `Rvmmin`
