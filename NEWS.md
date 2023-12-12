@@ -1,15 +1,82 @@
+# nlmixr2est 2.2.0
+
+## New Features
+
+- Algebraic mu referencing has been implemented in `nlme` and `saem`.
+
+- New estimation method "nlm" has been added to estimate population
+  only likelihoods using `stats::nlm` and possibly return a
+  standardized `nlmixr2` fit.
+
+- New estimation method "nls" has been added to estimate population
+  only problems.  This uses `minpack.lm::nlsNM` by default if
+  present, or the `stats::nls`
+
+- New estimation method "optim" has been added to estimate population
+  only likelihoods.  This uses `stats::optim` and returns a
+  standardized `nlmixr2` fit.
+
+- New estimation method "nlminb" has been added to estimate population
+  only likelihoods.  This uses `stats::nlminb` and returns a
+  standardized `nlmixr2` fit.
+
+- New estimation methods from the `minqa` package: "bobyqa", "uobyqa"
+  and "newuoa" have been added to estimate population only
+  likelihoods.  These methods returns a standardized `nlmixr2` fit.
+
+- New estimation method "lbfgsb3c" to estimate population only
+  likelihoods.  This returns a standardized `nlmixr2` fit.
+
+- New estimation method "n1qn1" to estimate population only
+  likelihoods.  This returns a standardized `nlmixr2` fit.
+
+- Added new feature for `vpcSim()` where a minimum number of subjects
+  are simulated from the model when trying to fill in ODEs that were
+  not solved successfully.  By default this is `10`.  This also
+  works-around a bug when there is only one subject simulated and the
+  `data.frame` has a slightly different output.
+
+## Breaking changes
+
+- Removed `fit$saemTransformedData` since it isn't actually used in
+  `saem` anymore (but will break anyone's code who is using it)
+
+- Now the internal function `.foceiPreProcessData()` requires the
+  rxode2 control `rxControl()` because some of the new steady state
+  lag features need to translate the data differently based on
+  `rxControl()` options.
+
+
+## Bug fixes
+
+- Printing models with correlated omega values and omega values fixed
+  to zero no longer fails (#359)
+
+- Add back values for $parHistData (#368)
+
+- This requires a new `rxode2` which will fix multiple endpoint issues observed (#394)
+
+- Manual back-transformed values in `$parFixed` are now displaying
+  correctly and are calculated based on the confidence interval in the
+  control instead of 95% confidence no matter what (#397)
+
+## Other changes
+
+- An `as.rxUi()` method was added for fit models (#377)
+
 # nlmixr2est 2.1.8
 
 - Version bump and a minor documentation update (same as nlmixr2est
   2.1.7).  This version bump is to simply allow correct binary linkage
   to rxode2 2.0.14. Otherwise `nlmixr2` models will crash R.
 
-
 # nlmixr2est 2.1.7
 
 - As requested by CRAN, remove `Rvmmin`
 
-- Fix SD calculation typo (#366)
+- Values in `$parFixed` for BSV without exponential transformation are now
+  correctly shown (#366)
+
 
 # nlmixr2est 2.1.6
 

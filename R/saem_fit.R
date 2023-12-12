@@ -122,7 +122,12 @@
   type <- match.arg(type)
   type <- type.idx[type]
   force(rxControl)
+  .env <- .nlmixrEvalEnv$envir
+  if (!is.environment(.env)) {
+    .env <- parent.frame(1)
+  }
   rxControl <- do.call(rxode2::rxControl, rxControl)
+  rxControl$envir <- .env
   # mcmc=list(niter=c(200,300), nmc=3, nu=c(2,2,2));ODEopt = list(atol=1e-6, rtol=1e-4, stiff=1, transit_abs=0);distribution=c("normal","poisson","binomial");seed=99;data=dat;distribution=1;fixed=NULL
   set.seed(seed)
   distribution.idx <- c("normal" = 1, "poisson" = 2, "binomial" = 3)
@@ -308,7 +313,9 @@
   ## CHECKME
   form <- attr(model$saem_mod, "form")
   .nobs <- 0
-  dat <- rxode2::etTrans(data$nmdat, attr(model$saem_mod, "rx"), addCmt=TRUE, dropUnits=TRUE, allTimeVar=TRUE)
+  dat <- rxode2::etTrans(data$nmdat, attr(model$saem_mod, "rx"), addCmt=TRUE, dropUnits=TRUE, allTimeVar=TRUE,
+                         addlKeepsCov = rxControl$addlKeepsCov, addlDropSs = rxControl$addlDropSs,
+                         ssAtDoseTime = rxControl$ssAtDoseTime)
   .nobs <- attr(class(dat), ".rxode2.lst")$nobs
   dat <- as.data.frame(dat) # convert back evid=3 oddness...
   ## if(length(dat) !=7) stop("SAEM doesn't support time varying covariates yet.");

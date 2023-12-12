@@ -7,6 +7,7 @@
 #include "censEst.h"
 #include "nearPD.h"
 #include "shi21.h"
+#include "inner.h"
 
 #ifdef ENABLE_NLS
 #include <libintl.h>
@@ -68,15 +69,10 @@ extern "C" {
                 double pgtol, int *fncount, int *grcount,
                 int maxit, char *msg, int trace, int nREPORT);
 
-
-  typedef void (*ind_solve_t)(rx_solve *rx, unsigned int cid, t_dydt_liblsoda dydt_lls,
-                              t_dydt_lsoda_dum dydt_lsoda, t_jdum_lsoda jdum,
-                              t_dydt c_dydt, t_update_inis u_inis, int jt);
   ind_solve_t ind_solve;
   typedef int (*par_progress_t)(int c, int n, int d, int cores, clock_t t0, int stop);
   par_progress_t par_progress;
   typedef rx_solve* (*getRxSolve_t)();
-  typedef int (*isRstudio_t)();
   isRstudio_t isRstudio;
   getRxSolve_t getRx;
   typedef const char *(*rxGetId_t)(int id);
@@ -426,26 +422,7 @@ extern "C" void rxOptionsFreeFocei(){
 void freeFocei(){
   rxOptionsFreeFocei();
 }
-struct rxSolveF {
-  //
-  // std::string estStr;
-  // std::string gradStr;
-  // std::string obfStr;
-  //
-  t_dydt dydt = NULL;
-  t_calc_jac calc_jac = NULL;
-  t_calc_lhs calc_lhs = NULL;
-  t_update_inis update_inis = NULL;
-  t_dydt_lsoda_dum dydt_lsoda_dum = NULL;
-  t_dydt_liblsoda dydt_liblsoda = NULL;
-  t_jdum_lsoda jdum_lsoda = NULL;
-  t_set_solve set_solve = NULL;
-  t_get_solve get_solve = NULL;
-  int global_jt = 2;
-  int global_mf = 22;
-  int global_debug = 0;
-  int neq = NA_INTEGER;
-} ;
+
 
 rxSolveF rxInner;
 rxSolveF rxPred;
@@ -543,17 +520,17 @@ static inline double getScaleC(int i){
       op_focei.scaleC[i]=1.0;
       break;
     case 2: // diag^2
-      op_focei.scaleC[i]=fabs(op_focei.initPar[i]);
+      op_focei.scaleC[i]=1.0/fabs(op_focei.initPar[i]);
       break;
     case 3: // exp(diag)
-      op_focei.scaleC[i] = 2.0;
+      op_focei.scaleC[i] = 1.0/2.0;
       break;
     case 4: // Identity diagonal chol(Omega ^-1)
     case 5: // off diagonal chol(Omega^-1)
-      op_focei.scaleC[i] = 2.0*fabs(op_focei.initPar[i]);
+      op_focei.scaleC[i] = 1.0/(2.0*fabs(op_focei.initPar[i]));
       break;
     default:
-      op_focei.scaleC[i]= fabs(op_focei.initPar[i]);
+      op_focei.scaleC[i]= 1.0/(fabs(op_focei.initPar[i]));
       break;
     }
   }
@@ -718,7 +695,6 @@ arma::mat grabRFmatFromInner(int id, bool predSolve) {
   arma::vec retR(ind->n_all_times);
   // this assumes the inner problem has been solved
   fInd->nObs = 0;
-  double *llikObs = fInd->llikObs;
   rx_solving_options *op = rx->op;
   int kk, k=0;
   double curT;
@@ -944,8 +920,6 @@ double likInner0(double *eta, int id){
 
         arma::vec grPH(fInd->nObs);
         arma::vec grMH(fInd->nObs);
-        arma::vec grP2H(fInd->nObs);
-        arma::vec grM2H(fInd->nObs);
 
         for (int ii = 0; ii < op_focei.neta; ++ii) {
           if (predSolve || op_focei.etaFD[ii]==1) {
@@ -1051,7 +1025,6 @@ double likInner0(double *eta, int id){
       fInd->tbsLik=0.0;
       double f, err, r, fpm, rp = 0,lnr, limit, dv,dv0, curT;
       int cens = 0;
-      int oldNeq = op->neq;
       if (predSolve) {
         iniSubjectI(id, 1, ind, op, rx, rxPred.update_inis);
       } else {
@@ -1358,9 +1331,6 @@ double LikInner2(double *eta, int likId, int id){
 
       arma::vec grPH(op_focei.neta);
       arma::vec grMH(op_focei.neta);
-
-      arma::vec grP2H(op_focei.neta);
-      arma::vec grM2H(op_focei.neta);
 
       double h = 0;
 
@@ -1945,7 +1915,7 @@ static inline bool isFixedTheta(int m) {
   return true; // here the parameter is fixed
 }
 
-static inline bool thetaReset0() {
+static inline bool thetaReset0(bool forceReset = false) {
   NumericVector thetaIni(op_focei.ntheta);
   NumericVector thetaUp(op_focei.ntheta);
   NumericVector thetaDown(op_focei.ntheta);
@@ -1985,7 +1955,9 @@ static inline bool thetaReset0() {
       adjustEta[ii] = false;
     }
   }
-  if (!doAdjust) return false;
+  if (!doAdjust && !forceReset) {
+    return false;
+  }
 
   arma::mat etaMat(rx->nsub, op_focei.neta);
   for (int ii = rx->nsub; ii--;){
@@ -2028,7 +2000,7 @@ void thetaReset(double size){
 }
 
 void thetaResetZero() {
-  thetaReset0();
+  thetaReset0(true);
   warning(_("thetas were reset during optimization because of a zero gradient"));
   stop("theta reset0");
 }
@@ -2330,7 +2302,6 @@ void foceiPhi(Environment e) {
     dimn[1] = e["etaNames"];
   }
   for (int j=rx->nsub; j--;){
-    focei_ind *fInd = &(inds_focei[j]);
     arma::mat H(op_focei.gH + j*op_focei.neta*op_focei.neta, op_focei.neta, op_focei.neta, false, true);
     RObject cur = wrap(H);
     if (doDimNames) cur.attr("dimnames") = dimn;
@@ -3067,7 +3038,7 @@ static inline void foceiSetupTheta_(List mvi,
     rxUpdateFuns(as<SEXP>(mvi["trans"]), &rxInner);
     foceiSetupTrans_(as<CharacterVector>(mvi["params"]));
   } else if (!op_focei.alloc){
-    stop("FOCEi problem not allocated\nThis can happen when sympy<->nlmixr2 interaction is not working correctly.");
+    stop("FOCEi problem not allocated\nThis can happen when symengine<->nlmixr2 interaction is not working correctly.");
   }
   std::copy(theta.begin(), theta.end(), &op_focei.fullTheta[0]);
   if (op_focei.neta >= 0) {
@@ -4266,10 +4237,14 @@ Environment foceiOuter(Environment e){
     foceiOuterFinal(x.begin(), e);
     if (op_focei.maxInnerIterations == 0){
       e["fail"] = NA_INTEGER;
-      e["message"] = "Likelihood evaluation with provided ETAs";
+      if (!e.exists("message")) {
+        e["message"] = "Likelihood evaluation with provided ETAs";
+      }
     } else {
       e["fail"] = 0;
-      e["message"] = "Posthoc prediction with provided THETAs";
+      if (!e.exists("message")) {
+        e["message"] = "Posthoc prediction with provided THETAs";
+      }
     }
   }
   return e;
@@ -5810,7 +5785,8 @@ void parHistData(Environment e, bool focei){
     tmp = typ;
     tmp.attr("levels") = CharacterVector::create("Gill83 Gradient", "Mixed Gradient",
                                                  "Forward Difference", "Central Difference",
-                                                 "Scaled", "Unscaled", "Back-Transformed");
+                                                 "Scaled", "Unscaled", "Back-Transformed",
+                                                 "Forward Sensitivity");
     tmp.attr("class") = "factor";
     ret[1] = tmp;
     arma::mat cPar(vPar.size()/iterType.size(), iterType.size());
@@ -5878,7 +5854,7 @@ void foceiFinalizeTables(Environment e){
   LogicalVector skipCov = e["skipCov"];
 
   if (covExists) {
-    Function loadNamespace("loadNamespace", R_BaseNamespace);    
+    Function loadNamespace("loadNamespace", R_BaseNamespace);
     Environment nlmixr2 = loadNamespace("nlmixr2est");
     Function getCor = nlmixr2[".cov2cor"];
     e["fullCor"] = getCor(e["cov"]);
@@ -6359,19 +6335,7 @@ void foceiFinalizeTables(Environment e){
 
 ////////////////////////////////////////////////////////////////////////////////
 // FOCEi fit
-
-//' Fit/Evaluate FOCEi
-//'
-//' This shouldn't be called directly.
-//'
-//' @param e Environment
-//'
-//' @return A focei fit object
-//'
-//' @keywords internal
-//' @export
-//[[Rcpp::export]]
-Environment foceiFitCpp_(Environment e){
+void doAssignFn(void) {
   if (!assignFn_){
     n1qn1_ = (n1qn1_fp) R_GetCCallable("n1qn1","n1qn1_");
     par_progress = (par_progress_t) R_GetCCallable("rxode2", "par_progress");
@@ -6384,6 +6348,20 @@ Environment foceiFitCpp_(Environment e){
     sortIdsF = (sortIds_t) R_GetCCallable("rxode2", "sortIds");
     assignFn_=true;
   }
+}
+//' Fit/Evaluate FOCEi
+//'
+//' This shouldn't be called directly.
+//'
+//' @param e Environment
+//'
+//' @return A focei fit object
+//'
+//' @keywords internal
+//' @export
+//[[Rcpp::export]]
+Environment foceiFitCpp_(Environment e){
+  doAssignFn();
   clock_t t0 = clock();
   List model = e["model"];
   bool doPredOnly = false;
@@ -6829,7 +6807,6 @@ void saveIntoEnvrionment(Environment e) {
 }
 
 void restoreFromEnvrionment(Environment e) {
-  int totN=op_focei.ntheta + op_focei.omegan;
   arma::Col<int> etaTrans = e[".etaTrans"];
   std::copy(etaTrans.begin(), etaTrans.end(), op_focei.etaTrans);
   arma::vec fullTheta = e[".fullTheta"];
@@ -6847,4 +6824,3 @@ void restoreFromEnvrionment(Environment e) {
   arma::vec gillDf = e[".gillDf"];
   std::copy(gillDf.begin(), gillDf.end(), op_focei.gillDf);
 }
-

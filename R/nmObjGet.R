@@ -39,17 +39,17 @@ attr(nmObjGet.iniUi, "desc") <- "The initial ui used to run the model"
 
 #' Set if the nlmixr2 object will return a compressed ui
 #'
-#' 
+#'
 #' @param type is a boolean indicating if the compressed ui will be
 #'   returned (`TRUE`) or not be returned (`FALSE`)
 #' @return invisible logical type
 #' @author Matthew L. Fidler
 #' @export
 #' @examples
-#' 
+#'
 #' nmObjUiSetCompressed(FALSE) # now the $ui will return an environment
 #' nmObjUiSetCompressed(TRUE) # now the $ui will return a compressed value
-#' 
+#'
 nmObjUiSetCompressed <- function(type) {
   checkmate::assertLogical(type,len=1, any.missing=FALSE)
   assignInMyNamespace(".finalUiCompressed", type)
@@ -89,6 +89,7 @@ nmObjGet.ui <- nmObjGet.finalUi
 #' @keywords internal
 #' @export
 nmObjGetData <- function(x, ...) {
+  # need to assign environment correctly for UDF
   if (!inherits(x, "nmObjGetData")) {
     stop("'x' is wrong type for 'nmObjGetData'", call.=FALSE)
   }
@@ -109,7 +110,7 @@ nmObjGetData.dataLloq <- function(x, ...) {
 #' @export
 nmObjGetData.dataUloq <- function(x, ...) {
   .fit <- x[[1]]
-  .df <- as.data.frame(.fit) 
+  .df <- as.data.frame(.fit)
   if (!any(names(.df) == "CENS")) return(NULL)
   if (!any(names(.df) == "lowerLim")) return(NULL)
   .w <- which(.df$CENS == -1)
@@ -200,6 +201,7 @@ attr(nmObjGet.cor, "desc") <- "correlation matrix of theta, calculated from cova
 nmObjGet.omegaR <- function(x, ...) {
   .obj <- x[[1]]
   .cov <- .obj$omega
+  if (is.null(.cov)) return(NULL)
   .sd2 <- sqrt(diag(.cov))
   .w <- which(diag(.cov) != 0)
   .cor2 <- stats::cov2cor(.cov[.w, .w])
@@ -302,7 +304,7 @@ nmObjGet.dataSav <- function(x, ...) {
   if (exists("dataSav", .objEnv)) return(get("dataSav", envir=.objEnv))
   .data <- .obj$origData
   .env <- new.env(emptyenv())
-  .foceiPreProcessData(.data, .env, .obj$ui)
+  .foceiPreProcessData(.data, .env, .obj$ui, .obj$control$rxControl)
   .env$dataSav
 }
 #attr(nmObjGet.dataSav, "desc") <- "data that focei sees for optimization"
@@ -321,7 +323,7 @@ nmObjGet.idLvl <- function(x, ...){
   if (exists("idLvl", .objEnv)) return(get("idLvl", envir=.objEnv))
   .data <- .obj$origData
   .env <- new.env(emptyenv())
-  .foceiPreProcessData(.data, .env, .obj$ui)
+  .foceiPreProcessData(.data, .env, .obj$ui, .obj$control$rxControl)
   .env$idLvl
 }
 
@@ -333,7 +335,7 @@ nmObjGet.covLvl <- function(x, ...) {
   if (exists("covLvl", .objEnv)) return(get("covLvl", envir=.objEnv))
   .data <- .obj$origData
   .env <- new.env(emptyenv())
-  .foceiPreProcessData(.data, .env, .obj$ui)
+  .foceiPreProcessData(.data, .env, .obj$ui, .obj$control$rxControl)
   .env$covLvl
 }
 #attr(nmObjGet.dataSav, "desc") <- "data that focei sees for optimization"
@@ -382,7 +384,7 @@ nmObjGet.covLvl <- function(x, ...) {
   if (preferFit) {
     .origData <- .origData[, !(names(.origData) %in% .share)]
   } else {
-    .fitData <- .fitData[, !(names(.fitData) %in% .share)] 
+    .fitData <- .fitData[, !(names(.fitData) %in% .share)]
   }
   if (inherits(.fitData$ID, "factor")) {
     .origData$ID <- factor(paste(.origData$ID), levels = levels(.fitData$ID))
@@ -480,30 +482,30 @@ attr(nmObjGetData.fitMergeFull, "desc") <- "full join between original and fit d
 
 #' @rdname nmObjGet
 #' @export
-nmObjGet.saemTransformedData <- function(x, ...) {
-  .dataSav <- nmObjGet.dataSav(x, ...)
+nmObjGet.parHist <- function(x, ...) {
   .obj <- x[[1]]
-  .ui <- .obj$ui
-  .saemGetDataForFit(.dataSav, .ui)
+  .env <- .obj$env
+  if (exists("parHistData", envir=.env)) {
+    return(.parHistCalc(.env))
+  }
+  NULL
 }
-#attr(nmObjGet.saemTransformedData, "desc") <- "data that saem sees for optimization"
-
+attr(nmObjGet.parHist, "desc") <- "Parameter History"
 
 #' @rdname nmObjGet
 #' @export
 nmObjGet.parHistStacked <- function(x, ...) {
   .obj <- x[[1]]
   .env <- .obj$env
-  if (exists("parHist", envir=.env)) {
-    .parHist <- .env$parHist
+  if (exists("parHistData", envir=.env)) {
+    .parHist <- .parHistCalc(.env)
     .iter <- .parHist$iter
     .ret <- data.frame(iter=.iter, stack(.parHist[, -1]))
     names(.ret) <- sub("values", "val",
                        sub("ind", "par", names(.ret)))
-    .ret
-  } else {
-    NULL
+    return(.ret)
   }
+  NULL
 }
 attr(nmObjGet.parHistStacked, "desc") <- "stacked parameter history"
 

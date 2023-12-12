@@ -12,6 +12,7 @@ vpcSim(
   pred = FALSE,
   seed = 1009,
   nretry = 50,
+  minN = 10,
   normRelated = TRUE
 )
 }
@@ -20,7 +21,7 @@ vpcSim(
 
 \item{...}{Other arguments sent to `rxSolve()`}
 
-\item{keep}{Keep character vector}
+\item{keep}{Column names to keep in the output simulated dataset}
 
 \item{n}{Number of simulations}
 
@@ -30,6 +31,9 @@ vpcSim(
 
 \item{nretry}{Number of times to retry the simulation if there is
 NA values in the simulation}
+
+\item{minN}{With retries, the minimum number of studies to
+restimulate (by default 10)}
 
 \item{normRelated}{should the VPC style simulation be for normal
 related variables only}

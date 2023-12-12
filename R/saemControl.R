@@ -104,6 +104,24 @@
 #'   `FALSE` mu-referenced covariates are treated the same as any
 #'   other input parameter.
 #'
+#' @param muRefCovAlg This controls if algebraic expressions that can
+#'   be mu-referenced are treated as mu-referenced covariates by:
+#'
+#'   1. Creating a internal data-variable `nlmixrMuDerCov#` for each
+#'      algebraic mu-referenced expression
+#'
+#'   2. Change the algebraic expression to `nlmixrMuDerCov# * mu_cov_theta`
+#'
+#'   3. Use the internal mu-referenced covariate for saem
+#'
+#'   4. After optimization is completed, replace `model({})` with old
+#'   `model({})` expression
+#'
+#'   5. Remove `nlmixrMuDerCov#` from nlmix2 output
+#'
+#' In general, these covariates should be more accurate since it
+#' changes the system to a linear compartment model.  Therefore, by default this is `TRUE`.
+#'
 #' @param ... Other arguments to control SAEM.
 #'
 #' @inheritParams rxode2::rxSolve
@@ -119,7 +137,7 @@ saemControl <- function(seed = 99,
                         nmc = 3,
                         nu = c(2, 2, 2),
                         print = 1,
-                        trace = 0,
+                        trace = 0, # nolint
                         covMethod = c("linFim", "fim", "r,s", "r", "s", ""),
                         calcTables = TRUE,
                         logLik = FALSE,
@@ -146,6 +164,7 @@ saemControl <- function(seed = 99,
                         sigdigTable=NULL,
                         ci=0.95,
                         muRefCov=TRUE,
+                        muRefCovAlg=TRUE,
                         ...) {
   .xtra <- list(...)
   .bad <- names(.xtra)
@@ -173,9 +192,9 @@ saemControl <- function(seed = 99,
   checkmate::assertIntegerish(nu, any.missing=FALSE, len=3, lower=1)
   checkmate::assertIntegerish(print, any.missing=FALSE, lower=0, len=1)
   if (!is.null(.xtra$DEBUG)) {
-    trace <- .xtra$DEBUG
+    trace <- .xtra$DEBUG # nolint
   }
-  checkmate::assertIntegerish(trace, any.missing=FALSE, lower=0, upper=1, len=1)
+  checkmate::assertIntegerish(trace, any.missing=FALSE, lower=0, upper=1, len=1) # nolint
   checkmate::assertLogical(calcTables, any.missing=FALSE, len=1)
   checkmate::assertLogical(logLik, any.missing=FALSE, len=1)
   checkmate::assertIntegerish(nnodesGq, any.missing=FALSE, lower=1, len=1)
@@ -194,6 +213,7 @@ saemControl <- function(seed = 99,
   checkmate::assertNumeric(perFixOmega, any.missing=FALSE, lower=0, upper=1, len=1)
   checkmate::assertNumeric(perFixResid, any.missing=FALSE, lower=0, upper=1, len=1)
   checkmate::assertLogical(muRefCov, any.missing=FALSE, len=1)
+  checkmate::assertLogical(muRefCovAlg, any.missing=FALSE, len=1)
 
   type <- match.arg(type)
   if (inherits(addProp, "numeric")) {
@@ -222,12 +242,17 @@ saemControl <- function(seed = 99,
     sigdigTable <- 3
   }
   checkmate::assertIntegerish(sigdigTable, lower=1, len=1, any.missing=FALSE)
+  .env <- .nlmixrEvalEnv$envir
+  if (!is.environment(.env)) {
+    .env <- parent.frame(1)
+  }
   if (is.null(rxControl)) {
-    rxControl <- rxode2::rxControl(sigdig=sigdig)
+    rxControl <- rxode2::rxControl(sigdig=sigdig, envir=.env)
     .genRxControl <- TRUE
   } else if (inherits(rxControl, "rxControl")) {
   } else if (is.list(rxControl)) {
     rxControl <- do.call(rxode2::rxControl, rxControl)
+    rxControl$envir <- .env
   } else {
     stop("solving options 'rxControl' needs to be generated from 'rxode2::rxControl'", call=FALSE)
   }
@@ -243,7 +268,7 @@ saemControl <- function(seed = 99,
     rxControl = rxControl,
     seed = seed,
     print = print,
-    DEBUG = trace,
+    DEBUG = trace, # nolint
     optExpression = optExpression,
     sumProd = sumProd,
     nnodesGq = nnodesGq,
@@ -268,7 +293,8 @@ saemControl <- function(seed = 99,
     covMethod=.covMethod,
     logLik=logLik,
     calcTables=calcTables,
-    muRefCov=muRefCov
+    muRefCov=muRefCov,
+    muRefCovAlg=muRefCovAlg
   )
   class(.ret) <- "saemControl"
   .ret
