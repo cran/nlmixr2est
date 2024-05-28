@@ -122,6 +122,10 @@
 #' In general, these covariates should be more accurate since it
 #' changes the system to a linear compartment model.  Therefore, by default this is `TRUE`.
 #'
+#' @param handleUninformativeEtas boolean that tells nlmixr2's saem to
+#'   calculate uninformative etas and handle them specially (default
+#'   is `TRUE`).
+#'
 #' @param ... Other arguments to control SAEM.
 #'
 #' @inheritParams rxode2::rxSolve
@@ -144,6 +148,7 @@ saemControl <- function(seed = 99,
                         nnodesGq = 3,
                         nsdGq = 1.6,
                         optExpression = TRUE,
+                        literalFix=TRUE,
                         adjObf = TRUE,
                         sumProd = FALSE,
                         addProp = c("combined2", "combined1"),
@@ -165,6 +170,7 @@ saemControl <- function(seed = 99,
                         ci=0.95,
                         muRefCov=TRUE,
                         muRefCovAlg=TRUE,
+                        handleUninformativeEtas=TRUE,
                         ...) {
   .xtra <- list(...)
   .bad <- names(.xtra)
@@ -200,6 +206,7 @@ saemControl <- function(seed = 99,
   checkmate::assertIntegerish(nnodesGq, any.missing=FALSE, lower=1, len=1)
   checkmate::assertNumeric(nsdGq, any.missing=FALSE, lower=1, len=1, finite=TRUE)
   checkmate::assertLogical(optExpression, any.missing=FALSE, len=1)
+  checkmate::assertLogical(literalFix, any.missing=FALSE, len=1)
   checkmate::assertLogical(adjObf, any.missing=FALSE, len=1)
   checkmate::assertLogical(sumProd, any.missing=FALSE, len=1)
   checkmate::assertNumeric(tol, any.missing=FALSE, len=1, finite=TRUE)
@@ -214,6 +221,7 @@ saemControl <- function(seed = 99,
   checkmate::assertNumeric(perFixResid, any.missing=FALSE, lower=0, upper=1, len=1)
   checkmate::assertLogical(muRefCov, any.missing=FALSE, len=1)
   checkmate::assertLogical(muRefCovAlg, any.missing=FALSE, len=1)
+  checkmate::assertLogical(handleUninformativeEtas, any.missing=FALSE, len=1)
 
   type <- match.arg(type)
   if (inherits(addProp, "numeric")) {
@@ -270,6 +278,7 @@ saemControl <- function(seed = 99,
     print = print,
     DEBUG = trace, # nolint
     optExpression = optExpression,
+    literalFix=literalFix,
     sumProd = sumProd,
     nnodesGq = nnodesGq,
     nsdGq = nsdGq,
@@ -294,7 +303,8 @@ saemControl <- function(seed = 99,
     logLik=logLik,
     calcTables=calcTables,
     muRefCov=muRefCov,
-    muRefCovAlg=muRefCovAlg
+    muRefCovAlg=muRefCovAlg,
+    handleUninformativeEtas=handleUninformativeEtas
   )
   class(.ret) <- "saemControl"
   .ret

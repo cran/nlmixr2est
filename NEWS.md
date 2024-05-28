@@ -1,3 +1,52 @@
+# nlmixr2est (development version)
+
+## Breaking changes
+
+- Saem non-mu reference input parameters/covariates were fixed so they
+  work correctly with fixed parameters (Issue #445)
+
+- Focei changed back to having a lower bound for standard deviations
+  when not specified. This means that best model fits may change.  You
+  can revert to the old settings by using
+  `foceiControl(sdLowerFact=0.0)`.  You can also change the factors to
+  other values than the default value, that is
+  `foceiControl(sdLowerFact=0.000001)` for instance which would
+  multiply the initial value by `0.000001` when either the lower bound
+  isn't specified or the lower bound is specified as zero for the
+  error estimates related to error-based standard deviations.
+
+- In `nlmixr2`, expressions are optimized.  Because of that
+  optimization, numerical rounding differences can cause different
+  directions in optimization when fixing parameters in the model
+  vs. fixing the parameters manually.
+
+  This means that the fixed parameters in a model vs hard-coded fixed
+  parameters could give different values in the final model.
+
+  A new option `literalFix` was introduced which change the fixed
+  population parameters to constants in the model while running the
+  optimization.  This makes the output of fixing within the model and
+  fixing manually the same (which is what is likely expected). The
+  default is for this to be turned on (ie. `literalFix=TRUE`).  You
+  can get back the old behavior by using the option
+  `literalFix=FALSE`.
+
+- In `saem`, the monte-carlo sampling occurs for all parameters
+  including non-informative ETAs.  A fix ensure that non-informative
+  etas in `saem` are fixed to zero while sampling the `phi` values.
+  This may change results for models with uninformative etas. To
+  ignore the uninformative etas with `saem` you ca use use the prior
+  `saem` handling with `saemControl(handleUninformativeEtas=FALSE)`.
+
+## New features
+
+- Gracefully degrade when $cov is not in the right form (see #423)
+
+- Add support for PopED in place solving (used in babelmixr2)
+
+- If `est=foceiControl()` or other nlmixr2 control with the class
+  `foceiControl` infer the estimation method is `focei`
+
 # nlmixr2est 2.2.1
 
 - Align with the possibility that linCmt sensitivities may not be

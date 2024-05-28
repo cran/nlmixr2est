@@ -194,14 +194,14 @@
         if (length(.w3) > 0) {
           .w2 <- .w2[.w3]
           .texp <- ui$muRefCurEval$parameter[.w2]
-          # now get parameters 
+          # now get parameters
           .pars <- .muRefCovariateDataFrame$covariateParameter[.muRefCovariateDataFrame$theta %in% .texp]
-          warning(paste0("log-scale mu referenced time varying covariates (",
-                         paste(.pars, collapse=", "),
-                         ") may have better results on no log-transformed scale (https://github.com/nlmixr2/nlmixr2est/issues/348), check results for plausibility"),
-                  call.=FALSE)
+          ## warning(paste0("log-scale mu referenced time varying covariates (",
+          ##                paste(.pars, collapse=", "),
+          ##                ") may have better results on no log-transformed scale (https://github.com/nlmixr2/nlmixr2est/issues/348), check results for plausibility"),
+          ##         call.=FALSE)
         }
-        
+
       }
       .muRefCovariateDataFrame <- .muRefCovariateDataFrame[!(.muRefCovariateDataFrame$covariate %in% timeVaryingCovariates), ]
     }
@@ -217,11 +217,19 @@
     })
     .model <- ui$saemModelList
     .inits <- ui$saemInit
+    .rxControl <- rxode2::rxGetControl(ui, "rxControl", rxode2::rxControl())
+    .ue <- .uninformativeEtas(ui,
+                              handleUninformativeEtas=rxode2::rxGetControl(ui, "handleUninformativeEtas", TRUE),
+                              data=data,
+                              attr(.model$saem_mod, "rx"),
+                              rxControl=.rxControl)
     .cfg <- .configsaem(model=.model,
                         data=data,
                         inits=.inits,
-                        mcmc=rxode2::rxGetControl(ui, "mcmc", list(niter = c(200, 300), nmc = 3, nu = c(2, 2, 2))),
-                        rxControl=rxode2::rxGetControl(ui, "rxControl", rxode2::rxControl()),
+                        mcmc=rxode2::rxGetControl(ui, "mcmc",
+                                                  list(niter = c(200, 300),
+                                                       nmc = 3, nu = c(2, 2, 2))),
+                        rxControl=.rxControl,
                         distribution="normal",
                         fixedOmega=ui$saemModelOmegaFixed,
                         fixedOmegaValues=ui$saemModelOmegaFixedValues,
@@ -241,7 +249,8 @@
                         perNoCor=rxode2::rxGetControl(ui, "perNoCor", 0.75),
                         perFixOmega=rxode2::rxGetControl(ui, "perFixOmega", 0.1),
                         perFixResid=rxode2::rxGetControl(ui, "perFixResid", 0.1),
-                        resFixed=ui$saemResFixed)
+                        resFixed=ui$saemResFixed,
+                        ue=.ue)
     .print <- rxode2::rxGetControl(ui, "print", 1)
     if (inherits(.print, "numeric")) {
       .cfg$print <- as.integer(.print)
@@ -327,7 +336,7 @@
                              return(TRUE)
                            }
                          }
-                         return(FALSE)
+                         FALSE
                        },
                        logical(1),
                        USE.NAMES=FALSE))
@@ -799,7 +808,7 @@ nmObjGet.saemDopredIpred <- function(x, ...) {
     .dopred <- attr(.saem, "dopred")
     .dopred(.saem$mpost_phi, .saemCfg$evt, .saemCfg$opt)
   } else {
-    return(NULL)
+    NULL
   }
 }
 
@@ -814,7 +823,7 @@ nmObjGet.saemDopredPred <- function(x, ...) {
     .dopred <- attr(.saem, "dopred")
     .dopred(.saem$mprior_phi, .saemCfg$evt, .saemCfg$opt)
   } else {
-    return(NULL)
+    NULL
   }
 }
 #attr(nmObjGet.saemDopredIpred, "desc") <- "Get ipred from low level saem"

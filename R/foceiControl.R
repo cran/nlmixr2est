@@ -170,6 +170,10 @@
 #' @param optExpression Optimize the rxode2 expression to speed up
 #'     calculation. By default this is turned on.
 #'
+#' @param literalFix boolean, substitute fixed population values as
+#'   literals and re-adjust ui and parameter estimates after
+#'   optimization; Default is `TRUE`.
+#'
 #' @param ci Confidence level for some tables.  By default this is
 #'     0.95 or 95\% confidence.
 #'
@@ -629,6 +633,13 @@
 #'   of gradients parameters (ie `ntheta*nsub`) before the S matrix is
 #'   considered to be a bad matrix.
 #'
+#' @param sdLowerFact A factor for multiplying the estimate by when
+#'   the lower estimate is zero and the error is known to represent a
+#'   standard deviation of a parameter (like add.sd, prop.sd, pow.sd,
+#'   lnorm.sd, etc).  When zero, no factor is applied.  If your
+#'   initial estimate is 0.15 and your lower bound is zero, then the
+#'   lower bound would be assumed to be 0.00015.
+#'
 #' @inheritParams rxode2::rxSolve
 #' @inheritParams minqa::bobyqa
 #'
@@ -705,6 +716,7 @@ foceiControl <- function(sigdig = 3, #
                          diagXform = c("sqrt", "log", "identity"), #
                          sumProd = FALSE, #
                          optExpression = TRUE,#
+                         literalFix=TRUE,
                          ci = 0.95, #
                          useColor = crayon::has_color(), #
                          boundTol = NULL, #
@@ -791,7 +803,8 @@ foceiControl <- function(sigdig = 3, #
                          rxControl=NULL,
                          sigdigTable=NULL,
                          fallbackFD=FALSE,
-                         smatPer=0.6) { #
+                         smatPer=0.6,
+                         sdLowerFact=0.001) { #
   if (!is.null(sigdig)) {
     checkmate::assertNumeric(sigdig, lower=1, finite=TRUE, any.missing=TRUE, len=1)
     if (is.null(boundTol)) {
@@ -836,6 +849,8 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertIntegerish(maxInnerIterations, lower=0, any.missing=FALSE, len=1)
   checkmate::assertIntegerish(maxInnerIterations, lower=0, any.missing=FALSE, len=1)
   checkmate::assertIntegerish(maxOuterIterations, lower=0, any.missing=FALSE, len=1)
+
+  checkmate::assertNumeric(sdLowerFact, lower=0, finite=TRUE, upper=0.1, any.missing=FALSE, len=1)
 
   if (is.null(n1qn1nsim)) {
     n1qn1nsim <- 10 * maxInnerIterations + 1
@@ -932,6 +947,7 @@ foceiControl <- function(sigdig = 3, #
 
   checkmate::assertLogical(sumProd, any.missing=FALSE, len=1)
   checkmate::assertLogical(optExpression, any.missing=FALSE, len=1)
+  checkmate::assertLogical(literalFix, any.missing=FALSE, len=1)
 
   checkmate::assertNumeric(ci, any.missing=FALSE, len=1, lower=0, upper=1)
   checkmate::assertLogical(useColor, any.missing=FALSE, len=1)
@@ -1201,6 +1217,7 @@ foceiControl <- function(sigdig = 3, #
     diagXform = match.arg(diagXform),
     sumProd = sumProd,
     optExpression = optExpression,
+    literalFix=literalFix,
     outerOpt = as.integer(outerOpt),
     ci = as.double(ci),
     sigdig = as.double(sigdig),
@@ -1295,7 +1312,8 @@ foceiControl <- function(sigdig = 3, #
     shi21maxInner=shi21maxInner,
     shi21maxInnerCov=shi21maxInnerCov,
     shi21maxFD=shi21maxFD,
-    smatPer=smatPer
+    smatPer=smatPer,
+    sdLowerFact=sdLowerFact
   )
   if (!missing(etaMat) && missing(maxInnerIterations)) {
     warning("by supplying 'etaMat', assume you wish to evaluate at ETAs, so setting 'maxInnerIterations=0'",
