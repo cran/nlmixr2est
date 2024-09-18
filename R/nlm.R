@@ -277,6 +277,14 @@ nlmControl <- function(typsize = NULL,
   .ret
 }
 
+#' @export
+rxUiDeparse.nlmControl <- function(object, var) {
+  .default <- nlmControl()
+  .w <- .deparseDifferent(.default, object, "genRxControl")
+  .deparseFinal(.default, object, .w, var)
+}
+
+
 #' Get the nlm family control
 #'
 #' @param env nlm optimization environment
@@ -386,9 +394,13 @@ rxUiGet.nlmModel0 <- function(x, ...) {
                               modelVars=TRUE,
                               cmtLines=FALSE,
                               dvidLine=FALSE)
-  as.call(c(list(quote(`rxModelVars`)), as.call(c(list(quote(`{`)),
-    lapply(seq_along(.ret)[-1], function(i) .ret[[i]]),
-    list(str2lang("rx_pred_ <- -rx_pred_"))))))
+  .ret <- .ret[[2]]
+  .ret <- as.call(c(quote(`{`),
+                    lapply(seq_along(.ret)[-1], function(i) {
+                      .ret[[i]]
+                    }),
+                    list(str2lang("rx_pred_ <- -rx_pred_"))))
+  as.call(c(list(quote(`rxModelVars`)), .ret))
 }
 
 #' Load the nlm model into symengine
@@ -404,7 +416,8 @@ rxUiGet.nlmModel0 <- function(x, ...) {
   .env$.if <- NULL
   .env$.def1 <- NULL
   .malert("pruning branches ({.code if}/{.code else}) of population log-likelihood model...")
-  .ret <- rxode2::.rxPrune(.x, envir = .env)
+  .ret <- rxode2::.rxPrune(.x, envir = .env,
+                           strAssign = rxModelVars(x[[1]])$strAssign)
   .mv <- rxode2::rxModelVars(.ret)
   ## Need to convert to a function
   if (rxode2::.rxIsLinCmt() == 1L) {
@@ -482,7 +495,12 @@ rxUiGet.nlmRxModel <- function(x, ...) {
     .ret <- rxode2::rxOptExpr(.ret, "population log-likelihood model")
     .msuccess("done")
   }
-  list(predOnly=rxode2::rxode2(paste(c(rxUiGet.nlmParams(x, ...), rxUiGet.foceiCmtPreModel(x, ...),
+  .cmt <-  rxUiGet.foceiCmtPreModel(x, ...)
+  .interp <- rxUiGet.interpLinesStr(x, ...)
+  if (.interp != "") {
+    .cmt <-paste0(.cmt, "\n", .interp)
+  }
+  list(predOnly=rxode2::rxode2(paste(c(rxUiGet.nlmParams(x, ...), .cmt,
                                        .ret, .foceiToCmtLinesAndDvid(x[[1]])), collapse="\n")),
        eventTheta=.eventTheta)
 }
@@ -891,8 +909,12 @@ rxUiGet.optimParName <- rxUiGet.nlmParName
 #' @export
 nlmixr2Est.nlm <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiPopulationOnly(.ui, " for the estimation routine 'nlm', try 'focei'", .var.name=.ui$modelName)
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'nlm'", .var.name=.ui$modelName)
+  rxode2::assertRxUiPopulationOnly(.ui, " for the estimation routine 'nlm', try 'focei'",
+                                   .var.name=.ui$modelName)
+  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'nlm'",
+                                   .var.name=.ui$modelName)
+  rxode2::warnRxBounded(.ui, " which are ignored in 'nlm'",
+                        .var.name=.ui$modelName)
   .nlmFamilyControl(env, ...)
   on.exit({if (exists("control", envir=.ui)) rm("control", envir=.ui)}, add=TRUE)
   .nlmFamilyFit(env,  ...)

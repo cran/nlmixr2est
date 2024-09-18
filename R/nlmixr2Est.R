@@ -76,14 +76,17 @@ nlmixr2Est.default <- function(env, ...) {
   stop("nlmixr2 estimation '", .curEst, "' not supported\n can be one of '", paste(nlmixr2AllEst(), collapse="', '"), "'",
        call.=FALSE)
 }
-#' For models with zero omega values, update the original model
+
+#' For models with zero omega values or fixed values, update the
+#' original model
 #'
 #' @param ret input for updating
 #' @return nothing, called for side effects
 #' @noRd
 #' @author Matthew L. Fidler
 .nlmixrEstUpdatesOrigModel <- function(ret) {
-  .ui <- try(ret$ui)
+  .ui <- try(ret$ui, silent=TRUE)
+  if (inherits(.ui, "try-error")) return(ret)
   if (inherits(.ui, "rxUi")) {
     # this needs to be in reverse order of the changes, which means apply zero omegas then fixed
     if (!is.null(.nlmixr2EstEnv$nlmixrPureInputUi)) {
@@ -271,10 +274,18 @@ nlmixr2Est0 <- function(env, ...) {
   }
   .lst <- get("ret", envir=.envReset)
   .ret <- .lst[[1]]
-  if (is.environment(.ret)) {
-    try(assign("runInfo", .lst[[2]], .ret), silent=TRUE)
+  if (inherits(.ret, "nlmixr2FitCore") ||
+        inherits(.ret, "nlmixr2Fit")) {
+    if (is.environment(.ret)) {
+      try(assign("runInfo", .lst[[2]], .ret), silent=TRUE)
+    } else {
+      try(assign("runInfo", .lst[[2]], .ret$env), silent=TRUE)
+    }
   } else {
-    try(assign("runInfo", .lst[[2]], .ret$env), silent=TRUE)
+    .w <-.lst[[2]]
+    lapply(seq_along(.w), function(i) {
+      warning(.w[[i]])
+    })
   }
   .nlmixrEstUpdatesOrigModel(.ret)
   .ret

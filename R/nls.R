@@ -14,7 +14,7 @@
 #' @examples
 #' \donttest{
 #'
-#' if (rxode2parse::.linCmtSens()) {
+#' if (rxode2::.linCmtSensB()) {
 #'
 #' one.cmt <- function() {
 #'   ini({
@@ -104,7 +104,6 @@ nlsControl <- function(maxiter=10000,
   checkmate::assertNumeric(odeRecalcFactor, len=1, lower=1, any.missing=FALSE)
   checkmate::assertNumeric(shiErr, lower=0, any.missing=FALSE, len=1)
   checkmate::assertIntegerish(shi21maxFD, lower=1, any.missing=FALSE, len=1)
-
 
   .eventTypeIdx <- c("central" =2L, "forward"=1L)
   if (checkmate::testIntegerish(eventType, len=1, lower=1, upper=6, any.missing=FALSE)) {
@@ -248,6 +247,13 @@ nlsControl <- function(maxiter=10000,
   .ret
 }
 
+#' @export
+rxUiDeparse.nlsControl <- function(object, var) {
+  .default <- nlsControl()
+  .w <- .deparseDifferent(.default, object, "genRxControl")
+  .deparseFinal(.default, object, .w, var)
+}
+
 #' Get the nls family control
 #'
 #' @param env nlme optimization environment
@@ -304,6 +310,7 @@ getValidNlmixrCtl.nls <- function(control) {
   }
   .ctl
 }
+
 
 .nlsEnv <- new.env(parent=emptyenv())
 
@@ -508,7 +515,8 @@ rxUiGet.nlsModel0 <- function(x, ...) {
   .env$.if <- NULL
   .env$.def1 <- NULL
   .malert("pruning branches ({.code if}/{.code else}) of nls model...")
-  .ret <- rxode2::.rxPrune(.x, envir = .env)
+  .ret <- rxode2::.rxPrune(.x, envir = .env,
+                           strAssign=rxode2::rxModelVars(x[[1]])$strAssign)
   .mv <- rxode2::rxModelVars(.ret)
   ## Need to convert to a function
   if (rxode2::.rxIsLinCmt() == 1L) {
@@ -577,7 +585,12 @@ rxUiGet.nlsRxModel <- function(x, ...) {
     .msuccess("done")
   }
 
-  list(predOnly =rxode2::rxode2(paste(c(rxUiGet.nlsParams(x, ...), rxUiGet.foceiCmtPreModel(x, ...),
+  .cmt <-  rxUiGet.foceiCmtPreModel(x, ...)
+  .interp <- rxUiGet.interpLinesStr(x, ...)
+  if (.interp != "") {
+    .cmt <-paste0(.cmt, "\n", .interp)
+  }
+  list(predOnly =rxode2::rxode2(paste(c(rxUiGet.nlsParams(x, ...), .cmt,
                                         .ret, .foceiToCmtLinesAndDvid(x[[1]])), collapse="\n")),
        eventTheta=.eventTheta)
 }
@@ -1053,10 +1066,15 @@ rxUiGet.nlsFormula <- function(x, ..., grad=FALSE) {
 #' @export
 nlmixr2Est.nls <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiPopulationOnly(.ui, " for the estimation routine 'nls', try 'focei'", .var.name=.ui$modelName)
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'nls'", .var.name=.ui$modelName)
-  rxode2::assertRxUiSingleEndpoint(.ui, " for the estimation routine 'nls'", .var.name=.ui$modelName)
-  rxode2::assertRxUiEstimatedResiduals(.ui, " for the estimation routine 'nls'", .var.name=.ui$modelName)
+  rxode2::assertRxUiPopulationOnly(.ui, " for the estimation routine 'nls', try 'focei'",
+                                   .var.name=.ui$modelName)
+  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'nls'",
+                                   .var.name=.ui$modelName)
+  rxode2::assertRxUiSingleEndpoint(.ui, " for the estimation routine 'nls'",
+                                   .var.name=.ui$modelName)
+  rxode2::assertRxUiEstimatedResiduals(.ui, " for the estimation routine 'nls'",
+                                       .var.name=.ui$modelName)
+  rxode2::warnRxBounded(.ui, " which are ignored in 'nls'", .var.name=.ui$modelName)
   # No add+prop or add+pow
   # Single endpoint
   .nlsFamilyControl(env, ...)

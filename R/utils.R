@@ -45,6 +45,8 @@
 #' iYeoJohnson(yeoJohnson(seq(-3,3),0),0)
 #' @export
 boxCox <- function(x, lambda = 1) {
+  checkmate::assert_numeric(x)
+  checkmate::assert_numeric(lambda)
   .Call(`_nlmixr2est_boxCox_`, x, lambda, 0L)
 }
 
@@ -349,6 +351,9 @@ rxModelVarsS3.nlmixr2FitCoreSilent <- function(obj) {
 #' can explicitly set this to \code{TRUE} or \code{FALSE}, saving the
 #' symmetry test. \emph{Beware} however that setting it \code{FALSE}
 #' for an \bold{a}symmetric input \code{x}, is typically nonsense!
+#'
+#' @return unlike the matrix package, this simply returns the nearest
+#'   positive definite matrix
 #'
 #' @examples
 #'

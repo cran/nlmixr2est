@@ -190,6 +190,14 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
   .ret
 }
 
+#' @export
+rxUiDeparse.n1qn1Control <- function(object, var) {
+  .default <- n1qn1Control()
+  .w <- .deparseDifferent(.default, object, "genRxControl")
+  .deparseFinal(.default, object, .w, var)
+}
+
+
 #' Get the n1qn1 family control
 #'
 #' @param env n1qn1 optimization environment
@@ -203,7 +211,7 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
   if (is.null(.control)) {
     .control <- nlmixr2est::n1qn1Control()
   }
-  if (!inherits(.control, "n1qn1Control")){
+  if (!inherits(.control, "n1qn1Control")) {
     .control <- do.call(nlmixr2est::n1qn1Control, .control)
   }
   assign("control", .control, envir=.ui)
@@ -383,8 +391,12 @@ getValidNlmixrCtl.n1qn1 <- function(control) {
 #' @export
 nlmixr2Est.n1qn1 <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiPopulationOnly(.ui, " for the estimation routine 'n1qn1', try 'focei'", .var.name=.ui$modelName)
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'n1qn1'", .var.name=.ui$modelName)
+  rxode2::assertRxUiPopulationOnly(.ui, " for the estimation routine 'n1qn1', try 'focei'",
+                                   .var.name=.ui$modelName)
+  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'n1qn1'",
+                                   .var.name=.ui$modelName)
+  rxode2::warnRxBounded(.ui, " which are ignored in 'n1qn1'",
+                        .var.name=.ui$modelName)
   .n1qn1FamilyControl(env, ...)
   on.exit({if (exists("control", envir=.ui)) rm("control", envir=.ui)}, add=TRUE)
   .n1qn1FamilyFit(env,  ...)

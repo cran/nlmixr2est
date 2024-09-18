@@ -1,3 +1,9 @@
+.foceiControlInternal <- c("genRxControl", "resetEtaSize",
+                           "resetThetaSize", "resetThetaFinalSize",
+                           "outerOptFun", "outerOptTxt", "skipCov",
+                           "foceiMuRef", "predNeq", "nfixed", "nomega",
+                           "neta", "ntheta", "nF", "printTop", "needOptimHess")
+
 #' Control Options for FOCEi
 #'
 #' @param sigdig Optimization significant digits. This controls:
@@ -623,7 +629,6 @@
 #'
 #' @param rxControl `rxode2` ODE solving options during fitting, created with `rxControl()`
 #'
-#'
 #' @param fallbackFD Fallback to the finite differences if the
 #'   sensitivity equations do not solve.
 #'
@@ -639,6 +644,24 @@
 #'   lnorm.sd, etc).  When zero, no factor is applied.  If your
 #'   initial estimate is 0.15 and your lower bound is zero, then the
 #'   lower bound would be assumed to be 0.00015.
+#'
+#' @param zeroGradFirstReset boolean, when `TRUE` if the first
+#'   gradient is zero, reset the zero gradient to
+#'   `sqrt(.Machine$double.eps)` to get past the bad initial estimate,
+#'   otherwise error (and possibly reset), when `FALSE` error when the
+#'   first gradient is zero.  When `NA` on the last reset, have the
+#'   zero gradient ignored, otherwise error and look for another
+#'   value.  Default is `TRUE`
+#'
+#' @param zeroGradRunReset boolean, when `TRUE` if a gradient is zero,
+#'   reset the zero gradient to `sqrt(.Machine$double.eps)` to get
+#'   past the bad estimate while running.  Otherwise error (and
+#'   possibly reset). Default is `TRUE`
+#'
+#' @param zeroGradBobyqa boolean, when `TRUE` if a gradient is zero,
+#'   the reset will change the method to the gradient free bobyqa
+#'   method. When `NA`, the zero gradient will change to bobyqa only
+#'   when the first gradient is zero.  Default is `TRUE`
 #'
 #' @inheritParams rxode2::rxSolve
 #' @inheritParams minqa::bobyqa
@@ -804,7 +827,10 @@ foceiControl <- function(sigdig = 3, #
                          sigdigTable=NULL,
                          fallbackFD=FALSE,
                          smatPer=0.6,
-                         sdLowerFact=0.001) { #
+                         sdLowerFact=0.001,
+                         zeroGradFirstReset=TRUE,
+                         zeroGradRunReset=TRUE,
+                         zeroGradBobyqa=TRUE) { #
   if (!is.null(sigdig)) {
     checkmate::assertNumeric(sigdig, lower=1, finite=TRUE, any.missing=TRUE, len=1)
     if (is.null(boundTol)) {
@@ -1028,11 +1054,7 @@ foceiControl <- function(sigdig = 3, #
   }
   .xtra <- list(...)
   .bad <- names(.xtra)
-  .bad <- .bad[!(.bad %in% c("genRxControl", "resetEtaSize",
-                             "resetThetaSize", "resetThetaFinalSize",
-                             "outerOptFun", "outerOptTxt", "skipCov",
-                             "foceiMuRef", "predNeq", "nfixed", "nomega",
-                             "neta", "ntheta", "nF", "printTop", "needOptimHess"))]
+  .bad <- .bad[!(.bad %in% .foceiControlInternal)]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste
     (paste0("'", .bad, "'", sep=""), collapse=", "),
@@ -1104,7 +1126,7 @@ foceiControl <- function(sigdig = 3, #
   }
   if (!is.null(.xtra$resetThetaSize)) {
     .resetThetaSize <- .xtra$resetThetaSize
-  } else{
+  } else {
     checkmate::assertNumeric(resetThetaP, lower=0, upper=1, len=1)
     if (resetThetaP > 0 & resetThetaP < 1) {
       .resetThetaSize <- qnorm(1 - (resetThetaP / 2))
@@ -1190,6 +1212,9 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertNumeric(gradProgressOfvTime, any.missing=FALSE, lower=0, len=1)
   checkmate::assertNumeric(badSolveObjfAdj, any.missing=FALSE, len=1)
   checkmate::assertLogical(fallbackFD, any.missing=FALSE, len=1)
+  checkmate::assertLogical(zeroGradFirstReset, any.missing=TRUE, len=1)
+  checkmate::assertLogical(zeroGradRunReset, any.missing=FALSE, len=1)
+  checkmate::assertLogical(zeroGradBobyqa, any.missing=TRUE, len=1)
 
   checkmate::assertIntegerish(shi21maxOuter, lower=0, len=1, any.missing=FALSE)
   checkmate::assertIntegerish(shi21maxInner, lower=0, len=1, any.missing=FALSE)
@@ -1313,7 +1338,10 @@ foceiControl <- function(sigdig = 3, #
     shi21maxInnerCov=shi21maxInnerCov,
     shi21maxFD=shi21maxFD,
     smatPer=smatPer,
-    sdLowerFact=sdLowerFact
+    sdLowerFact=sdLowerFact,
+    zeroGradFirstReset=zeroGradFirstReset,
+    zeroGradRunReset=zeroGradRunReset,
+    zeroGradBobyqa=zeroGradBobyqa
   )
   if (!missing(etaMat) && missing(maxInnerIterations)) {
     warning("by supplying 'etaMat', assume you wish to evaluate at ETAs, so setting 'maxInnerIterations=0'",
@@ -1327,4 +1355,44 @@ foceiControl <- function(sigdig = 3, #
   }
   class(.ret) <- "foceiControl"
   return(.ret)
+}
+
+#' @export
+rxUiDeparse.foceiControl <- function(object, var) {
+  .ret <- foceiControl()
+  .outerOpt <- character(0)
+  if (object$outerOpt == -1L && object$outerOptTxt == "custom") {
+    warning("functions for `outerOpt` cannot be deparsed, reset to default",
+            call.=FALSE)
+  } else if (object$outerOptTxt != "nlminb") {
+    .outerOpt <- paste0("outerOpt=", deparse1(object$outerOptTxt))
+  }
+  .w <- .deparseDifferent(.ret, object, .foceiControlInternal)
+  if (length(.w) == 0 && length(.outerOpt) == 0) {
+    return(str2lang(paste0(var, " <- foceiControl()")))
+  }
+  .retD <- c(vapply(names(.ret)[.w], function(x) {
+    .val <- .deparseShared(x, object[[x]])
+    if (!is.na(.val)) {
+      return(.val)
+    }
+    if (x == "innerOpt") {
+      .innerOptFun <- c("n1qn1" = 1L, "BFGS" = 2L)
+      paste0("innerOpt =", deparse1(names(.innerOptFun[which(object[[x]] == .innerOptFun)])))
+    } else if (x %in% c("derivMethod", "covDerivMethod", "optimHessType", "optimHessCovType",
+                        "eventType")) {
+      .methodIdx <- c("forward" = 0L, "central" = 1L, "switch" = 3L)
+      paste0(x, " =", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
+    } else if (x == "covMethod") {
+      if (object[[x]] == 0L) {
+        paste0(x, " = \"\"")
+      } else {
+        .covMethodIdx <- c("r,s" = 1L, "r" = 2L, "s" = 3L)
+        paste0(x, " =", deparse1(names(.covMethodIdx[which(object[[x]] == .covMethodIdx)])))
+      }
+    } else {
+      paste0(x, "=", deparse1(object[[x]]))
+    }
+  }, character(1)), .outerOpt)
+  str2lang(paste(var, " <- foceiControl(", paste(.retD, collapse=","),")"))
 }

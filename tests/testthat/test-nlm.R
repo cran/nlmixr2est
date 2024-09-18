@@ -1,5 +1,74 @@
 nmTest({
 
+  test_that("nlm models convert strings to numbers", {
+
+    mod <- function() {
+      ini({
+        E0 <- 0.5
+        Em <- 0.5
+        E50 <- 2
+        g <- fix(2)
+      })
+      model({
+        v <- E0+Em*time^g/(E50^g+time^g)+wt
+        p <- expit(v)
+        if (p < 0.5) {
+          a <- "good"
+        }  else {
+          a <- "bad"
+        }
+        ll(bin) ~ DV * v - log(1 + exp(v)) + (a=="good")*0.5
+      })
+    }
+
+    m <- mod()
+
+    expect_error(rxode2::rxNorm(m$nlmRxModel$predOnly), NA)
+
+  })
+
+  test_that("nlm models add interp", {
+
+    mod <- function() {
+      ini({
+        E0 <- 0.5
+        Em <- 0.5
+        E50 <- 2
+        g <- fix(2)
+      })
+      model({
+        v <- E0+Em*time^g/(E50^g+time^g)+wt
+        p <- expit(v)
+        ll(bin) ~ DV * v - log(1 + exp(v))
+      })
+    }
+
+    m <- mod()
+
+    expect_false(grepl("linear\\(wt\\)", rxode2::rxNorm(m$nlmRxModel$predOnly)))
+
+    mod <- function() {
+      ini({
+        E0 <- 0.5
+        Em <- 0.5
+        E50 <- 2
+        g <- fix(2)
+      })
+      model({
+        linear(wt)
+        v <- E0+Em*time^g/(E50^g+time^g)+wt
+        p <- expit(v)
+        ll(bin) ~ DV * v - log(1 + exp(v))
+      })
+    }
+
+    m <- mod()
+
+    expect_true(grepl("linear\\(wt\\)", rxode2::rxNorm(m$nlmRxModel$predOnly)))
+
+
+  })
+
   test_that("nlm makes sense", {
 
     dsn <- data.frame(i=1:1000)
@@ -19,6 +88,8 @@ nmTest({
         ll(bin) ~ DV * v - log(1 + exp(v))
       })
     }
+
+
 
     fit2 <- nlmixr(mod, dsn, est="nlm")
 
@@ -68,7 +139,7 @@ nmTest({
       })
     }
 
-    skip_if_not(rxode2parse::.linCmtSens())
+    skip_if_not(rxode2::.linCmtSensB())
 
     fit2 <- nlmixr(one.cmt, nlmixr2data::theo_sd, est="nlm")
 

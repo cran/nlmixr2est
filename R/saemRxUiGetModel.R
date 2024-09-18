@@ -199,7 +199,8 @@ rxUiGet.saemModelPred0 <- function(x, ...) {
   .env$.if <- NULL
   .env$.def1 <- NULL
   .malert("pruning branches ({.code if}/{.code else}) of saem model...")
-  .ret <- rxode2::.rxPrune(.x, envir = .env)
+  .ret <- rxode2::.rxPrune(.x, envir = .env,
+                           strAssign=rxode2::rxModelVars(x[[1]])$strAssign)
   .mv <- rxode2::rxModelVars(.ret)
   ## Need to convert to a function
   if (rxode2::.rxIsLinCmt() == 1L) {
@@ -218,12 +219,14 @@ rxUiGet.saemModelPred0 <- function(x, ...) {
 #' @noRd
 .saemPrunePred <- function(x) {
   .x <- x[[1]]
+  .ui0 <- .x
   .x <- .x$saemModelPred0[[-1]]
   .env <- new.env(parent = emptyenv())
   .env$.if <- NULL
   .env$.def1 <- NULL
   .malert("pruning branches ({.code if}/{.code else}) of saem model...")
-  .ret <- rxode2::.rxPrune(.x, envir = .env)
+  .ret <- rxode2::.rxPrune(.x, envir = .env,
+                           strAssign=rxode2::rxModelVars(.ui0)$strAssign)
   .mv <- rxode2::rxModelVars(.ret)
   ## Need to convert to a function
   if (rxode2::.rxIsLinCmt() == 1L) {
@@ -297,6 +300,7 @@ attr(rxUiGet.saemParams, "desc") <- "Get the params() for a saem model"
 #' @export
 rxUiGet.saemModel <- function(x, ...) {
   .s <- rxUiGet.loadPruneSaem(x, ...)
+
   .prd <- get("rx_pred_", envir = .s)
   .prd <- paste0("rx_pred_=", rxode2::rxFromSE(.prd))
   ## .lhs0 <- .s$..lhs0
@@ -323,7 +327,12 @@ rxUiGet.saemModel <- function(x, ...) {
     .ret <- rxode2::rxOptExpr(.ret, "saem model")
      .msuccess("done")
   }
-  paste(c(rxUiGet.saemParams(x, ...), rxUiGet.foceiCmtPreModel(x, ...),
+  .cmt <-  rxUiGet.foceiCmtPreModel(x, ...)
+  .interp <- rxUiGet.interpLinesStr(x, ...)
+  if (.interp != "") {
+    .cmt <-paste0(.cmt, "\n", .interp)
+  }
+  paste(c(rxUiGet.saemParams(x, ...), .cmt,
           .ret, .foceiToCmtLinesAndDvid(x[[1]])), collapse="\n")
 }
 
@@ -332,7 +341,12 @@ rxUiGet.saemModelPredReplaceLst <- function(x, ...) {
   .ui <- x[[1]]
   .iniDf <- .ui$iniDf
   .thetaNames <- .iniDf[!is.na(.iniDf$ntheta) & is.na(.iniDf$err), ]
-  .thetaValue <- setNames(paste0("THETA[", .thetaNames$ntheta, "]"), .thetaNames$name)
+  if (length(.thetaNames$name) == 0L) {
+    .thetaValue <- character(0L)
+  } else {
+    .thetaValue <- setNames(paste0("THETA[", .thetaNames$ntheta, "]"), .thetaNames$name)
+  }
+
   if (length(.ui$nonMuEtas) > 0) {
     .nonMuThetas <- setNames(rep("", length(.ui$nonMuEtas)), .ui$nonMuEtas)
     .thetaValue <- c(.thetaValue, .nonMuThetas)
@@ -368,13 +382,39 @@ rxUiGet.saemModelPredReplaceLst <- function(x, ...) {
 }
 #attr(rxUiGet.saemModelPredReplaceLst, "desc") <- "Replace the mu referenced thetas with these values"
 
-.saemModelPredSymengineEnvironment <- NULL
+.saemModelEnv <- NULL
+.saemModelEnv$symengine <- NULL
+.saemModelEnv$predSymengine <- NULL
+
+
+#' @export
+rxUiGet.interpLinesStr <- function(x, ...) {
+  .ui <- x[[1]]
+  .interp <- x[[1]]$interpLines
+  if (is.null(.interp)) {
+    .interp <- ""
+  } else {
+    .interp <- vapply(.interp, deparse1, character(1), USE.NAMES = FALSE)
+  }
+  .interp
+}
 
 #' @export
 rxUiGet.saemModelPred <- function(x, ...) {
+  .ui0 <- x[[1]]
+  .levels  <- .ui0$levels
+  if (!is.null(.levels)) {
+    .levels <- vapply(seq_along(.levels),
+                      function(i){
+                        deparse1(.levels[[i]])
+                      },
+                      character(1), USE.NAMES=FALSE)
+    .levels <- paste(.levels, collapse="\n")
+  }
   .s <- rxUiGet.loadPruneSaemPred(x, ...)
+  .saemModelEnv$symengine <- .s
   .replaceLst <- rxUiGet.saemModelPredReplaceLst(x, ...)
-  assignInMyNamespace(".saemModelPredSymengineEnvironment", .s)
+  .saemModelEnv$predSymengine <- .s
   .prd <- get("rx_pred_", envir = .s)
   .prd <- paste0("rx_pred_=", rxode2::rxFromSE(.prd))
   .r <- get("rx_r_", envir = .s)
@@ -434,8 +474,10 @@ rxUiGet.saemModelPred <- function(x, ...) {
     .ret,
     .ret2
   ), collapse = "\n")
+  .interp <- rxUiGet.interpLinesStr(x, ...)
   .ret <- c(rxUiGet.foceiParams(x, ...),
             rxUiGet.foceiCmtPreModel(x, ...),
+            .interp,
             "rx_pred_=NA\nrx_r_=NA\n",
             paste(names(.replaceLst), "<-", .replaceLst),
             .ret,

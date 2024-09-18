@@ -1,6 +1,7 @@
 nmTest({
 
   test_that("test augPred", {
+
     PKdata <- nlmixr2data::warfarin %>%
       dplyr::filter(dvid == "cp") %>%
       dplyr::select(-dvid) %>%
@@ -25,7 +26,7 @@ nmTest({
       })
     }
 
-    skip_if_not(rxode2parse::.linCmtSens())
+    skip_if_not(rxode2::.linCmtSensB())
     fitOne.comp.KA.solved_S <-
       nlmixr(
         One.comp.KA.solved,
@@ -37,9 +38,14 @@ nmTest({
         tableControl(cwres = TRUE, npde=TRUE)
       )
 
-      expect_error(augPred(fitOne.comp.KA.solved_S), NA)
+    expect_error(augPred(fitOne.comp.KA.solved_S), NA)
 
-    skip_if_not(rxode2parse::.linCmtSens())
+    ap <- augPred(fitOne.comp.KA.solved_S)
+
+    expect_equal(as.character(ap[ap$id == 1 & ap$time == 120, "ind"]),
+                 c("Individual", "Population"))
+
+    skip_if_not(rxode2::.linCmtSensB())
 
       df <-
         tibble::tibble(
@@ -76,6 +82,7 @@ nmTest({
   })
 
   test_that("test augPred with xgxr dataset", {
+
     dat <- xgxr::case1_pkpd %>%
       dplyr::rename(DV=LIDV) %>%
       dplyr::filter(CMT %in% 1:2) %>%
@@ -117,7 +124,7 @@ nmTest({
         })
       }
 
-    skip_if_not(rxode2parse::.linCmtSens())
+    skip_if_not(rxode2::.linCmtSensB())
 
       cmt2fit.logn <- nlmixr(cmt2, dat2, "saem",
                                       control=saemControl(print=0, nBurn = 1, nEm = 1),
@@ -127,7 +134,7 @@ nmTest({
   })
 
   test_that("augPred with pop only data", {
-    skip_if_not(rxode2parse::.linCmtSens())
+    skip_if_not(rxode2::.linCmtSensB())
     one.cmt <- function() {
       ini({
         tka <- 0.45
@@ -142,7 +149,7 @@ nmTest({
         linCmt() ~ add(add.sd)
       })
     }
-    skip_if_not(rxode2parse::.linCmtSens())
+    skip_if_not(rxode2::.linCmtSensB())
 
     fit2 <- nlmixr(one.cmt, nlmixr2data::theo_sd, est="focei",
                    control = foceiControl(eval.max = 1),

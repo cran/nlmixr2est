@@ -437,7 +437,15 @@
       .ini <- .ini[!is.na(.ini$ntheta), ]
       .ini <- .ini[!.ini$fix, ]
       .ini <- paste(.ini$name)
-      if (.calcCov) {
+      if (.calcCov && .nth == 0) {
+        warning("no population parameters in the model, no covariance matrix calculated",
+                call.=FALSE)
+        .calcCov <- FALSE
+        .addCov <- FALSE
+        env$cov <- NULL
+        .cov <- NULL
+        env$covMethod <- "none"
+      } else if (.calcCov) {
         .covm <- .saem$Ha[1:.nth, 1:.nth]
         .covm <- try(calc.COV(.saem))
         .doIt <- !inherits(.covm, "try-error")
@@ -788,6 +796,7 @@ nlmixr2Est.saem <- function(env, ...) {
   rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'saem'", .var.name=.ui$modelName)
   rxode2::assertRxUiEstimatedResiduals(.ui, " for the estimation routine 'saem'", .var.name=.ui$modelName)
   rxode2::assertRxUiMixedOnly(.ui, " for the estimation routine 'saem'", .var.name=.ui$modelName)
+  rxode2::warnRxBounded(.ui, " which are ignored in 'saem'", .var.name=.ui$modelName)
   .saemFamilyControl(env, ...)
   on.exit({
     if (exists("control", envir=.ui)) {

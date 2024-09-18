@@ -127,6 +127,13 @@
 #' @author Matthew L. Fidler and Bill Denney
 #' @noRd
 .updateParFixedGetEtaRow <- function(.eta, .env, .ome, .omegaFix, .muRefCurEval, .sigdig) {
+  if (is.null(.ome)) {
+    # This can happen if there are no BSV parameters in a model
+    return("")
+  } else if (!(.eta %in% rownames(.ome))) {
+    # This can happen if .eta is a fixed BSV parameter
+    return("")
+  }
   .v <- .ome[.eta, .eta]
   .w <- which(.muRefCurEval$parameter == .eta)
   if (.muRefCurEval$curEval[.w] == "exp") {
@@ -435,7 +442,7 @@
 
 #' @export
 `$.nlmixr2FitCore` <- function(obj, arg, exact = FALSE) {
-  rxode2parse::.udfEnvSet(parent.frame(1))
+  rxode2::.udfEnvSet(parent.frame(1))
   .env <- obj
   .arg <- .nmObjBackward[arg]
   if (is.na(.arg)) .arg <- arg
@@ -450,7 +457,7 @@
 
 #' @export
 `$.nlmixr2FitData` <- function(obj, arg, exact = FALSE) {
-  rxode2parse::.udfEnvSet(parent.frame(1))
+  rxode2::.udfEnvSet(parent.frame(1))
   .ret <- obj[[arg]]
   if (arg == "md5") {
     return(.nlmixr2Md5(obj))

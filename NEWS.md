@@ -1,4 +1,14 @@
-# nlmixr2est (development version)
+# nlmixr2est 3.0.0
+
+- No binary linking to `rxode2`, `lbfgsb3c` and `n1q1`, which means
+  that updating these will not make `nlmixr2est` crash without
+  recompiling.
+
+- New `mu`3 referencing will take context from the model to see if the
+  algebraic expression can be completed from defined model variables;
+  These variable would have to be unique.
+
+# nlmixr2est 2.2.2
 
 ## Breaking changes
 
@@ -46,6 +56,21 @@
 
 - If `est=foceiControl()` or other nlmixr2 control with the class
   `foceiControl` infer the estimation method is `focei`
+
+- Add back the warnings when estimation methods ignore the boundaries
+
+- When using `rxSolve`, now respects the values from `tableControl()`
+  (#465 and #297)
+
+## Bug fixes
+
+- Will emit warnings when the return object is not a nlmixr2 fit
+  (#453)
+
+## Other things
+
+- Moved actual code of some matrix libraries to `lotri` and import
+  them via function pointers
 
 # nlmixr2est 2.2.1
 

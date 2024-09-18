@@ -27,11 +27,21 @@ mu2env$expit <- rxode2::expit
     expr
   }
 }
+.uiGetMu3 <- function(data, .datEnv, .tmp) {
+  .tmp <- eval(str2lang(paste0("rxode2::rxToSE(", .tmp, ", NULL)")))
+  .tmp <- str2lang(paste0("with(.datEnv$symengine, ", .tmp, ")"))
+  .tmp <- eval(.tmp)
+  .tmp <- as.character(.tmp)
+  .tmp <- str2lang(paste0("rxode2::rxFromSE(", .tmp, ")"))
+  .tmp <- eval(.tmp)
+  .tmp <- str2lang(paste0("with(.datEnv, with(data,",  .tmp, "))"))
+  eval(.tmp)
+}
 #' This function handles mu2 covariates
 #'
 #' In general the dataset is modified with nlmixrMuDerCov# and the mu2
 #' expressions are changed to traditional mu-expressions
-#'  
+#'
 #' @param data input dataset
 #' @param ui input ui
 #' @return a list with list(ui=mu referenced ui, data=mu referenced dataset)
@@ -42,6 +52,15 @@ mu2env$expit <- rxode2::expit
   .datEnv$data <- data
   .datEnv$model <- rxode2::as.model(ui)
   .datEnv$ui  <- ui
+  .datEnv$symengine <- NULL
+  if (use.utf()) {
+    .mu2 <- "\u03BC\u2082"
+    .mu3 <- "\u03BC\u2083"
+  } else {
+    .mu2 <- "mu2"
+    .mu3 <- "mu3"
+  }
+
   lapply(seq_along(ui$mu2RefCovariateReplaceDataFrame$covariate),
          function(i) {
            .datEnv$i <- i
@@ -49,6 +68,25 @@ mu2env$expit <- rxode2::expit
                         with(data,
                              eval(str2lang(ui$mu2RefCovariateReplaceDataFrame$covariate[i])))),
                        silent=TRUE)
+           if (inherits(.tmp, "try-error")) {
+             if (is.null(.datEnv$symengine)) {
+               .minfo(paste0("loading model to look for ", .mu3, "references"))
+               .datEnv$symengine <- ui$loadPruneSaem
+               .minfo("done")
+             }
+             .tmp <- try(.uiGetMu3(data, .datEnv,
+                                   ui$mu2RefCovariateReplaceDataFrame$covariate[i]), silent=TRUE)
+             if (!inherits(.tmp, "try-error")) {
+               .txt <- paste0(.mu3, " item: ", ui$mu2RefCovariateReplaceDataFrame$covariate[i])
+               .minfo(.txt)
+               # Will put into the fit information
+               warning(.txt, call.=FALSE)
+             }
+           } else {
+             .txt <- paste0(.mu2, " item: ", ui$mu2RefCovariateReplaceDataFrame$covariate[i])
+             .minfo(.txt)
+             warning(.txt, call.=FALSE)
+           }
            if (!inherits(.tmp, "try-error")) {
              .datEnv$data[[paste0("nlmixrMuDerCov", i)]] <- .tmp
              .new <- str2lang(paste0("nlmixrMuDerCov", i, "*",
@@ -56,10 +94,9 @@ mu2env$expit <- rxode2::expit
              .old <- str2lang(ui$mu2RefCovariateReplaceDataFrame$modelExpression[i])
              .datEnv$model <- .uiModifyForCovsRep(.datEnv$model, .old, .new)
            } else {
-             warning(paste0("algebraic mu expression failed for '",
-                            ui$mu2RefCovariateReplaceDataFrame$modelExpression[i],
-                            "'"),
-                     call.=FALSE)
+             .txt <- paste0("not ",.mu2," or ", .mu3, " item: ", ui$mu2RefCovariateReplaceDataFrame$covariate[i])
+             .minfo(.txt)
+             warning(.txt, call.=FALSE)
            }
            invisible()
          })
@@ -73,7 +110,7 @@ mu2env$expit <- rxode2::expit
 #' mu2 referencing is algebraic mu-referencing by converting to the
 #' transformation to a single value in the original dataset, and
 #' moving that around
-#'  
+#'
 #' @param env Environment needed for nlmixr2 fits
 #' @return Either the original model({}) block (if changed) or NULL if
 #'   not changed
@@ -104,7 +141,9 @@ mu2env$expit <- rxode2::expit
 #' @keywords internal
 .uiFinalizeMu2 <- function(ret, model) {
   if (!is.null(model)) {
+    if (is.null(ret$ui)) return(ret)
     .ui2 <- rxode2::rxUiDecompress(ret$ui)
+    if (is.null(.ui2)) return(ret)
     rm("control", envir=.ui2)
     rxode2::model(.ui2) <- model
     assign("ui", .ui2, envir=ret$env)
@@ -118,5 +157,8 @@ mu2env$expit <- rxode2::expit
       }
     }
   }
+  # Reset symengine environments
+  .saemModelEnv$symengine <- NULL
+  .saemModelEnv$predSymengine <- NULL
   ret
 }

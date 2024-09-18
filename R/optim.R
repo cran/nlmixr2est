@@ -227,9 +227,6 @@ optimControl <- function(method = c("Nelder-Mead", "BFGS", "CG", "L-BFGS-B", "SA
   checkmate::assertIntegerish(maxOdeRecalc, any.missing=FALSE, len=1)
   checkmate::assertNumeric(odeRecalcFactor, len=1, lower=1, any.missing=FALSE)
 
-
-
-
   .xtra <- list(...)
   .bad <- names(.xtra)
   .bad <- .bad[!(.bad %in% "genRxControl")]
@@ -341,6 +338,12 @@ optimControl <- function(method = c("Nelder-Mead", "BFGS", "CG", "L-BFGS-B", "SA
   .ret
 }
 
+#' @export
+rxUiDeparse.optimControl <- function(object, var) {
+  .default <- optimControl()
+  .w <- .deparseDifferent(.default, object, "genRxControl")
+  .deparseFinal(.default, object, .w, var)
+}
 
 #' A surrogate function for optim to call for ode solving
 #'
@@ -373,10 +376,16 @@ optimControl <- function(method = c("Nelder-Mead", "BFGS", "CG", "L-BFGS-B", "SA
   if (is.null(.control)) {
     .control <- nlmixr2est::optimControl()
   }
-  if (!inherits(.control, "optimControl")){
+  if (!inherits(.control, "optimControl")) {
     .control <- do.call(nlmixr2est::optimControl, .control)
   }
   assign("control", .control, envir=.ui)
+  if (.control$method %in% c("L-BFGS-B", "Brent")) {
+  } else {
+    .methodWarn <- paste0(" which are ignored in 'optim' with method='",
+                          .control$method, "'")
+    rxode2::warnRxBounded(.ui, .methodWarn, .var.name=.ui$modelName)
+  }
 }
 
 #' @rdname nmObjHandleControlObject
