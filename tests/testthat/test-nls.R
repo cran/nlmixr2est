@@ -1,5 +1,9 @@
 nmTest({
 
+  .nlmixr <- function(...) {
+    suppressMessages(nlmixr2(...))
+  }
+
   test_that("nls supports interp", {
 
     one.cmt <- function() {
@@ -44,6 +48,28 @@ nmTest({
 
   })
 
+  test_that("nls all 1 issue", {
+
+    pheno <- function() {
+      ini({
+        tcl <- log(1) # typical value of clearance
+        tv <-  log(1)   # typical value of volume
+        add.err <- 0.1    # residual variability
+      })
+      model({
+        cl <- exp(tcl ) # individual value of clearance
+        v <- exp(tv)    # individual value of volume
+        ke <- cl / v            # elimination rate constant
+        d/dt(A1) = - ke * A1    # model differential equation
+        cp = A1 / v             # concentration in plasma
+        cp ~ add(add.err)       # define error model
+      })
+    }
+
+    expect_error(.nlmixr(pheno, nlmixr2data::pheno_sd, est="nls", nlsControl(algorithm="LM",print=0L)), NA)
+
+  })
+
   test_that("nls makes sense", {
 
     d <- nlmixr2data::theo_sd
@@ -66,11 +92,11 @@ nmTest({
     }
     skip_if_not(rxode2::.linCmtSensB())
 
-    fit1 <- nlmixr(one.cmt, d, est="nls")
+    fit1 <- .nlmixr(one.cmt, d, est="nls")
 
     expect_true(inherits(fit1, "nlmixr2.nls"))
 
-    fit1 <- nlmixr(one.cmt, d, est="nls", nlsControl(solveType = "fun"))
+    fit1 <- .nlmixr(one.cmt, d, est="nls", nlsControl(solveType = "fun"))
 
     Treated <- Puromycin[Puromycin$state == "treated", ]
     names(Treated) <- gsub("rate", "DV", gsub("conc", "time", names(Treated)))
@@ -88,7 +114,7 @@ nmTest({
       })
     }
 
-    fit1 <- nlmixr(f, Treated, est="nls", control=nlsControl(algorithm="default"))
+    fit1 <- .nlmixr(f, Treated, est="nls", control=nlsControl(algorithm="default"))
 
     expect_true(inherits(fit1, "nlmixr2.nls"))
   })

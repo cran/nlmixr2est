@@ -17,7 +17,7 @@ use.utf <- function() {
   } else {
     l10n_info()$`UTF-8` && !is.latex()
   }
-}
+ }
 
 is.latex <- function() {
   if (!("knitr" %in% loadedNamespaces())) {
@@ -61,6 +61,32 @@ is.latex <- function() {
     control = .control, hessian = FALSE
   )
   .ret$x <- .ret$par
+  .ret
+}
+
+.optimize <- function(par, fn, gr, lower=-Inf, upper=Inf, control=list(), ...) {
+  # focei assumes par is the initial estimate (ignored in Brent's method)
+  # fn  is the function to calculate the objective function
+  # gr  is the function to calculate the gradient (ignored)
+  # lower is the lower bound, in this case it must be length 1
+  # upper is the upper bound, in this case it must be length 1
+  .lower <- rxode2::expit(lower)
+  if (is.na(.lower)) .lower <- 0.0
+  .upper <- rxode2::expit(upper)
+  if (is.na(.upper)) .upper <- 1.0
+  f <- function(x) {
+    fn(rxode2::logit(x))
+  }
+  .ret <- stats::optimize(f, c(.lower, .upper), tol=control$abstol)
+  f <- fn
+  .range <- rxode2::logit(.ret$minimum) + c(-4,4)*control$abstol
+  .range[1] <- max(lower, .range[1])
+  .range[2] <- min(upper, .range[2])
+  .ret <- stats::optimize(f, .range, tol=control$abstol)
+  .ret$x <- .ret$minimum
+  .ret$message <- "stats::optimize for 1 dimensional optimization"
+  .ret$convergence <- 0L
+  .ret$value <- .ret$objective
   .ret
 }
 
@@ -257,7 +283,6 @@ rxGetDistributionFoceiLines <- function(line) {
   UseMethod("rxGetDistributionFoceiLines")
 }
 
-.rxPredLlik <- NULL
 #' Get pred only options
 #'
 #' @param env  rxode2 environment option
@@ -269,10 +294,7 @@ rxGetDistributionFoceiLines <- function(line) {
 #'
 #' @noRd
 .getRxPredLlikOption <-function() {
-  if (inherits(.rxPredLlik, "logical")) {
-    return(.rxPredLlik)
-  }
-  FALSE
+  nlmixr2global$rxPredLlik
 }
 
 #' @export
@@ -350,8 +372,8 @@ rxUiGet.foceiModel0 <- function(x, ...) {
 
 #' @export
 rxUiGet.foceiModel0ll <- function(x, ...) {
-  assignInMyNamespace(".rxPredLlik", TRUE)
-  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
+  nlmixr2global$rxPredLlik <- TRUE
+  on.exit(nlmixr2global$rxPredLlik <- FALSE)
   .f <- x[[1]]
   rxode2::rxCombineErrorLines(.f, errLines=rxGetDistributionFoceiLines(.f),
                               prefixLines=.uiGetThetaEta(.f),
@@ -618,15 +640,13 @@ rxUiGet.getEBEEnv <- function(x, ...) {
 }
 #attr(rxUiGet.getEBEEnv, "desc") <- "Get the EBE environment"
 
-.toRxParam <- ""
-.toRxDvidCmt <- ""
-
 .toRx <- function(x, msg) {
   if (is.null(x)) {
     return(NULL)
   }
   .malert(msg)
-  .ret <- rxode2::rxode2(paste(.toRxParam, x, .toRxDvidCmt))
+  .ret <- rxode2::rxode2(paste(nlmixr2global$toRxParam, x,
+                               nlmixr2global$toRxDvidCmt))
   .msuccess("done")
   .ret
 }
@@ -729,9 +749,10 @@ rxUiGet.predDfFocei <- function(x, ...) {
   if (.interp != "") {
     .cmt <-paste0(.cmt, "\n", .interp)
   }
-  assignInMyNamespace(".toRxParam", paste0(.uiGetThetaEtaParams(ui, TRUE), "\n",
-                                           .cmt, "\n"))
-  assignInMyNamespace(".toRxDvidCmt", .foceiToCmtLinesAndDvid(ui))
+  nlmixr2global$toRxParam <-
+    paste0(.uiGetThetaEtaParams(ui, TRUE), "\n",
+           .cmt, "\n")
+  nlmixr2global$toRxDvidCmt <- .foceiToCmtLinesAndDvid(ui)
   if (exists("..maxTheta", s)) {
     .eventTheta <- rep(0L, s$..maxTheta)
   } else {
@@ -808,13 +829,13 @@ rxUiGet.predDfFocei <- function(x, ...) {
 rxUiGet.focei <- function(x, ...) {
   .ui <- x[[1]]
   # For t/cauchy/dnorm, predOnly model
-  assignInMyNamespace(".rxPredLlik", FALSE)
-  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
+  nlmixr2global$rxPredLlik <- FALSE
+  on.exit(nlmixr2global$rxPredLlik <- FALSE)
   .s <- rxUiGet.foceiEnv(x, ...)
   .ret <-  .innerInternal(.ui, .s)
   .predDf <- .ui$predDfFocei
   if (any(.predDf$distribution %in% c("t", "cauchy", "dnorm"))) {
-    assignInMyNamespace(".rxPredLlik", TRUE)
+    nlmixr2global$rxPredLlik <- TRUE
     .s <- rxUiGet.foceiEnv(x, ...)
     .s2 <- .innerInternal(.ui, .s)
     .w <- vapply(seq_along(.s2),
@@ -834,13 +855,13 @@ rxUiGet.focei <- function(x, ...) {
 #' @export
 rxUiGet.foce <- function(x, ...) {
   .ui <- x[[1]]
-  assignInMyNamespace(".rxPredLlik", FALSE)
-  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
+  nlmixr2global$rxPredLlik <- FALSE
+  on.exit(nlmixr2global$rxPredLlik <- FALSE)
   .s <- rxUiGet.foceEnv(x, ...)
   .ret <- .innerInternal(.ui, .s)
   .predDf <- .ui$predDfFocei
   if (any(.predDf$distribution %in% c("t", "cauchy", "dnorm"))) {
-    assignInMyNamespace(".rxPredLlik", TRUE)
+    nlmixr2global$rxPredLlik <- TRUE
     .s <- rxUiGet.foceEnv(x, ...)
     .s2 <- .innerInternal(.ui, .s)
     .w <- vapply(seq_along(.s2),
@@ -861,13 +882,13 @@ rxUiGet.foce <- function(x, ...) {
 #' @export
 rxUiGet.ebe <- function(x, ...) {
   .ui <-x[[1]]
-  assignInMyNamespace(".rxPredLlik", FALSE)
-  on.exit(assignInMyNamespace(".rxPredLlik", NULL))
+  nlmixr2global$rxPredLlik <- FALSE
+  on.exit(  nlmixr2global$rxPredLlik <- FALSE)
   .s <- rxUiGet.getEBEEnv(x, ...)
   .ret <- .innerInternal(.ui, .s)
   .predDf <- .ui$predDfFocei
   if (any(.predDf$distribution %in% c("t", "cauchy", "dnorm"))) {
-    assignInMyNamespace(".rxPredLlik", TRUE)
+    nlmixr2global$rxPredLlik <- TRUE
     .s <- rxUiGet.getEBEEnv(x, ...)
     .s2 <- .innerInternal(.ui, .s)
     .w <- vapply(seq_along(.s2),
@@ -973,7 +994,7 @@ rxUiGet.foceiEtaNames <- function(x, ...) {
     .len0 <- length(env$model$inner$state)
     .len2 <- .len0 - .len
     if (.len2 > 0) {
-      .env <- .nlmixrEvalEnv$envir
+      .env <- nlmixr2global$nlmixrEvalEnv$envir
       if (!is.environment(.env)) {
         .env <- parent.frame(1)
       }
@@ -1001,7 +1022,7 @@ rxUiGet.foceiEtaNames <- function(x, ...) {
       }
     }, integer(1), USE.NAMES=FALSE))
     if (.maxLl > 0) {
-      .env <- .nlmixrEvalEnv$envir
+      .env <- nlmixr2global$nlmixrEvalEnv$envir
       if (!is.environment(.env)) {
         .env <- parent.frame(1)
       }
@@ -1276,6 +1297,8 @@ rxUiGet.foceiSkipCov <- function(x, ...) {
       assign("skipCov",env$skipCov[seq_len(.maxTheta)], env)
     }
   }
+  assign("nEstOmega", length(which(!is.na(ui$iniDf$neta1) & !ui$iniDf$fix)),
+         env)
   if (length(env$skipCov) != .maxTheta) {
     stop("'skipCov' improperly specified", call.=FALSE)
   }
@@ -1337,7 +1360,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
 #' @export
 .foceiPreProcessData <- function(data, env, ui, rxControl=NULL) {
   if (is.null(rxControl)) {
-    .env <- .nlmixrEvalEnv$envir
+    .env <- nlmixr2global$nlmixrEvalEnv$envir
     if (!is.environment(.env)) {
       .env <- parent.frame(1)
     }
@@ -1567,7 +1590,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
 #' @author Matthew L. Fidler
 #' @noRd
 .foceiFamilyControl <- function(env, ...) {
-  .ui <- env$ui
+  .ui <- get("ui", envir=env)
   .control <- env$control
   if (is.null(.control)) {
     .control <- foceiControl()
@@ -1575,7 +1598,34 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
   if (!inherits(.control, "foceiControl")) {
     .control <- do.call(nlmixr2est::foceiControl, .control)
   }
-  .control$needOptimHess <- any(.ui$predDfFocei$distribution != "norm")
+  # Change control when there is only 1 item being optimized
+  .iniDf <- get("iniDf", envir=.ui)
+  .est <- .iniDf[!.iniDf$fix,,drop=FALSE]
+  if (length(.est$name) == 0L) {
+    .etas <- .iniDf[!is.na(.iniDf$neta1),, drop = FALSE]
+    if (length(.etas$name) == 0L) {
+      stop("no parameters to estimate", call.=FALSE)
+    } else {
+      .minfo("no population parameters to estimate; changing to a EBE estimation")
+      .control$maxOuterIterations <- 0L # no outer optimization
+      .control$normType <- 6L #"constant"
+      .control$interaction <- 0L # focei
+      .control$covMethod <- 0L # ""
+      warning("no population parameters to estimate; changing to a EBE estimation",
+              call.=FALSE)
+    }
+  } else if (length(.est$name) == 1L) {
+    .minfo("only one parameter to estimate, using stats::optimize")
+    .control$outerOpt <- -1L
+    .control$outerOptFun <- .optimize
+    .control$normType <- 6L #"constant"
+    .control$outerOptTxt <- "stats::optimize"
+  }
+  .optimHess <- any(.ui$predDfFocei$distribution != "norm")
+  if (length(.optimHess) != 1) {
+    .optimHess <- FALSE
+  }
+  .control$needOptimHess <- .optimHess
   if (.control$needOptimHess) {
     .control$interaction <- 0L
   }
@@ -1674,7 +1724,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
   assign("skipCov", .env$skipCov, envir=.ret)
   nmObjHandleModelObject(.ret$model, .ret)
   nmObjHandleControlObject(get("control", envir=.ret), .ret)
-  assignInMyNamespace(".currentTimingEnvironment", .ret) # add environment for updating timing info
+  nlmixr2global$currentTimingEnvironment <- .ret # add environment for updating timing info
   if (.control$calcTables) {
     .tmp <- try(addTable(.ret, updateObject="no", keep=.ret$table$keep, drop=.ret$table$drop,
                          table=.ret$table), silent=TRUE)
@@ -1952,8 +2002,8 @@ nlmixr2Est.output <- function(env, ...) {
 #' @author Matthew L. Fidler
 #' @export
 nlmixr2CreateOutputFromUi <- function(ui, data=NULL, control=NULL, table=NULL, env=NULL, est="none") {
-  assignInMyNamespace(".finalUiCompressed", FALSE)
-  on.exit(assignInMyNamespace(".finalUiCompressed", TRUE))
+  nlmixr2global$finalUiCompressed <- FALSE
+  on.exit(nlmixr2global$finalUiCompressed <- TRUE)
   if (inherits(ui, "function")) {
     ui <- rxode2::rxode2(ui)
   }
