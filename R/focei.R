@@ -1376,11 +1376,17 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
       toupper(x)
     }
   }, character(1))
-  requiredCols <- c("ID", "DV", "TIME", .covNames)
   if (is.null(data$ID)) data$ID <- 1L
-  checkmate::assert_names(names(data), must.include = requiredCols)
+  colnames(data) <- vapply(names(data), function(x) {
+    if (any(x == .covNames)) {
+      x
+    } else {
+      toupper(x)
+    }
+  }, character(1))
   if (is.null(data$EVID) && is.null(data$AMT)) data$EVID <- 0
   if (is.null(data$AMT)) data$AMT <- 0
+  checkmate::assert_names(names(data), must.include = c("DV", "TIME"))
   ## Make sure they are all double amounts.
   for (.v in c("DV", "TIME")) {
     data[[.v]] <- as.double(data[[.v]])
@@ -1804,6 +1810,7 @@ nlmixr2Est.focei <- function(env, ...) {
   })
   .foceiFamilyReturn(env, .ui, ..., est="focei")
 }
+attr(nlmixr2Est.focei, "covPresent") <- TRUE
 
 
 #'@rdname nlmixr2Est
@@ -1825,6 +1832,7 @@ nlmixr2Est.foce <- function(env, ...) {
   env$est <- "foce"
   .foceiFamilyReturn(env, .ui, ..., est="focei")
 }
+attr(nlmixr2Est.foce, "covPresent") <- TRUE
 
 #'@rdname nlmixr2Est
 #'@export
@@ -1843,6 +1851,7 @@ nlmixr2Est.posthoc <- function(env, ...) {
   env$est <- "posthoc"
   .foceiFamilyReturn(env, .ui, ..., est="posthoc")
 }
+attr(nlmixr2Est.posthoc, "covPresent") <- TRUE
 
 #' Add objective function line to the return object
 #'
@@ -1910,6 +1919,7 @@ nlmixr2Est.foi <- function(env, ...) {
   .addObjDfToReturn(.ret, .objDf)
   .ret
 }
+attr(nlmixr2Est.foi, "covPresent") <- TRUE
 
 
 #'@rdname nlmixr2Est
@@ -1943,6 +1953,7 @@ nlmixr2Est.fo <- function(env, ...) {
   .addObjDfToReturn(.ret, .objDf)
   .ret
 }
+attr(nlmixr2Est.fo, "covPresent") <- TRUE
 
 #'@rdname nlmixr2Est
 #'@export
