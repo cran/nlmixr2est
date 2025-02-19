@@ -1,6 +1,6 @@
-bc4fd182eaaa5daa3e8728b4836cdd49 *DESCRIPTION
+329d868ddea40a32cb3e20eaeaf35694 *DESCRIPTION
 25829d07fcfc1d601a5688b825d9d344 *NAMESPACE
-4ea699d59fe67e4cd9c64d433298f8b7 *NEWS.md
+814febec121f739b41863b4e5977d595 *NEWS.md
 0d6299758955c55654bd8d84f89a5701 *R/RcppExports.R
 eeaf52cae71c99f765ac4d4ca7a83428 *R/addCwres.R
 408f44d7fcb8295b707991cbeca7ba9d *R/asFunction.R
@@ -14,9 +14,9 @@ bb9b1abce3a520f8a6528e987064e849 *R/broom.R
 27bba1cce90640a774dcf69375f06c4a *R/cov.R
 15a2e2dec5c85b65b800420c39620aa4 *R/deparse.R
 7e93518abdb7008c1fd31c8be5f7eb77 *R/fitSim.R
-9f4019bc6c229f55bf24ae7c27acfee7 *R/focei.R
+13fc2db9325a26f3b9f7c4e9e9ae876c *R/focei.R
 17d5bcadda525a006d7b2348ff58e1fb *R/foceiControl.R
-f928f3fa06b59fa82b04d770366d2f4f *R/hook.R
+e89e7465bf14631223abf96121c5a105 *R/hook.R
 837da2fb45e9181ae29fd53ac0ea3f1e *R/ini.R
 4c7ed9edaaff4ce003c42ecc50f4909f *R/lbfgsb3c.R
 a5fbeb3d563e51b2091a9318831a47d9 *R/md5.R
@@ -32,7 +32,7 @@ acf20285bca103673d5461e3028d0c2b *R/nlmShared.R
 805429df0d8415f5c258a7be2522f478 *R/nlmixr2.R
 45448d98d35c432b0788c7944531f52e *R/nlmixr2Est.R
 ee60851f641d47afa14e8c7e33595d91 *R/nlmixr2Keywords.R
-fb68ca87c89ff6c50e0ef7a5e5f533ed *R/nlmixr2_md5.R
+9e7513d8f5e6fccf86b275a233bdc324 *R/nlmixr2_md5.R
 4e300a61b176a1516576b09f097996f3 *R/nlmixr2global.R
 1b7f3f2984bc187048345ff773cfe851 *R/nlmixr2output.R
 dbe313dbb46970545c033ef9840507ab *R/nlmixrAddObjectiveFunction.R
@@ -46,7 +46,7 @@ ee6f726f1caf11d17dc35ae3ce857a05 *R/npde.R
 15fe08e103a5f663dfd030fdaff6cfe3 *R/ofv.R
 81d895529d51dbe18abeb2914bba6b9f *R/optim.R
 b334f1ed2472ee77ac0b57b7b68c694b *R/pkpars.R
-0b13ffb22bd81b61f2bf638e4d41e00c *R/preProcessCovariatesPresent.R
+ce8eb487da96b77768208327d0774472 *R/preProcessCovariatesPresent.R
 2a26178f26e204cd4f271539e8d7a077 *R/preProcessDataUi.R
 01b87476e78b7ddc987a584150c4a93f *R/preProcessLiteralFix.R
 e1c72c8580a5348eb73e4fb4701b7186 *R/preProcessZeroOmega.R
@@ -239,13 +239,14 @@ dd91414216b28c1c14211dd4245107d3 *tests/testthat.R
 59eab8b008ad46a8da78c82a7a006695 *tests/testthat/datos_pac.qs
 ef8df4e73ea2b198454ab8a5e5aeff1f *tests/testthat/out.focei.prop.qs
 b606b5f301391558ae08586e46c7d931 *tests/testthat/test-00-reload-ll.R
-5454d1e00d94984ba687a36004f97baa *tests/testthat/test-addCwres.R
+2e921cb5aa4f46b66a078d929aee4cbe *tests/testthat/test-addCwres.R
 3aac76524d1c681066bcbe8be0a0bf65 *tests/testthat/test-augpred.R
 00db8ebca6879e95e8032dc6b560c549 *tests/testthat/test-broom.R
 a0e602dbd885ea71bbb1664ae76b187d *tests/testthat/test-coerce.R
 80fb2d39113d979e8ddced3e29123c8b *tests/testthat/test-control.R
 86c4d4e7f6e99dbcc5ceba5e4fe4edbf *tests/testthat/test-cov-focei.R
 099657fe397ef6da2b614ae9017dab3f *tests/testthat/test-cov-mu.R
+662af0df432285e2cf1ebdac6a117b8d *tests/testthat/test-cwres-3.0.3.qs
 baaf1d1651546db268310fe9f47f1d1c *tests/testthat/test-cwres.R
 3d8fe9b489b139bb9771dbdafffa8766 *tests/testthat/test-data-assert.R
 ff9ed06de0c622b06741fbcb1996267c *tests/testthat/test-fix-cov.R
