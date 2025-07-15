@@ -1,6 +1,4 @@
 nmTest({
-  .nlmixr <- function(...) suppressWarnings(suppressMessages(nlmixr(...)))
-
   test_that("nlme will pick up interpolation", {
 
     one.compartment <- function() {
@@ -281,7 +279,6 @@ nmTest({
       })
     }
 
-    skip_if_not(rxode2::.linCmtSensB())
 
     fit_nlme <- .nlmixr(one.cmt.all.mu.ref, theo_sd, est="nlme", control=nlmeControl(verbose=FALSE, returnObject=TRUE))
     expect_true(!all(ranef(fit_nlme)[[1]] == 0))

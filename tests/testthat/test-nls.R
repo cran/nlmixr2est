@@ -1,9 +1,4 @@
 nmTest({
-
-  .nlmixr <- function(...) {
-    suppressMessages(nlmixr2(...))
-  }
-
   test_that("nls supports interp", {
 
     one.cmt <- function() {
@@ -90,7 +85,6 @@ nmTest({
         linCmt() ~ add(add.sd)
       })
     }
-    skip_if_not(rxode2::.linCmtSensB())
 
     fit1 <- .nlmixr(one.cmt, d, est="nls")
 

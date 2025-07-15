@@ -1,9 +1,4 @@
 nmTest({
-
-  .nlmixr2 <- .nlmixr <- function(...) {
-    suppressMessages(nlmixr(...))
-  }
-
   test_that("test augPred", {
 
     PKdata <- nlmixr2data::warfarin %>%
@@ -30,26 +25,20 @@ nmTest({
       })
     }
 
-    skip_if_not(rxode2::.linCmtSensB())
     fitOne.comp.KA.solved_S <-
       .nlmixr(
         One.comp.KA.solved,
         PKdata,
         est = "saem",
-        saemControl(nBurn = 200,
-                    nEm   = 300,
-                    print = 50),
+        control = saemControlFast,
         tableControl(cwres = TRUE, npde=TRUE)
       )
-
     expect_error(augPred(fitOne.comp.KA.solved_S), NA)
 
     ap <- augPred(fitOne.comp.KA.solved_S)
 
     expect_equal(as.character(ap[ap$id == 1 & ap$time == 120, "ind"]),
                  c("Individual", "Population"))
-
-    skip_if_not(rxode2::.linCmtSensB())
 
       df <-
         tibble::tibble(
@@ -128,17 +117,17 @@ nmTest({
         })
       }
 
-    skip_if_not(rxode2::.linCmtSensB())
-
-      cmt2fit.logn <- .nlmixr(cmt2, dat2, "saem",
-                                      control=saemControl(print=0, nBurn = 1, nEm = 1),
-                                      table=tableControl(cwres=TRUE, npde=TRUE))
+      cmt2fit.logn <-
+        .nlmixr(
+          cmt2, dat2, "saem",
+          control = saemControlFast,
+          table=tableControl(cwres=TRUE, npde=TRUE)
+        )
 
       expect_error(augPred(cmt2fit.logn), NA)
   })
 
   test_that("augPred with pop only data", {
-    skip_if_not(rxode2::.linCmtSensB())
     one.cmt <- function() {
       ini({
         tka <- 0.45
@@ -153,12 +142,13 @@ nmTest({
         linCmt() ~ add(add.sd)
       })
     }
-    skip_if_not(rxode2::.linCmtSensB())
 
-    fit2 <- .nlmixr(one.cmt, nlmixr2data::theo_sd, est="focei",
-                   control = foceiControl(eval.max = 1),
-                   table=tableControl(npde=TRUE))
-
+    fit2 <-
+      .nlmixr(
+        one.cmt, nlmixr2data::theo_sd, est="focei",
+        control = foceiControl(eval.max = 1),
+        table=tableControl(npde=TRUE)
+      )
     expect_error(augPred(fit2), NA)
   })
 
@@ -203,10 +193,8 @@ nmTest({
       })
     }
 
-    fit <- .nlmixr2(mod, dat, "posthoc")
+    fit <- .nlmixr(mod, dat, "posthoc")
 
     expect_error(augPred(fit), NA)
-
-
   })
 })
