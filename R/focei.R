@@ -261,6 +261,7 @@ rxUiGet.foceiParams <- function(x, ...) {
   .ui <- x[[1]]
   .uiGetThetaEtaParams(.ui, str=TRUE)
 }
+attr(rxUiGet.foceiParams, "rstudio") <- "params(THETA[1], ETA[1])"
 
 #' @export
 rxUiGet.foceiCmtPreModel <- function(x, ...) {
@@ -269,6 +270,7 @@ rxUiGet.foceiCmtPreModel <- function(x, ...) {
   if (length(.state) == 0) return("")
   paste(paste0("cmt(", .state, ")"), collapse="\n")
 }
+attr(rxUiGet.foceiCmtPreModel, "rstudio") <- ""
 
 # This handles the errors for focei
 .createFoceiLineObject <- function(x, line) {
@@ -380,6 +382,7 @@ rxUiGet.foceiModel0 <- function(x, ...) {
                               dvidLine=FALSE)
 }
 #attr(rxUiGet.foceiModel0, "desc") <- "FOCEi model base"
+attr(rxUiGet.foceiModel0, "rstudio") <- quote(rxModelVars({}))
 
 #' @export
 rxUiGet.foceiModel0ll <- function(x, ...) {
@@ -393,6 +396,8 @@ rxUiGet.foceiModel0ll <- function(x, ...) {
                               cmtLines=FALSE,
                               dvidLine=FALSE)
 }
+
+attr(rxUiGet.foceiModel0ll, "rstudio") <- quote(rxModelVars({}))
 
 
 .foceiPrune <- function(x, fullModel=TRUE) {
@@ -452,12 +457,14 @@ rxUiGet.loadPruneSens <- function(x, ...) {
   .loadSymengine(.foceiPrune(x), promoteLinSens = TRUE)
 }
 #attr(rxUiGet.loadPruneSens, "desc") <- "load sensitivity with linCmt() promoted"
+attr(rxUiGet.loadPruneSens, "rstudio") <- emptyenv()
 
 #' @export
 rxUiGet.loadPrune <- function(x, ...) {
   .loadSymengine(.foceiPrune(x), promoteLinSens = FALSE)
 }
 #attr(rxUiGet.loadPrune, "desc") <- "load sensitivity without linCmt() promoted"
+attr(rxUiGet.loadPrune, "rstudio") <- emptyenv()
 
 .sensEtaOrTheta <- function(s, theta=FALSE) {
   .etaVars <- NULL
@@ -481,6 +488,7 @@ rxUiGet.foceiEtaS <- function(x, ..., theta=FALSE) {
   .sensEtaOrTheta(.s)
 }
 #attr(rxUiGet.foceiEtaS, "desc") <- "Get symengine environment with eta sensitivities"
+attr(rxUiGet.foceiEtaS, "rstudio") <- emptyenv()
 
 
 #' @export
@@ -489,6 +497,7 @@ rxUiGet.foceiThetaS <- function(x, ..., theta=FALSE) {
   .sensEtaOrTheta(.s, theta=TRUE)
 }
 #attr(rxUiGet.foceiEtaS, "desc") <- "Get symengine environment with eta sensitivities"
+attr(rxUiGet.foceiThetaS, "rstudio") <- emptyenv()
 
 #' @export
 rxUiGet.foceiHdEta <- function(x, ...) {
@@ -536,6 +545,7 @@ rxUiGet.foceiHdEta <- function(x, ...) {
   .s
 }
 attr(rxUiGet.foceiHdEta, "desc") <- "Generate the d(err)/d(eta) values for FO related methods"
+attr(rxUiGet.foceiHdEta, "rstudio") <- emptyenv()
 
 
 #' Finalize inner rxode2 based on symengine saved info
@@ -642,6 +652,7 @@ rxUiGet.foceiEnv <- function(x, ...) {
   .s
 }
 #attr(rxUiGet.foceiEnv, "desc") <- "Get the focei environment"
+attr(rxUiGet.foceiEnv, "rstudio") <- emptyenv()
 
 #' @export
 rxUiGet.foceEnv <- function(x, ...) {
@@ -657,6 +668,7 @@ rxUiGet.foceEnv <- function(x, ...) {
   .s
 }
 #attr(rxUiGet.foceEnv, "desc") <- "Get the foce environment"
+attr(rxUiGet.foceEnv, "rstudio") <- emptyenv()
 
 
 #' @export
@@ -671,6 +683,7 @@ rxUiGet.getEBEEnv <- function(x, ...) {
   .s
 }
 #attr(rxUiGet.getEBEEnv, "desc") <- "Get the EBE environment"
+attr(rxUiGet.getEBEEnv, "rstudio") <- emptyenv()
 
 .toRx <- function(x, msg) {
   if (is.null(x)) {
@@ -711,6 +724,8 @@ rxUiGet.predDfFocei <- function(x, ...) {
     }
   }
 }
+attr(rxUiGet.predDfFocei, "rstudio") <- NA
+
 
 
 .rxFinalizePred <- function(.s, sum.prod = FALSE,
@@ -954,12 +969,15 @@ rxUiGet.foceiModelDigest <- function(x, ...) {
                    .ui$lstExpr))
 }
 #attr(rxUiGet.foceiModelDigest, "desc") <- "Get the md5 digest for the focei model"
+attr(rxUiGet.foceiModelDigest, "rstudio") <- "hash"
+
 #' @export
 rxUiGet.foceiModelCache <- function(x, ...) {
   file.path(rxode2::rxTempDir(),
             paste0("focei-", rxUiGet.foceiModelDigest(x, ...), ".qs"))
 }
 #attr(rxUiGet.foceiModelCache, "desc") <- "Get the focei cache file for a model"
+attr(rxUiGet.foceiModelCache, "rstudio") <- "file"
 
 #' @export
 rxUiGet.foceiModel <- function(x, ...) {
@@ -999,6 +1017,7 @@ rxUiGet.foceiFixed <- function(x, ...) {
   c(.fix, .dft$fix)
 }
 #attr(rxUiGet.foFixed, "desc") <- "focei theta fixed vector"
+attr(rxUiGet.foceiFixed, "rstudio") <- c(FALSE, TRUE)
 
 #' @export
 rxUiGet.foceiEtaNames <- function(x, ...) {
@@ -1008,9 +1027,10 @@ rxUiGet.foceiEtaNames <- function(x, ...) {
   .dft[.dft$neta1 == .dft$neta2, "name"]
 }
 #attr(rxUiGet.foceiEtaNames, "desc") <- "focei eta names"
+attr(rxUiGet.foceiEtaNames, "rstudio") <- c("eta.ka", "eta.cl", "eta.vc")
 
-
-#' This assigns the tolerances based on a different tolerance for the sensitivity equations
+#' This assigns the tolerances based on a different tolerance for the
+#' sensitivity equations
 #'
 #' It will update and modify the control inside of the UI.
 #'
@@ -1240,6 +1260,7 @@ rxUiGet.scaleCtheta <- function(x, ...) {
   .foceiOptEnvSetupScaleC(.ui, .env)
   .env$scaleC[!.ui$iniDf$fix]
 }
+attr(rxUiGet.scaleCtheta, "rstudio") <- c(1.0, NA_real_)
 
 #' @export
 rxUiGet.scaleCnls <- function(x, ...) {
@@ -1249,6 +1270,7 @@ rxUiGet.scaleCnls <- function(x, ...) {
   .foceiOptEnvSetupScaleC(.ui, .env)
   .env$scaleC[!.ui$iniDf$fix & !(.ui$iniDf$err %in% c("add", "prop", "pow"))]
 }
+attr(rxUiGet.scaleCnls, "rstudio") <- c(1.0, NA_real_)
 
 #' This sets up the transformation bounds and indexes and bounds for inner.cpp
 #'
@@ -1307,6 +1329,7 @@ rxUiGet.foceiMuRefVector <- function(x, ...) {
   }
 }
 #attr(rxUiGet.foceiMuRefVector, "desc") <- "focei mu ref vector"
+attr(rxUiGet.foceiMuRefVector, "rstudio") <- c(0L, -1L)
 
 #' @export
 rxUiGet.foceiSkipCov <- function(x, ...) {
@@ -1323,6 +1346,7 @@ rxUiGet.foceiSkipCov <- function(x, ...) {
   }
 }
 #attr(rxUiGet.foceiSkipCov, "desc") <- "what covariance elements to skip"
+attr(rxUiGet.foceiSkipCov, "rstudio") <- c(FALSE, TRUE)
 
 #'  Setup the skip covariate function
 #'
@@ -1396,6 +1420,8 @@ rxUiGet.foceiOptEnv <- function(x, ...) {
   .env
 }
 attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
+attr(rxUiGet.foceiOptEnv, "rstudio") <- emptyenv()
+
 #' This function process the data for use in focei
 #'
 #' The $origData is the data that is fed into the focei before modification
@@ -1649,14 +1675,14 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
 #' @return nothing, called for side effects
 #' @author Matthew L. Fidler
 #' @noRd
-.foceiFamilyControl <- function(env, ...) {
+.foceiFamilyControl <- function(env, ..., type="foceiControl") {
   .ui <- get("ui", envir=env)
   .control <- env$control
   if (is.null(.control)) {
-    .control <- foceiControl()
+    .control <- do.call(type)
   }
-  if (!inherits(.control, "foceiControl")) {
-    .control <- do.call(nlmixr2est::foceiControl, .control)
+  if (!inherits(.control, type)) {
+    .control <- do.call(type, .control)
   }
   if (inherits(nlmixr2global$etaMat, "nlmixr2FitCore") &&
         is.null(.control[["etaMat"]])) {
@@ -1754,6 +1780,24 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
       .env$cov <- NULL
     }
   }
+  if (.control$nAGQ > 0) {
+    .ag <- .agq(length(ui$eta), .control$nAGQ)
+    .env$aqn <- as.integer(.ag$n)
+    .env$qx <- .ag$x
+    .env$qw <- .ag$w
+    .env$qfirst <- .ag$first
+    .env$nAGQ <- .control$nAGQ
+    .env$aqLow <- .control$agqLow
+    .env$aqHi <- .control$agqHi
+  } else {
+    .env$aqn <- 0L
+    .env$qx <- double(0)
+    .env$qw <- double(0)
+    .env$qfirst <- FALSE
+    .env$nAGQ <- 0L
+    .env$aqLow <- -Inf
+    .env$aqHi <- Inf
+  }
   if (getOption("nlmixr2.retryFocei", TRUE)) {
     .ret0 <- try(.foceiFitInternal(.env))
   } else {
@@ -1792,7 +1836,10 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
   nmObjHandleControlObject(get("control", envir=.ret), .ret)
   nlmixr2global$currentTimingEnvironment <- .ret # add environment for updating timing info
   if (.control$calcTables) {
-    .tmp <- try(addTable(.ret, updateObject="no", keep=.ret$table$keep, drop=.ret$table$drop,
+    .tmp <- try(addTable(.ret,
+                         updateObject="no",
+                         keep=.ret$table$keep,
+                         drop=.ret$table$drop,
                          table=.ret$table), silent=TRUE)
     if (inherits(.tmp, "try-error")) {
       warning("error calculating tables, returning without table step", call.=FALSE)
@@ -1815,7 +1862,7 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
       .env$saem0 <- .saem
     }
     if (.control$compress) {
-      for (.item in c("origData", "phiM", "parHistData", "saem0")) {
+      for (.item in c("origData", "parHistData", "phiM")) {
         if (exists(.item, .env)) {
           .obj <- get(.item, envir=.env)
           .size <- utils::object.size(.obj)
@@ -1856,62 +1903,25 @@ attr(rxUiGet.foceiOptEnv, "desc") <- "Get focei optimization environment"
 #'@export
 nlmixr2Est.focei <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'focei'",
-                                   .var.name=.ui$modelName)
+  rxode2::assertRxUiIovNoCor(.ui, " for the estimation routine 'focei'",
+                             .var.name=.ui$modelName)
   if (!rxode2hasLlik()) {
     rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'focei'",
                                       .var.name=.ui$modelName)
   }
+  .uiApplyIov(env)
   .foceiFamilyControl(env, ...)
   on.exit({
     if (exists("control", envir=.ui)) {
       rm("control", envir=.ui)
     }
   })
-  .foceiFamilyReturn(env, .ui, ..., est="focei")
+  .ui <- env$ui
+  .ret <- .foceiFamilyReturn(env, .ui, ..., est="focei")
+  .ret <- .uiFinalizeIov(.ret)
+  .ret
 }
 attr(nlmixr2Est.focei, "covPresent") <- TRUE
-
-
-#'@rdname nlmixr2Est
-#'@export
-nlmixr2Est.foce <- function(env, ...) {
-  .ui <- env$ui
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'foce'", .var.name=.ui$modelName)
-  if (!rxode2hasLlik()) {
-    rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'focei'", .var.name=.ui$modelName)
-  }
-
-  .foceiFamilyControl(env, ...)
-  rxode2::rxAssignControlValue(.ui, "interaction", 0L)
-  on.exit({
-    if (exists("control", envir=.ui)) {
-      rm("control", envir=.ui)
-    }
-  })
-  env$est <- "foce"
-  .foceiFamilyReturn(env, .ui, ..., est="focei")
-}
-attr(nlmixr2Est.foce, "covPresent") <- TRUE
-
-#'@rdname nlmixr2Est
-#'@export
-nlmixr2Est.posthoc <- function(env, ...) {
-  .ui <- env$ui
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'posthoc'", .var.name=.ui$modelName)
-  .foceiFamilyControl(env, ...)
-  rxode2::rxAssignControlValue(.ui, "interaction", 0L)
-  rxode2::rxAssignControlValue(.ui, "covMethod", 0L)
-  rxode2::rxAssignControlValue(.ui, "maxOuterIterations", 0L)
-  on.exit({
-    if (exists("control", envir=.ui)) {
-      rm("control", envir=.ui)
-    }
-  })
-  env$est <- "posthoc"
-  .foceiFamilyReturn(env, .ui, ..., est="posthoc")
-}
-attr(nlmixr2Est.posthoc, "covPresent") <- TRUE
 
 #' Add objective function line to the return object
 #'
@@ -1946,74 +1956,6 @@ attr(nlmixr2Est.posthoc, "covPresent") <- TRUE
   assign("objDf", rbind(.objDf1, objDf), envir=ret)
 }
 
-#'@rdname nlmixr2Est
-#'@export
-nlmixr2Est.foi <- function(env, ...) {
-  .ui <- env$ui
-  rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'foi'", .var.name=.ui$modelName)
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'foi'", .var.name=.ui$modelName)
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'foi'", .var.name=.ui$modelName)
-  rxode2::assertRxUiMixedOnly(.ui, " for the estimation routine 'foi'", .var.name=.ui$modelName)
-
-  .foceiFamilyControl(env, ...)
-  .control <- .ui$control
-  rxode2::rxAssignControlValue(.ui, "interaction", 0L)
-  rxode2::rxAssignControlValue(.ui, "covMethod", 0L)
-  rxode2::rxAssignControlValue(.ui, "fo", TRUE)
-  rxode2::rxAssignControlValue(.ui, "boundTol", 0)
-  on.exit({
-    if (exists("control", envir=.ui)) {
-      rm("control", envir=.ui)
-    }
-  })
-  env$skipTable <- TRUE
-  .ret <- .foceiFamilyReturn(env, .ui, ...)
-  .objDf <- .ret$objDf
-  .ui <- .ret$ui
-  assign("control", .control, envir=.ui)
-  .foceiFamilyControl(env, ...)
-  rxode2::rxAssignControlValue(.ui, "interaction", 1L)
-  rxode2::rxAssignControlValue(.ui, "maxOuterIterations", 0L)
-  env$skipTable <- FALSE
-  .ret <- .foceiFamilyReturn(env, .ui, ..., method="FO", est="foi")
-  .addObjDfToReturn(.ret, .objDf)
-  .ret
-}
-attr(nlmixr2Est.foi, "covPresent") <- TRUE
-
-
-#'@rdname nlmixr2Est
-#'@export
-nlmixr2Est.fo <- function(env, ...) {
-  .ui <- env$ui
-  rxode2::assertRxUiTransformNormal(.ui, " for the estimation routine 'fo'", .var.name=.ui$modelName)
-  rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'fo'", .var.name=.ui$modelName)
-  rxode2::assertRxUiMixedOnly(.ui, " for the estimation routine 'fo'", .var.name=.ui$modelName)
-
-  .foceiFamilyControl(env, ...)
-  .control <- .ui$control
-  rxode2::rxAssignControlValue(.ui, "interaction", 0L)
-  rxode2::rxAssignControlValue(.ui, "covMethod", 0L)
-  rxode2::rxAssignControlValue(.ui, "fo", TRUE)
-  rxode2::rxAssignControlValue(.ui, "boundTol", 0)
-  on.exit({
-    if (exists("control", envir=.ui)) {
-      rm("control", envir=.ui)
-    }
-  })
-  env$skipTable <- TRUE
-  .ret <- .foceiFamilyReturn(env, .ui, ...)
-  .objDf <- .ret$objDf
-  .ui <- .ret$ui
-  assign("control", .control, envir=.ui)
-  .foceiFamilyControl(env, ...)
-  rxode2::rxAssignControlValue(.ui, "interaction", 0L)
-  rxode2::rxAssignControlValue(.ui, "maxOuterIterations", 0L)
-  .ret <- .foceiFamilyReturn(env, .ui, ..., method="FO", est="fo")
-  .addObjDfToReturn(.ret, .objDf)
-  .ret
-}
-attr(nlmixr2Est.fo, "covPresent") <- TRUE
 
 #'@rdname nlmixr2Est
 #'@export

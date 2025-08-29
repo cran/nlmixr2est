@@ -208,9 +208,6 @@
 #' @param eigen A boolean indicating if eigenvectors are calculated
 #'     to include a condition number calculation.
 #'
-#' @param addPosthoc Boolean indicating if posthoc parameters are
-#'     added to the table output.
-#'
 #' @param printNcol Number of columns to printout before wrapping
 #'     parameter estimates/gradient
 #'
@@ -498,7 +495,6 @@
 #'     initial estimate by.  So each iteration during the covariance
 #'     step is equal to the new step size = (prior step size)*gillStepCov
 #'
-#'
 #' @param gillStepCovLlik Same as above but during generalized focei
 #'   log-likelihood
 #'
@@ -697,6 +693,23 @@
 #'   - `n` the last eta and eta=0 are used, as well as n-1 sampled
 #'   etas from the omega matrix
 #'
+#' @param nAGQ Number of Gauss-Hermite Adaptive Quadrature points to
+#'   take.  When `nAGQ=0`, the AGQ is not used.  With `nAGQ=1`, this
+#'   is equivalent to the Laplace method. The adaptive quadrature
+#'   expands every node for each of the ETAs, so it can be quite
+#'   expensive with a large amount of ETAs.  Once the EBE is obtained
+#'   for a subject, you will have nAGQ^neta additional function
+#'   evaluations for even nAGQ numbers and (nAGQ^neta)-1 additional
+#'   function evaluations for odd nAGQ numbers.
+#'
+#' @param agqLow The lower bound for adaptive quadrature
+#'   log-likelihood. By default this is -Inf; in the original nlmixr's
+#'   gnlmm it was -700.
+#'
+#' @param agqHi The upper bound for adaptive quadrature
+#'   log-likelihood.  By default this is Inf; in the original nlmixr's
+#'   gnlmm was 400.
+#'
 #' @inheritParams rxode2::rxSolve
 #' @inheritParams minqa::bobyqa
 #'
@@ -770,7 +783,6 @@ foceiControl <- function(sigdig = 3, #
                          lbfgsPgtol = 0, #
                          lbfgsFactr = NULL, #
                          eigen = TRUE, #
-                         addPosthoc = TRUE, #
                          diagXform = c("sqrt", "log", "identity"), #
                          sumProd = FALSE, #
                          optExpression = TRUE,#
@@ -874,7 +886,10 @@ foceiControl <- function(sigdig = 3, #
                          zeroGradFirstReset=TRUE,
                          zeroGradRunReset=TRUE,
                          zeroGradBobyqa=TRUE,
-                         mceta=-1L) { #
+                         mceta=-1L,
+                         nAGQ=0,
+                         agqLow=-Inf,
+                         agqHi=Inf) { #
   if (!is.null(sigdig)) {
     checkmate::assertNumeric(sigdig, lower=1, finite=TRUE, any.missing=TRUE, len=1)
     if (is.null(boundTol)) {
@@ -1009,11 +1024,6 @@ foceiControl <- function(sigdig = 3, #
     checkmate::assertLogical(eigen, any.missing=FALSE, len=1)
   }
   eigen <- as.integer(eigen)
-
-  if (!checkmate::testIntegerish(addPosthoc, lower=0, upper=1, any.missing=FALSE, len=1)) {
-    checkmate::assertLogical(addPosthoc, any.missing=FALSE, len=1)
-  }
-  addPosthoc <- as.integer(addPosthoc)
 
   checkmate::assertLogical(sumProd, any.missing=FALSE, len=1)
   checkmate::assertLogical(optExpression, any.missing=FALSE, len=1)
@@ -1268,6 +1278,9 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertIntegerish(mceta, lower=-1, len=1,any.missing=FALSE)
 
   checkmate::assertNumeric(smatPer, any.missing=FALSE, lower=0, upper=1, len=1)
+  checkmate::assertIntegerish(nAGQ, lower=0, len=1, any.missing=FALSE)
+  checkmate::assertNumeric(agqHi, len=1, any.missing=FALSE)
+  checkmate::assertNumeric(agqLow, len=1, any.missing=FALSE)
   .ret <- list(
     maxOuterIterations = as.integer(maxOuterIterations),
     maxInnerIterations = as.integer(maxInnerIterations),
@@ -1284,7 +1297,6 @@ foceiControl <- function(sigdig = 3, #
     covMethod = covMethod,
     centralDerivEps = centralDerivEps,
     eigen = eigen,
-    addPosthoc = addPosthoc,
     diagXform = match.arg(diagXform),
     sumProd = sumProd,
     optExpression = optExpression,
@@ -1389,7 +1401,10 @@ foceiControl <- function(sigdig = 3, #
     zeroGradFirstReset=zeroGradFirstReset,
     zeroGradRunReset=zeroGradRunReset,
     zeroGradBobyqa=zeroGradBobyqa,
-    mceta=as.integer(mceta)
+    mceta=as.integer(mceta),
+    nAGQ=as.integer(nAGQ),
+    agqHi=as.double(agqHi),
+    agqLow=as.double(agqLow)
   )
   if (length(etaMat) == 1L && is.na(etaMat)) {
     .ret$etaMat <- NA
