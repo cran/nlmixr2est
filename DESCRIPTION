@@ -2,7 +2,7 @@ Type: Package
 Package: nlmixr2est
 Title: Nonlinear Mixed Effects Models in Population PK/PD, Estimation
         Routines
-Version: 4.1.0
+Version: 4.1.1
 Authors@R: c(
     person("Matthew", "Fidler", , "matthew.fidler@gmail.com", role = c("aut", "cre"),
            comment = c(ORCID = "0000-0001-8538-6691")),
@@ -57,9 +57,9 @@ Config/testthat/edition: 3
 Encoding: UTF-8
 Language: en-US
 NeedsCompilation: yes
-RoxygenNote: 7.3.2
+RoxygenNote: 7.3.3
 LazyData: true
-Packaged: 2025-08-29 18:48:12 UTC; matt
+Packaged: 2025-10-08 20:10:28 UTC; matt
 Author: Matthew Fidler [aut, cre] (ORCID:
     <https://orcid.org/0000-0001-8538-6691>),
   Yuan Xiong [aut],
@@ -85,4 +85,4 @@ Author: Matthew Fidler [aut, cre] (ORCID:
   Katharine Mullen [cph],
   Ben Goodrich [ctb]
 Repository: CRAN
-Date/Publication: 2025-08-29 19:40:02 UTC
+Date/Publication: 2025-10-09 05:10:03 UTC
