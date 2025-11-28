@@ -2,7 +2,7 @@ Type: Package
 Package: nlmixr2est
 Title: Nonlinear Mixed Effects Models in Population PK/PD, Estimation
         Routines
-Version: 4.1.1
+Version: 5.0.2
 Authors@R: c(
     person("Matthew", "Fidler", , "matthew.fidler@gmail.com", role = c("aut", "cre"),
            comment = c(ORCID = "0000-0001-8538-6691")),
@@ -45,10 +45,10 @@ URL: https://github.com/nlmixr2/nlmixr2est,
 Depends: nlmixr2data, R (>= 4.0)
 Imports: backports, checkmate, cli, graphics, knitr, lbfgsb3c, lotri,
         magrittr, Matrix, methods, minqa, n1qn1 (>= 6.0.1-12), nlme,
-        Rcpp, rex, rxode2 (>= 4.1.0), stats, symengine, utils
+        Rcpp, rex, rxode2 (>= 5.0.0), stats, symengine, utils
 Suggests: broom.mixed, crayon, data.table, devtools, digest, dplyr (>=
-        1.1.0), generics, nloptr, qs, sys, testthat, tibble, withr,
-        xgxr, sfsmisc, minpack.lm, remotes, fastGHQuad
+        1.1.0), generics, nloptr, qs2, qs, sys, testthat, tibble,
+        withr, xgxr, sfsmisc, minpack.lm, remotes, fastGHQuad
 LinkingTo: BH, n1qn1 (>= 6.0.1-12), lbfgsb3c (>= 2024-3.5), lotri (>=
         0.5.0), Rcpp, RcppArmadillo (>= 0.11.2.3.1), RcppEigen, rxode2
         (> 4.0.3)
@@ -59,7 +59,7 @@ Language: en-US
 NeedsCompilation: yes
 RoxygenNote: 7.3.3
 LazyData: true
-Packaged: 2025-10-08 20:10:28 UTC; matt
+Packaged: 2025-11-28 15:23:00 UTC; matt
 Author: Matthew Fidler [aut, cre] (ORCID:
     <https://orcid.org/0000-0001-8538-6691>),
   Yuan Xiong [aut],
@@ -85,4 +85,4 @@ Author: Matthew Fidler [aut, cre] (ORCID:
   Katharine Mullen [cph],
   Ben Goodrich [ctb]
 Repository: CRAN
-Date/Publication: 2025-10-09 05:10:03 UTC
+Date/Publication: 2025-11-28 19:20:02 UTC
