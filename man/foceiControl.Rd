@@ -60,7 +60,7 @@ foceiControl(
   fo = FALSE,
   covTryHarder = FALSE,
   outerOpt = c("nlminb", "bobyqa", "lbfgsb3c", "L-BFGS-B", "mma", "lbfgsbLG", "slsqp",
-    "Rvmmin"),
+    "Rvmmin", "uobyqa", "newuoa"),
   innerOpt = c("n1qn1", "BFGS"),
   rhobeg = 0.2,
   rhoend = NULL,
@@ -108,6 +108,7 @@ foceiControl(
   etaMat = NULL,
   repeatGillMax = 1,
   stickyRecalcN = 4,
+  indTolRelax = TRUE,
   gradProgressOfvTime = 10,
   addProp = c("combined2", "combined1"),
   badSolveObjfAdj = 100,
@@ -123,7 +124,8 @@ foceiControl(
   mceta = -1L,
   nAGQ = 0,
   agqLow = -Inf,
-  agqHi = Inf
+  agqHi = Inf,
+  boundedTransform = TRUE
 )
 }
 \arguments{
@@ -739,6 +741,12 @@ parameter.}
 \item{stickyRecalcN}{The number of bad ODE solves before reducing
 the atol/rtol for the rest of the problem.}
 
+\item{indTolRelax}{When `TRUE` (default), only subjects whose ODE
+solve produced NaN/Inf have their tolerances relaxed, and the
+relaxed tolerance persists across optimizer calls (sticky).
+When `FALSE`, all subjects have their tolerances relaxed on
+each retry and tolerances are reset afterward.}
+
 \item{gradProgressOfvTime}{This is the time for a single objective
 function evaluation (in seconds) to start progress bars on gradient evaluations}
 
@@ -848,6 +856,16 @@ gnlmm it was -700.}
 \item{agqHi}{The upper bound for adaptive quadrature
 log-likelihood.  By default this is Inf; in the original nlmixr's
 gnlmm was 400.}
+
+\item{boundedTransform}{boolean indicating if the bounded
+parameters should by transformed when using a unbounded
+optimization method to make sure they are in bounds.  By default
+this is `TRUE`, which transforms during optimization and
+back-transforms for the final estimates.  When `FALSE`, the
+optimization is performed on the original scale and the bounds
+are passed to the optimization method.  When `NA`, the bounded
+parameters are transformed for the optimization, but the final
+estimates are not back-transformed.}
 }
 \value{
 The control object that changes the options for the FOCEi
@@ -887,9 +905,9 @@ Optimization.
 
 \code{\link[rxode2]{rxSolve}}
 
-Other Estimation control: 
-\code{\link{nlmixr2NlmeControl}()},
-\code{\link{saemControl}()}
+Other Estimation control:
+\code{\link[=nlmixr2NlmeControl]{nlmixr2NlmeControl()}},
+\code{\link[=saemControl]{saemControl()}}
 }
 \author{
 Matthew L. Fidler

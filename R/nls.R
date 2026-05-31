@@ -65,6 +65,7 @@ nlsControl <- function(maxiter=10000,
                        stickyRecalcN=4,
                        maxOdeRecalc=5,
                        odeRecalcFactor=10^(0.5),
+                       indTolRelax=TRUE,
 
                        eventType=c("central", "forward"),
                        shiErr=(.Machine$double.eps)^(1/3),
@@ -89,8 +90,9 @@ nlsControl <- function(maxiter=10000,
                        literalFix=TRUE,
                        returnNls=FALSE,
                        addProp = c("combined2", "combined1"),
-                       calcTables=TRUE, compress=FALSE,
-                       adjObf=TRUE, ci=0.95, sigdig=4, sigdigTable=NULL, ...) {
+                       calcTables=TRUE, compress=TRUE,
+                       adjObf=TRUE, ci=0.95, sigdig=4, sigdigTable=NULL,
+                       boundedTransform=TRUE, ...) {
   algorithm <- match.arg(algorithm)
   if (algorithm == "LM" && !requireNamespace("minpack.lm", quietly = TRUE)) {
     .malert("to use the LM algorithm you must have minpack.lm installed")
@@ -100,6 +102,7 @@ nlsControl <- function(maxiter=10000,
   checkmate::assertIntegerish(stickyRecalcN, any.missing=FALSE, lower=0, len=1)
   checkmate::assertIntegerish(maxOdeRecalc, any.missing=FALSE, len=1)
   checkmate::assertNumeric(odeRecalcFactor, len=1, lower=1, any.missing=FALSE)
+  checkmate::assertLogical(indTolRelax, any.missing=FALSE, len=1)
   checkmate::assertNumeric(shiErr, lower=0, any.missing=FALSE, len=1)
   checkmate::assertIntegerish(shi21maxFD, lower=1, any.missing=FALSE, len=1)
 
@@ -134,9 +137,10 @@ nlsControl <- function(maxiter=10000,
   checkmate::assertLogical(calcTables, len=1, any.missing=FALSE)
   checkmate::assertLogical(compress, len=1, any.missing=TRUE)
   checkmate::assertLogical(adjObf, len=1, any.missing=TRUE)
+  checkmate::assertLogical(boundedTransform, len=1, any.missing=FALSE)
   .xtra <- list(...)
   .bad <- names(.xtra)
-  .bad <- .bad[!(.bad %in% c("genRxControl"))]
+  .bad <- .bad[!(.bad %in% "genRxControl")]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste
     (paste0("'", .bad, "'", sep=""), collapse=", "),
@@ -208,6 +212,7 @@ nlsControl <- function(maxiter=10000,
                stickyRecalcN=stickyRecalcN,
                maxOdeRecalc=maxOdeRecalc,
                odeRecalcFactor=odeRecalcFactor,
+               indTolRelax=indTolRelax,
                eventType=eventType,
                shiErr=shiErr,
                shi21maxFD=shi21maxFD,
@@ -240,7 +245,8 @@ nlsControl <- function(maxiter=10000,
                calcTables=calcTables,
                compress=compress,
                ci=ci, sigdig=sigdig, sigdigTable=sigdigTable,
-               genRxControl=.genRxControl)
+               genRxControl=.genRxControl,
+               boundedTransform=boundedTransform)
   class(.ret) <- "nlsControl"
   .ret
 }
@@ -890,6 +896,24 @@ attr(rxUiGet.nlsFormula, "rstudio") <- quote(~nlmixr2est::.nlmixrNlsFunValGrad(D
     .ctl$scaleC <- ui$scaleCnls
   }
   .p <- unlist(ui$nlsParStart)
+  .cens <- which(tolower(names(dataSav)) == "cens")
+  .lim <- which(tolower(names(dataSav)) == "limit")
+  .evid <- which(tolower(names(dataSav)) == "evid")
+  if (length(.evid) == 1) {
+    .wObs <- which(dataSav[[.evid]] == 0 | dataSav[[.evid]] == 2)
+  } else {
+    .wObs <- seq_len(nrow(dataSav))
+  }
+  if (length(.cens) == 1L) {
+    if (!all(dataSav[.wObs, .cens] == 0)) {
+      stop("'nls' does not work with censored data", call. =FALSE)
+    }
+  }
+  if (length(.lim) == 1L) {
+    if (any(is.finite(dataSav[.wObs, .lim]))) {
+      stop("'nls' does not work with limit data", call. =FALSE)
+    }
+  }
   .env <- .nlmSetupEnv(.p, ui, dataSav, .mi, .ctl,
                        lower=ui$nlsParLower, upper=ui$nlsParUpper)
   .env$par.ini.list <- setNames(as.list(.env$par.ini), names(ui$nlsParStart))
@@ -988,7 +1012,8 @@ attr(rxUiGet.nlsFormula, "rstudio") <- quote(~nlmixr2est::.nlmixrNlsFunValGrad(D
                                 interaction=0L,
                                 compress=.nlsControl$compress,
                                 ci=.nlsControl$ci,
-                                sigdigTable=.nlsControl$sigdigTable)
+                                sigdigTable=.nlsControl$sigdigTable,
+                                indTolRelax=.nlsControl$indTolRelax)
   if (assign) env$control <- .foceiControl
   .foceiControl
 }
@@ -1024,8 +1049,6 @@ attr(rxUiGet.nlsFormula, "rstudio") <- quote(~nlmixr2est::.nlmixrNlsFunValGrad(D
   .foceiPreProcessData(.data, .ret, .ui, .control$rxControl)
   .nls <- .collectWarn(.nlsFitModel(.ui, .ret$dataSav), lst = TRUE)
   .ret$nls <- .nls[[1]]
-  .ret$parHistData <- .ret$nls$parHistData
-  .ret$nls$parHistData <- NULL
 
   .ret$message <- NULL
   if (rxode2::rxGetControl(.ui, "returnNls", FALSE)) {
@@ -1042,6 +1065,7 @@ attr(rxUiGet.nlsFormula, "rstudio") <- quote(~nlmixr2est::.nlmixrNlsFunValGrad(D
     .ret$covMethod <- "nls"
     .ret$objective <- -2 * as.numeric(logLik(.ret$nls))
   }
+  .ret <- .nlmFamilyAdjustOutput(.ret, "nls")
   .ret$ui <- .ui
   .ret$adjObf <- rxode2::rxGetControl(.ui, "adjObf", TRUE)
   .ret$fullTheta <- .nlsGetTheta(.ret$nls, .ui)
@@ -1087,3 +1111,4 @@ nlmixr2Est.nls <- function(env, ...) {
   .nlsFamilyFit(env,  ...)
 }
 attr(nlmixr2Est.nls, "covPresent") <- TRUE
+attr(nlmixr2Est.nls, "unbounded") <- TRUE

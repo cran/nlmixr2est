@@ -79,6 +79,9 @@ rxode2.api <- names(rxode2::.rxode2ptrs())
     rxode2::.s3register("generics::augment", "nlmixr2FitCore")
     rxode2::.s3register("generics::augment", "nlmixr2FitCoreSilent")
   }
+  if (exists("dim.rxEt", envir = asNamespace("nlmixr2est"), inherits = FALSE)) {
+    rxode2::.s3register("base::dim", "rxEt")
+  }
   rxode2::.s3register("rxode2::rxModelVarsS3", "nlmixr2FitCore")
   rxode2::.s3register("rxode2::rxModelVarsS3", "nlmixr2FitCoreSilent")
   rxode2::.s3register("rxode2::getBaseSimModel", "nlmixr2FitCoreSilent")
@@ -98,6 +101,8 @@ rxode2.api <- names(rxode2::.rxode2ptrs())
   rxode2::.s3register("rxode2::rxUiDeparse", "optimControl")
   rxode2::.s3register("rxode2::rxUiDeparse", "uobyqaControl")
   rxode2::.s3register("rxode2::rxUiDeparse", "tableControl")
+  rxode2::.s3register("rxode2::rxUiDeparse", "agqControl")
+  rxode2::.s3register("rxode2::rxUiDeparse", "laplaceControl")
   .resetCacheIfNeeded()
   .Call(`_rxode2version4`, as.integer(utils::packageVersion("rxode2") >= "4.0.0"))
 }

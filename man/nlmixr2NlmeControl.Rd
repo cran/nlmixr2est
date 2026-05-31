@@ -36,7 +36,7 @@ nlmixr2NlmeControl(
   returnNlme = FALSE,
   addProp = c("combined2", "combined1"),
   calcTables = TRUE,
-  compress = FALSE,
+  compress = TRUE,
   adjObf = TRUE,
   ci = 0.95,
   sigdig = 4,
@@ -76,7 +76,7 @@ nlmeControl(
   returnNlme = FALSE,
   addProp = c("combined2", "combined1"),
   calcTables = TRUE,
-  compress = FALSE,
+  compress = TRUE,
   adjObf = TRUE,
   ci = 0.95,
   sigdig = 4,
@@ -326,8 +326,8 @@ nlmeControl()
 nlmixr2NlmeControl()
 }
 \seealso{
-Other Estimation control: 
-\code{\link{foceiControl}()},
-\code{\link{saemControl}()}
+Other Estimation control:
+\code{\link[=foceiControl]{foceiControl()}},
+\code{\link[=saemControl]{saemControl()}}
 }
 \concept{Estimation control}

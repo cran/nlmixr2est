@@ -597,6 +597,12 @@
 #' @param stickyRecalcN The number of bad ODE solves before reducing
 #'     the atol/rtol for the rest of the problem.
 #'
+#' @param indTolRelax When `TRUE` (default), only subjects whose ODE
+#'     solve produced NaN/Inf have their tolerances relaxed, and the
+#'     relaxed tolerance persists across optimizer calls (sticky).
+#'     When `FALSE`, all subjects have their tolerances relaxed on
+#'     each retry and tolerances are reset afterward.
+#'
 #' @param nRetries If FOCEi doesn't fit with the current parameter
 #'     estimates, randomly sample new parameter estimates and restart
 #'     the problem.  This is similar to 'PsN' resampling.
@@ -726,6 +732,16 @@
 #'   log-likelihood.  By default this is Inf; in the original nlmixr's
 #'   gnlmm was 400.
 #'
+#' @param boundedTransform boolean indicating if the bounded
+#'   parameters should by transformed when using a unbounded
+#'   optimization method to make sure they are in bounds.  By default
+#'   this is `TRUE`, which transforms during optimization and
+#'   back-transforms for the final estimates.  When `FALSE`, the
+#'   optimization is performed on the original scale and the bounds
+#'   are passed to the optimization method.  When `NA`, the bounded
+#'   parameters are transformed for the optimization, but the final
+#'   estimates are not back-transformed.
+#'
 #' @inheritParams rxode2::rxSolve
 #' @inheritParams minqa::bobyqa
 #'
@@ -837,7 +853,9 @@ foceiControl <- function(sigdig = 3, #
                                       "mma",
                                       "lbfgsbLG",
                                       "slsqp",
-                                      "Rvmmin"), #
+                                      "Rvmmin",
+                                      "uobyqa",
+                                      "newuoa"), #
                          innerOpt = c("n1qn1", "BFGS"), #
                          ##
                          rhobeg = .2, #
@@ -891,6 +909,7 @@ foceiControl <- function(sigdig = 3, #
                          etaMat = NULL, #
                          repeatGillMax = 1,#
                          stickyRecalcN = 4, #
+                         indTolRelax = TRUE, #
                          gradProgressOfvTime = 10, #
                          addProp = c("combined2", "combined1"),
                          badSolveObjfAdj=100, #
@@ -906,7 +925,8 @@ foceiControl <- function(sigdig = 3, #
                          mceta=-1L,
                          nAGQ=0,
                          agqLow=-Inf,
-                         agqHi=Inf) { #
+                         agqHi=Inf,
+                         boundedTransform=TRUE) { #
   if (!is.null(sigdig)) {
     checkmate::assertNumeric(sigdig, lower=1, finite=TRUE, any.missing=TRUE, len=1)
     if (is.null(boundTol)) {
@@ -1162,6 +1182,12 @@ foceiControl <- function(sigdig = 3, #
     } else if (outerOpt == "lbfgsbLG") {
       outerOptFun <- .lbfgsbLG
       outerOpt <- -1L
+    } else if (outerOpt == "uobyqa") {
+      outerOptFun <- .uobyqa
+      outerOpt <- -1L
+    } else if (outerOpt == "newuoa") {
+      outerOptFun <- .newuoa
+      outerOpt <- -1L
     } else {
       if (checkmate::testIntegerish(outerOpt, lower=0, upper=1, len=1)) {
         outerOpt <- as.integer(outerOpt)
@@ -1281,6 +1307,7 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertNumeric(resetThetaCheckPer, lower=0, upper=1, any.missing=FALSE, finite=TRUE)
   checkmate::assertIntegerish(repeatGillMax, any.missing=FALSE, lower=0, len=1)
   checkmate::assertIntegerish(stickyRecalcN, any.missing=FALSE, lower=0, len=1)
+  checkmate::assertLogical(indTolRelax, any.missing=FALSE, len=1)
   checkmate::assertNumeric(gradProgressOfvTime, any.missing=FALSE, lower=0, len=1)
   checkmate::assertNumeric(badSolveObjfAdj, any.missing=FALSE, len=1)
   checkmate::assertLogical(fallbackFD, any.missing=FALSE, len=1)
@@ -1298,6 +1325,7 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertIntegerish(nAGQ, lower=0, len=1, any.missing=FALSE)
   checkmate::assertNumeric(agqHi, len=1, any.missing=FALSE)
   checkmate::assertNumeric(agqLow, len=1, any.missing=FALSE)
+  checkmate::assertLogical(boundedTransform, len=1, any.missing=FALSE)
   .ret <- list(
     maxOuterIterations = as.integer(maxOuterIterations),
     maxInnerIterations = as.integer(maxInnerIterations),
@@ -1401,6 +1429,7 @@ foceiControl <- function(sigdig = 3, #
     etaMat = etaMat,
     repeatGillMax = as.integer(repeatGillMax),
     stickyRecalcN = as.integer(max(1, abs(stickyRecalcN))),
+    indTolRelax = as.logical(indTolRelax),
     eventType = eventType,
     gradProgressOfvTime = gradProgressOfvTime,
     addProp = addProp,
@@ -1422,7 +1451,8 @@ foceiControl <- function(sigdig = 3, #
     mceta=as.integer(mceta),
     nAGQ=as.integer(nAGQ),
     agqHi=as.double(agqHi),
-    agqLow=as.double(agqLow)
+    agqLow=as.double(agqLow),
+    boundedTransform=boundedTransform
   )
   if (length(etaMat) == 1L && is.na(etaMat)) {
     .ret$etaMat <- NA
@@ -1442,21 +1472,22 @@ foceiControl <- function(sigdig = 3, #
   .ret
 }
 
-#' @export
-rxUiDeparse.foceiControl <- function(object, var) {
-  .ret <- foceiControl()
+.rxUiDeparseFoceiControl <- function(object, var, type="foceiControl") {
+  .ret <- eval(str2lang(paste0(type, "()")))
   .outerOpt <- character(0)
   if (object$outerOpt == -1L && object$outerOptTxt == "custom") {
     warning("functions for `outerOpt` cannot be deparsed, reset to default",
             call.=FALSE)
-  } else if (object$outerOptTxt != "nlminb") {
+  } else if (!(object$outerOptTxt %in% c("nlminb", "stats::optimize"))) {
     .outerOpt <- paste0("outerOpt=", deparse1(object$outerOptTxt))
   }
   .w <- .deparseDifferent(.ret, object, .foceiControlInternal)
   if (length(.w) == 0 && length(.outerOpt) == 0) {
-    return(str2lang(paste0(var, " <- foceiControl()")))
+    return(str2lang(paste0(var, " <- ", type, "()")))
   }
-  .retD <- c(vapply(names(.ret)[.w], function(x) {
+  .n <- names(.ret)[.w]
+  .n <- .n[.n != "outerOpt"]
+  .retD <- c(vapply(.n, function(x) {
     .val <- .deparseShared(x, object[[x]])
     if (!is.na(.val)) {
       return(.val)
@@ -1464,8 +1495,13 @@ rxUiDeparse.foceiControl <- function(object, var) {
     if (x == "innerOpt") {
       .innerOptFun <- c("n1qn1" = 1L, "BFGS" = 2L)
       paste0("innerOpt =", deparse1(names(.innerOptFun[which(object[[x]] == .innerOptFun)])))
-    } else if (x %in% c("derivMethod", "covDerivMethod", "optimHessType", "optimHessCovType",
-                        "eventType")) {
+    } else if (x %in% c("optimHessType", "optimHessCovType")) {
+      .methodIdx <- c("central" = 1L, "forward" = 3L)
+      paste0(x, " =", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
+    } else if (x == "eventType") {
+      .methodIdx <- c("central" = 2L, "forward" = 3L)
+      paste0(x, " =", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
+    } else if (x %in% c("derivMethod", "covDerivMethod")) {
       .methodIdx <- c("forward" = 0L, "central" = 1L, "switch" = 3L)
       paste0(x, " =", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
     } else if (x == "covMethod") {
@@ -1479,5 +1515,10 @@ rxUiDeparse.foceiControl <- function(object, var) {
       paste0(x, "=", deparse1(object[[x]]))
     }
   }, character(1)), .outerOpt)
-  str2lang(paste(var, " <- foceiControl(", paste(.retD, collapse=","),")"))
+  str2lang(paste(var, " <- ", type, "(", paste(.retD, collapse=","),")"))
+}
+
+#' @export
+rxUiDeparse.foceiControl <- function(object, var) {
+  .rxUiDeparseFoceiControl(object, var, type="foceiControl")
 }
