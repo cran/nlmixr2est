@@ -1,8 +1,12 @@
 #' Control for uobyqa estimation method in nlmixr2
 #'
+#' @inheritParams iterPrintParams
 #' @inheritParams foceiControl
 #' @inheritParams saemControl
 #' @inheritParams bobyqaControl
+#' @param covMethod Method for calculating the covariance.  \code{"r"} (the
+#'   default) uses nlmixr2's \code{nlmixr2Hess()} Hessian; \code{""} skips the
+#'   covariance step.
 #' @param returnUobyqa return the uobyqa output instead of the nlmixr2
 #'   fit
 #'
@@ -53,8 +57,8 @@ uobyqaControl <- function(npt=NULL,
                           odeRecalcFactor=10^(0.5),
                           indTolRelax=TRUE,
 
-                          useColor = crayon::has_color(),
-                          printNcol = floor((getOption("width") - 23) / 12), #
+                          useColor = NULL,
+                          printNcol = NULL, #
                           print = 1L, #
 
                           normType = c("rescale2", "mean", "rescale", "std", "len", "constant"), #
@@ -71,10 +75,14 @@ uobyqaControl <- function(npt=NULL,
                           addProp = c("combined2", "combined1"),
                           calcTables=TRUE, compress=FALSE,
                           covMethod=c("r", ""),
-                          adjObf=TRUE, ci=0.95, sigdig=4, sigdigTable=NULL,
-                          boundedTransform=TRUE, ...) {
+                          adjObf=TRUE, ci=0.95, sigdig=3, sigdigTable=NULL,
+                          boundedTransform=TRUE,
+                          eventSens=c("jump", "fd"), ...) {
 
   checkmate::assertIntegerish(npt, null.ok=TRUE, any.missing=FALSE, lower=2, len=1)
+  # bobyqa final trust-region radius from sigdig (FOCEi mechanism, matches
+  # foceiControl rhoend); a user value wins, sigdig=NULL leaves the minqa default
+  if (is.null(rhoend) && !is.null(sigdig)) rhoend <- .sigdigOptTol(sigdig)
   checkmate::assertNumeric(rhobeg, null.ok=TRUE, any.missing=FALSE, lower=0, len=1)
   checkmate::assertNumeric(rhoend, null.ok=TRUE, any.missing=FALSE, lower=0, len=1)
   checkmate::assertIntegerish(iprint, any.missing=FALSE, lower=0, len=1)
@@ -89,10 +97,11 @@ uobyqaControl <- function(npt=NULL,
   checkmate::assertLogical(compress, len=1, any.missing=TRUE)
   checkmate::assertLogical(adjObf, len=1, any.missing=TRUE)
   checkmate::assertLogical(boundedTransform, len=1, any.missing=FALSE)
+  eventSens <- match.arg(eventSens)
 
   .xtra <- list(...)
   .bad <- names(.xtra)
-  .bad <- .bad[!(.bad %in% "genRxControl")]
+  .bad <- .bad[!(.bad %in% c("genRxControl", "iterPrintControl"))]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste
     (paste0("'", .bad, "'", sep=""), collapse=", "),
@@ -110,14 +119,14 @@ uobyqaControl <- function(npt=NULL,
   }
   if (is.null(rxControl)) {
     if (!is.null(sigdig)) {
-      rxControl <- rxode2::rxControl(sigdig=sigdig)
+      rxControl <- .rxControlScaleSigdig(rxode2::rxControl(sigdig=sigdig), sigdig)
     } else {
       rxControl <- rxode2::rxControl(atol=1e-4, rtol=1e-4)
     }
     .genRxControl <- TRUE
   } else if (inherits(rxControl, "rxControl")) {
   } else if (is.list(rxControl)) {
-    rxControl <- do.call(rxode2::rxControl, rxControl)
+    rxControl <- .rxControlScaleSigdig(do.call(rxode2::rxControl, rxControl), sigdig, skip = names(rxControl))
   } else {
     stop("solving options 'rxControl' needs to be generated from 'rxode2::rxControl'", call=FALSE)
   }
@@ -132,9 +141,10 @@ uobyqaControl <- function(npt=NULL,
   }
   checkmate::assertIntegerish(sigdigTable, lower=1, len=1, any.missing=FALSE)
 
-  checkmate::assertLogical(useColor, any.missing=FALSE, len=1)
-  checkmate::assertIntegerish(print, len=1, lower=0, any.missing=FALSE)
-  checkmate::assertIntegerish(printNcol, len=1, lower=1, any.missing=FALSE)
+  .iterPrintControl <- .absorbIterPrintControl(print = print,
+                                               printNcol = printNcol,
+                                               useColor = useColor,
+                                               iterPrintControl = .xtra$iterPrintControl)
   if (checkmate::testIntegerish(scaleType, len=1, lower=1, upper=4, any.missing=FALSE)) {
     scaleType <- as.integer(scaleType)
   } else {
@@ -173,9 +183,7 @@ uobyqaControl <- function(npt=NULL,
                odeRecalcFactor=odeRecalcFactor,
                indTolRelax=indTolRelax,
 
-               useColor=useColor,
-               print=print,
-               printNcol=printNcol,
+               iterPrintControl = .iterPrintControl,
                scaleType=scaleType,
                normType=normType,
 
@@ -189,7 +197,8 @@ uobyqaControl <- function(npt=NULL,
                compress=compress,
                ci=ci, sigdig=sigdig, sigdigTable=sigdigTable,
                genRxControl=.genRxControl,
-               boundedTransform=boundedTransform)
+               boundedTransform=boundedTransform,
+               eventSens=eventSens)
   class(.ret) <- "uobyqaControl"
   .ret
 }
@@ -209,15 +218,7 @@ rxUiDeparse.uobyqaControl <- function(object, var) {
 #' @author Matthew L. Fidler
 #' @noRd
 .uobyqaFamilyControl <- function(env, ...) {
-  .ui <- env$ui
-  .control <- env$control
-  if (is.null(.control)) {
-    .control <- nlmixr2est::uobyqaControl()
-  }
-  if (!inherits(.control, "uobyqaControl")) {
-    .control <- do.call(nlmixr2est::uobyqaControl, .control)
-  }
-  assign("control", .control, envir=.ui)
+  .nlmFamilyControlGeneric(env, nlmixr2est::uobyqaControl, "uobyqaControl")
 }
 
 #' @rdname nmObjHandleControlObject
@@ -275,7 +276,8 @@ getValidNlmixrCtl.uobyqa <- function(control) {
                                 compress=.uobyqaControl$compress,
                                 ci=.uobyqaControl$ci,
                                 sigdigTable=.uobyqaControl$sigdigTable,
-                                indTolRelax=.uobyqaControl$indTolRelax)
+                                indTolRelax=.uobyqaControl$indTolRelax,
+                                eventSens=.uobyqaControl$eventSens)
   if (assign) env$control <- .foceiControl
   .foceiControl
 }
@@ -329,68 +331,20 @@ getValidNlmixrCtl.uobyqa <- function(control) {
 }
 
 .uobyqaFamilyFit <- function(env, ...) {
-  .ui <- env$ui
-  .control <- .ui$control
-  .data <- env$data
-  .ret <- new.env(parent=emptyenv())
-  # The environment needs:
-  # - table for table options
-  # - $origData -- Original Data
-  # - $dataSav -- Processed data from .foceiPreProcessData
-  # - $idLvl -- Level information for ID factor added
-  # - $covLvl -- Level information for items to convert to factor
-  # - $ui for ui fullTheta Full theta information
-  # - $etaObf data frame with ID, etas and OBJI
-  # - $cov For covariance
-  # - $covMethod for the method of calculating the covariance
-  # - $adjObf Should the objective function value be adjusted
-  # - $objective objective function value
-  # - $extra Extra print information
-  # - $method Estimation method (for printing)
-  # - $omega Omega matrix
-  # - $theta Is a theta data frame
-  # - $model a list of model information for table generation.  Needs a `predOnly` model
-  # - $message Message for display
-  # - $est estimation method
-  # - $ofvType (optional) tells the type of ofv is currently being used
-  # When running the focei problem to create the nlmixr object, you also need a
-  #  foceiControl object
-  .ret$table <- env$table
-  .foceiPreProcessData(.data, .ret, .ui, .control$rxControl)
-  .uobyqa <- .collectWarn(.uobyqaFitModel(.ui, .ret$dataSav), lst = TRUE)
-  .ret$uobyqa <- .uobyqa[[1]]
-  .ret$parHistData <- .ret$uobyqa$parHistData
-  .ret$uobyqa$parHistData <- NULL
-  .ret$message <- .ret$uobyqa$message
-  if (rxode2::rxGetControl(.ui, "returnUobyqa", FALSE)) {
-    return(.ret$uobyqa)
-  }
-  .ret$ui <- .ui
-  .ret$adjObf <- rxode2::rxGetControl(.ui, "adjObf", TRUE)
-  .ret$fullTheta <- .uobyqaGetTheta(.ret$uobyqa, .ui)
-  .ret$cov <- .ret$uobyqa$cov
-  .ret$covMethod <- .ret$uobyqa$covMethod
-  #.ret$etaMat <- NULL
-  #.ret$etaObf <- NULL
-  #.ret$omega <- NULL
-  .ret$control <- .control
-  .ret$extra <- ""
-  .nlmixr2FitUpdateParams(.ret)
-  nmObjHandleControlObject(.ret$control, .ret)
-  if (exists("control", .ui)) {
-    rm(list="control", envir=.ui)
-  }
-  .ret$est <- "uobyqa"
-  # There is no parameter history for nlme
-  .ret$objective <- 2 * as.numeric(.ret$uobyqa$fval)
-  .ret$model <- .ui$ebe
-  .ret$ofvType <- "uobyqa"
-  .uobyqaControlToFoceiControl(.ret)
-  .ret$theta <- .ret$ui$saemThetaDataFrame
-  .ret <- nlmixr2CreateOutputFromUi(.ret$ui, data=.ret$origData, control=.ret$control, table=.ret$table, env=.ret, est="uobyqa")
-  .env <- .ret$env
-  .env$method <- "uobyqa"
-  .ret
+  .nlmFamilyFitGeneric(
+    env, "uobyqa", .uobyqaFitModel, .uobyqaGetTheta,
+    objective = function(.fit) 2 * as.numeric(.fit$fval),
+    controlToFocei = .uobyqaControlToFoceiControl,
+    returnFlag = "returnUobyqa",
+    # uobyqa manages its own cov/parHistData instead of .nlmFamilyAdjustOutput
+    adjustOutput = FALSE,
+    postSetup = function(.ret, .ui, .fit) {
+      .ret$parHistData <- .ret$uobyqa$parHistData
+      .ret$uobyqa$parHistData <- NULL
+      .ret$cov <- .ret$uobyqa$cov
+      .ret$covMethod <- .ret$uobyqa$covMethod
+      .ret
+    })
 }
 
 #' @rdname nlmixr2Est

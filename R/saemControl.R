@@ -29,8 +29,7 @@
 #'     The third value represents the number of bootstrap/reshuffling or
 #'     uni-dimensional random samples are taken.
 #'
-#' @param print The number it iterations that are completed before
-#'     anything is printed to the console.  By default, this is 1.
+#' @inheritParams iterPrintParams
 #'
 #' @param trace An integer indicating if you want to trace(1) the
 #'     SAEM algorithm process.  Useful for debugging, but not for
@@ -42,9 +41,34 @@
 #'     gradient cross-product (evaluated at the individual empirical
 #'     Bayes estimates).
 #'
+#'  "\code{sa}" (default) Use the stochastic-approximation Fisher Information
+#'  Matrix.  After estimation, a dedicated covariance phase (\code{nSaCov}
+#'  iterations) holds the parameters at the converged estimate and keeps
+#'  resimulating the individual parameters, Monte-Carlo averaging the Louis
+#'  observed-information integrand into a converged FIM decoupled from the cooling
+#'  schedule (the approach used by Monolix; Kuhn & Lavielle 2005).  Always includes
+#'  every estimated population parameter (theta, the \code{Omega} diagonal
+#'  variances, and residual).
+#'
+#'  "\code{analytic}" Compute the FOCEI analytic observed-information covariance at
+#'  the converged SAEM estimates.  When the model is out of analytic-covariance
+#'  scope (e.g. \code{linCmt()}, a non-normal likelihood, or a non-SD IOV
+#'  parameterization) or the result is not positive definite, it falls back to the
+#'  linearized Fisher information (\code{linFim}) with a message.
+#'
 #'  "\code{linFim}" Use the Linearized Fisher Information Matrix to calculate the covariance.
 #'
-#'  "\code{fim}" Use the SAEM-calculated Fisher Information Matrix to calculate the covariance.
+#'  "\code{fim}" Use the Fisher Information Matrix accumulated during SAEM
+#'  estimation to calculate the covariance.  Like \code{sa} it inverts the observed
+#'  information to a full theta + \code{Omega} diagonal + residual covariance, but
+#'  uses the (noisier) estimation-phase matrix rather than a dedicated cov phase.
+#'
+#'  For both \code{fim} and \code{sa} the simulation-based Fisher information covers the
+#'  structural theta, the \code{Omega} diagonal variances, and additive residual error.
+#'  Off-diagonal \code{Omega} covariances and proportional/combined residual error are not
+#'  estimated reliably by the simulation FIM (the complete-data correction is unstable when
+#'  between-subject variability dominates the residual), so those variance-block standard
+#'  errors are spliced in from the linearized FIM (\code{linFim}).
 #'
 #'  "\code{r,s}" Uses the sandwich matrix to calculate the covariance, that is: \eqn{R^-1 \times S \times R^-1}
 #'
@@ -53,6 +77,25 @@
 #'  "\code{s}" Uses the crossproduct matrix to calculate the covariance as \eqn{4\times S^-1}
 #'
 #'  "" Does not calculate the covariance step.
+#'
+#' @param covMethodDeferred Internal.  When a foreign covariance ("sa"/"imp")
+#'   is requested, it is stashed here and computed post-fit at the converged
+#'   estimates by the decoupled recompute engine (\code{setCov()} uses the same
+#'   path); \code{NA} otherwise.
+#'
+#' @param covFull Boolean (default \code{TRUE}) indicating the covariance
+#'   should include every estimated population parameter -- the structural and
+#'   residual thetas plus the \code{Omega} variance/covariance elements -- named
+#'   \code{om.<eta>} / \code{cov.<eta>.<eta>}.  When \code{FALSE} the legacy
+#'   structural-theta-only covariance is reported.  Ignored by
+#'   \code{covMethod="sa"}, which is always full.
+#'
+#' @param nSaCov Number of iterations in the dedicated stochastic-approximation
+#'   covariance phase used by \code{covMethod="sa"} (default \code{500}).  These
+#'   iterations run at the converged estimate (parameters frozen) and only
+#'   resimulate the individual parameters to build the observed Fisher
+#'   information; a larger value gives a less noisy covariance.  Ignored by other
+#'   covariance methods.
 #'
 #' @param logLik boolean indicating that log-likelihood should be
 #'     calculate by Gaussian quadrature.
@@ -126,6 +169,112 @@
 #'   calculate uninformative etas and handle them specially (default
 #'   is `TRUE`).
 #'
+#' @param mixProbMethod For mixture models (`mix()`, more than one
+#'   component), stabilizes the mixing-probability estimate against
+#'   collapsing onto a single component (the responsibility used to
+#'   update it is itself weighted by the current mixing probability,
+#'   which can create a runaway feedback loop). Three options:
+#'
+#'   * `"regress"` (default): treat per-subject mixture membership as a
+#'     fixed regressor.  Each subject is hard-classified to a component up
+#'     front, held fixed, and fed into the solve (via the existing
+#'     mixture-index regressor), skipping the per-iteration soft-EM
+#'     responsibility step entirely.  Avoids the responsibility feedback
+#'     loop / collapse by construction and is lower-bias; on heavily
+#'     overlapping components it is higher-variance (an early
+#'     misclassification is not revisited), so prefer `"regularized"` when
+#'     membership is genuinely uncertain.
+#'
+#'   * `"regularized"`: blend `mixProbPriorN` pseudo-subjects,
+#'     distributed per the initial mixing probability, into the
+#'     responsibility average each iteration (Dirichlet/MAP-EM-style).
+#'     Prevents collapse even in difficult cases, at the cost of some
+#'     bias toward the initial guess; may need larger `nBurn`/`nEm`.
+#'
+#'   * `"annealed"`: give the mixing-probability update its own decaying
+#'     step-size schedule (`mixProbStepExp`) instead of the
+#'     full-replacement step used during `nBurn`. Lower bias, but does
+#'     not by itself fix a systematic (non-noise-driven) collapse.
+#'
+#' @param mixProbStepExp Only used when `mixProbMethod="annealed"`. Decay
+#'   exponent for the mixing-probability step size
+#'   (`1/iteration^mixProbStepExp`), applied from iteration 1. Default 1;
+#'   smaller values decay more slowly.
+#'
+#' @param mixProbPriorN Only used when `mixProbMethod="regularized"`.
+#'   Number of pseudo-subjects blended into the responsibility average
+#'   each iteration. Larger values are more robust to collapse but bias
+#'   the estimate more and need more `nBurn`/`nEm`. Default 20.
+#'
+#' @param mixSampleMethod For mixture models with per-component etas
+#'   (split-ETA, e.g. `cl <- mix(tcl1 + eta.cl1, p1, tcl2 + eta.cl2)`),
+#'   controls the MCMC/sufficient-statistic architecture for the
+#'   individual random effects, independent of `mixProbMethod`. BSV
+#'   (`$omega`) for split components is unreliable under `"parallel"`
+#'   regardless of `mixProbMethod`.
+#'
+#'   * `"parallel"` (default): one full MCMC chain per component per
+#'     subject per iteration, blended post hoc by responsibility. Mirrors
+#'     NONMEM's `$MIX` and correctly estimates BSV shared across
+#'     components, but cannot cleanly separate per-component BSV for
+#'     split-ETA models (each "wrong-hypothesis" chain still explores its
+#'     non-owned column(s) as unconstrained prior noise).
+#'
+#'   * `"msaem"` (experimental): the MSAEM algorithm (Lavielle & Mbogning
+#'     2014), as used by Monolix. Simulates one random-effects trajectory
+#'     per subject per iteration (label marginalized out via a
+#'     closed-form responsibility) instead of parallel per-component
+#'     chains, so no post-hoc blending is needed. Not compute-matched to
+#'     `"parallel"` at equal `nmc` -- set `nmc` to roughly `nMix` times
+#'     its default for a fair comparison. Uses a model-aware stratified
+#'     initialization for split-ETA components that reliably achieves
+#'     full theta/fixed-effect separation. Split-ETA BSV recovery is
+#'     improved (two numerical bugs fixed: an `IGamma2_phi1` blowup that
+#'     locked variance to exactly zero, and an inverted responsibility
+#'     sign) but still not reliable -- it often settles at a safety-floor
+#'     value rather than the true variance. Prefer `"parallel"` unless
+#'     specifically evaluating this method.
+#'
+#' @param nonMuTheta Controls how a population `theta` that is not
+#'   mu-referenced (does not appear linearly with an eta -- the SAEM `phi0`
+#'   fixed effects) is estimated.
+#'
+#'   * `"regress"` (default): keep the parameter as a plain directly-estimated
+#'     `theta` regressor.  Each iteration `phi0` is estimated by a bounded
+#'     direct optimization of the observation likelihood (robust coordinate
+#'     descent within a local trust region, honoring the `ini` bounds), held
+#'     fixed rather than drawn stochastically with a shrinking variance.  This
+#'     recovers population parameters that have no associated random effect
+#'     more accurately, at some extra runtime (the objective re-solves the
+#'     ODE).
+#'
+#'   * `"eta"`: the historic SAEM treatment (the parameter is carried through
+#'     the stochastic `phi0` block).
+#'
+#' @param residWarmStart Boolean (default `TRUE`); warm-start the residual-error
+#'   parameters from the observed per-endpoint moments at the initial predictions
+#'   (additive SD from `sqrt(mean(err^2))`, proportional SD from
+#'   `sqrt(mean((err/f)^2))`), the same moment estimate `est="npag"` uses.  Gives
+#'   the stochastic step a better starting residual scale.  Set `FALSE` to start
+#'   from the `ini`-block residual values instead.
+#'
+#' @param lbfgsLmm Integer number of BFGS corrections (the L-BFGS-B `lmm`
+#'   memory) used when refining the fixed-effect-only parameters of a general
+#'   log-likelihood model (`ll(name) ~ <expr>`) by direct L-BFGS-B
+#'   optimization of the observation likelihood.  Default 5.
+#'
+#' @param lbfgsFactr Convergence tolerance on the relative reduction in the
+#'   objective for that L-BFGS-B refinement (the `factr` control, in units of
+#'   machine epsilon).  When `NULL` (default) it is derived from `sigdig` the
+#'   same way as `foceiControl()` (`10^(-sigdig) / .Machine$double.eps`).
+#'
+#' @param lbfgsPgtol Convergence tolerance on the projected gradient for that
+#'   L-BFGS-B refinement (the `pgtol` control).  When `NULL` (default) it is
+#'   derived from `sigdig` (`10^(-sigdig)`).
+#'
+#' @param lbfgsMaxIter Integer maximum number of iterations for that L-BFGS-B
+#'   refinement.  Default 20.
+#'
 #' @param ... Other arguments to control SAEM.
 #'
 #' @inheritParams rxode2::rxSolve
@@ -133,6 +282,14 @@
 #' @return List of options to be used in \code{\link{nlmixr2}} fit for
 #'     SAEM.
 #' @author Wenping Wang & Matthew L. Fidler
+#' @references
+#' Kuhn E, Lavielle M (2005). "Maximum likelihood estimation in nonlinear mixed
+#' effects models." Computational Statistics & Data Analysis, 49(4), 1020-1038.
+#' \doi{10.1016/j.csda.2004.07.002}
+#'
+#' Jiang L, Roy A, Balasubramanian K, Davis D, Drusvyatskiy D, Na S (2025).
+#' "Online Covariance Estimation in Nonsmooth Stochastic Approximation."
+#' arXiv:2502.05305. \doi{10.48550/arXiv.2502.05305}
 #' @family Estimation control
 #' @export
 saemControl <- function(seed = 99,
@@ -140,9 +297,12 @@ saemControl <- function(seed = 99,
                         nEm = 300,
                         nmc = 3,
                         nu = c(2, 2, 2),
-                        print = 1,
+                        print = 1L,
                         trace = 0, # nolint
-                        covMethod = c("linFim", "fim", "r,s", "r", "s", ""),
+                        covMethod = c("sa", "analytic", "linFim", "fim", "r,s", "r", "s", "imp", ""),
+                        covMethodDeferred = NA_character_,
+                        covFull = TRUE,
+                        nSaCov = 500L,
                         calcTables = TRUE,
                         logLik = FALSE,
                         nnodesGq = 3,
@@ -152,9 +312,9 @@ saemControl <- function(seed = 99,
                         adjObf = TRUE,
                         sumProd = FALSE,
                         addProp = c("combined2", "combined1"),
-                        tol = 1e-6,
+                        tol = NULL,
                         itmax = 30,
-                        type = c("nelder-mead", "newuoa"),
+                        type = c("newuoa", "nelder-mead"),
                         powRange = 10,
                         lambdaRange = 3,
                         odeRecalcFactor=10^(0.5),
@@ -174,11 +334,23 @@ saemControl <- function(seed = 99,
                         handleUninformativeEtas=TRUE,
                         iovXform = c("sd", "var", "logsd", "logvar"),
                         boundedTransform = TRUE,
+                        eventSens = c("jump", "fd"),
+                        mixProbMethod = c("regress", "regularized", "annealed"),
+                        mixProbStepExp = 1,
+                        mixProbPriorN = 20,
+                        mixSampleMethod = c("parallel", "msaem"),
+                        nonMuTheta = c("regress", "eta"),
+                        residWarmStart = TRUE,
+                        censOption = c("gauss", "laplace"),
+                        lbfgsLmm = 5L,
+                        lbfgsFactr = NULL,
+                        lbfgsPgtol = NULL,
+                        lbfgsMaxIter = 20L,
                         ...) {
   .xtra <- list(...)
   .bad <- names(.xtra)
   .bad <- .bad[!(.bad %in% c("genRxControl", "mcmc",
-                             "DEBUG"))]
+                             "DEBUG", "iterPrintControl"))]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste
     (paste0("'", .bad, "'", sep=""), collapse=", "),
@@ -200,7 +372,13 @@ saemControl <- function(seed = 99,
   checkmate::assertIntegerish(nEm, any.missing=FALSE, len=1, lower=0)
   checkmate::assertIntegerish(nmc, any.missing=FALSE, len=1, lower=1)
   checkmate::assertIntegerish(nu, any.missing=FALSE, len=3, lower=1)
-  checkmate::assertIntegerish(print, any.missing=FALSE, lower=0, len=1)
+  # `print` can be either a scalar print-frequency or a pre-built
+  # iterPrintControl object; .absorbIterPrintControl validates either form
+  # and returns the canonical iterPrintControl list.  list(...)$iterPrintControl
+  # catches the round-trip case where the previous saemControl()'s return
+  # value is passed back through do.call(saemControl, .ctl).
+  .iterPrintControl <- .absorbIterPrintControl(print = print,
+                                               iterPrintControl = .xtra$iterPrintControl)
   if (!is.null(.xtra$DEBUG)) {
     trace <- .xtra$DEBUG # nolint
   }
@@ -213,6 +391,10 @@ saemControl <- function(seed = 99,
   checkmate::assertLogical(literalFix, any.missing=FALSE, len=1)
   checkmate::assertLogical(adjObf, any.missing=FALSE, len=1)
   checkmate::assertLogical(sumProd, any.missing=FALSE, len=1)
+  # `tol` is the rhoend/tolerance of saem's inner residual-regression optimizer
+  # (bounded bobyqa / newuoa / nelder-mead); tie it to sigdig with the FOCEi
+  # mechanism.  A user value wins, sigdig=NULL keeps the historic default.
+  if (is.null(tol)) tol <- if (!is.null(sigdig)) .sigdigOptTol(sigdig) else 1e-6
   checkmate::assertNumeric(tol, any.missing=FALSE, len=1, finite=TRUE)
   checkmate::assertIntegerish(itmax, any.missing=FALSE, len=1, lower=1)
   checkmate::assertNumeric(powRange, any.missing=FALSE, len=1, lower=0)
@@ -228,6 +410,14 @@ saemControl <- function(seed = 99,
   checkmate::assertLogical(muRefCovAlg, any.missing=FALSE, len=1)
   checkmate::assertLogical(handleUninformativeEtas, any.missing=FALSE, len=1)
   checkmate::assertLogical(boundedTransform, any.missing=FALSE, len=1)
+  eventSens <- match.arg(eventSens)
+  mixProbMethod <- match.arg(mixProbMethod)
+  checkmate::assertNumeric(mixProbStepExp, any.missing=FALSE, len=1, lower=0, finite=TRUE)
+  checkmate::assertNumeric(mixProbPriorN, any.missing=FALSE, len=1, lower=0, finite=TRUE)
+  mixSampleMethod <- match.arg(mixSampleMethod)
+  nonMuTheta <- match.arg(nonMuTheta)
+  checkmate::assertLogical(residWarmStart, any.missing=FALSE, len=1)
+
 
   type <- match.arg(type)
   if (inherits(addProp, "numeric")) {
@@ -251,7 +441,26 @@ saemControl <- function(seed = 99,
     if (is.null(sigdigTable)) {
       sigdigTable <- round(sigdig)
     }
+    # L-BFGS-B tolerances for the general-likelihood phi0 direct optimization,
+    # derived from sigdig the same way foceiControl() does (factr = tol/eps)
+    if (is.null(lbfgsFactr)) {
+      lbfgsFactr <- 10^(-sigdig) / .Machine$double.eps
+    }
+    if (is.null(lbfgsPgtol)) {
+      lbfgsPgtol <- 10^(-sigdig)
+    }
   }
+  # defaults when sigdig is not supplied (~4 significant digits)
+  if (is.null(lbfgsFactr)) {
+    lbfgsFactr <- 1e7
+  }
+  if (is.null(lbfgsPgtol)) {
+    lbfgsPgtol <- 0
+  }
+  checkmate::assertIntegerish(lbfgsLmm, lower=1, len=1, any.missing=FALSE)
+  checkmate::assertNumeric(lbfgsFactr, lower=0, len=1, any.missing=FALSE)
+  checkmate::assertNumeric(lbfgsPgtol, lower=0, len=1, any.missing=FALSE)
+  checkmate::assertIntegerish(lbfgsMaxIter, lower=1, len=1, any.missing=FALSE)
   if (is.null(sigdigTable)) {
     sigdigTable <- 3
   }
@@ -261,27 +470,49 @@ saemControl <- function(seed = 99,
     .env <- parent.frame(1)
   }
   if (is.null(rxControl)) {
-    rxControl <- rxode2::rxControl(sigdig=sigdig, envir=.env)
+    rxControl <- .rxControlScaleSigdig(rxode2::rxControl(sigdig=sigdig, envir=.env), sigdig)
     .genRxControl <- TRUE
   } else if (inherits(rxControl, "rxControl")) {
   } else if (is.list(rxControl)) {
-    rxControl <- do.call(rxode2::rxControl, rxControl)
+    rxControl <- .rxControlScaleSigdig(do.call(rxode2::rxControl, rxControl), sigdig, skip = names(rxControl))
     rxControl$envir <- .env
   } else {
     stop("solving options 'rxControl' needs to be generated from 'rxode2::rxControl'", call=FALSE)
   }
 
-  if (checkmate::testIntegerish(covMethod, lower=0, len=1, any.missing=FALSE)) {
+  # "imp" is foreign to the SAEM kernel; skip the native cov and recompute the
+  # importance-sampling covariance post-fit at the converged estimates.  The
+  # covMethodDeferred formal carries a round-tripped request (default NA).
+  if (identical(covMethod, "")) {
+    ## "" requests no covariance; match.arg() cannot select it because
+    ## pmatch("") matches nothing, so handle it explicitly.
+    .covMethod <- ""
+  } else if (checkmate::testIntegerish(covMethod, lower=0, len=1, any.missing=FALSE)) {
     .covMethod <- covMethod
   } else {
     .covMethod <- match.arg(covMethod)
+    if (identical(.covMethod, "imp")) {
+      covMethodDeferred <- "imp"
+      .covMethod <- ""
+    }
   }
 
+  checkmate::assertLogical(covFull, len=1, any.missing=FALSE)
+
+  # censOption: FOCEI-family censored (M2/M3/M4) 2nd-derivative treatment -- "gauss" (historic
+  # Gauss-Newton, default) or "laplace" (exact).  Accepted for a uniform interface but INERT for
+  # SAEM (stochastic EM has no Laplace inner Hessian); kept for alignment with focei/nlm.
+  if (checkmate::testIntegerish(censOption, len=1, lower=0, upper=1, any.missing=FALSE)) {
+    censOption <- as.integer(censOption)
+  } else {
+    censOption <- setNames(c("gauss" = 0L, "laplace" = 1L)[match.arg(censOption)], NULL)
+  }
   .ret <- list(
     mcmc = list(niter = c(nBurn, nEm), nmc = nmc, nu = nu),
     rxControl = rxControl,
     seed = seed,
-    print = print,
+    censOption = censOption,
+    iterPrintControl = .iterPrintControl,
     DEBUG = trace, # nolint
     optExpression = optExpression,
     literalFix=literalFix,
@@ -307,13 +538,27 @@ saemControl <- function(seed = 99,
     sigdigTable=sigdigTable,
     ci=ci,
     covMethod=.covMethod,
+    covMethodDeferred=covMethodDeferred,
+    covFull=covFull,
+    nSaCov=as.integer(nSaCov),
     logLik=logLik,
     calcTables=calcTables,
     muRefCov=muRefCov,
     muRefCovAlg=muRefCovAlg,
     handleUninformativeEtas=handleUninformativeEtas,
     iovXform=iovXform,
-    boundedTransform=boundedTransform
+    boundedTransform=boundedTransform,
+    eventSens=eventSens,
+    mixProbMethod=mixProbMethod,
+    mixProbStepExp=mixProbStepExp,
+    mixProbPriorN=mixProbPriorN,
+    mixSampleMethod=mixSampleMethod,
+    nonMuTheta=nonMuTheta,
+    residWarmStart=residWarmStart,
+    lbfgsLmm=as.integer(lbfgsLmm),
+    lbfgsFactr=lbfgsFactr,
+    lbfgsPgtol=lbfgsPgtol,
+    lbfgsMaxIter=as.integer(lbfgsMaxIter)
   )
   class(.ret) <- "saemControl"
   .ret

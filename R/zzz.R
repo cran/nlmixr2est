@@ -5,8 +5,15 @@
     if (file.exists(.md5File)) {
       .md5 <- readLines(.md5File)
       if (.md5 != nlmixr2.md5) {
-        packageStartupMessage("detected new version of nlmixr2est, cleaning rxode2 cache")
-        rxode2::rxClean()
+        ## Deliberately NOT rxClean() here.  It wipes rxTempDir(), and deleting a
+        ## generated model's compiled artifact out from under a live model object makes
+        ## rxode2's deferred-compile thunk rebuild it -- emitting different code than
+        ## the build it replaces, which silently corrupts that model (see
+        ## nlmixr2/rxode2#1171 and .nlmixr2estRxode2()).  Every model nlmixr2est
+        ## generates now carries a role-tagged, content-hashed artifact name and builds
+        ## outside rxTempDir(), so an upgrade cannot make this package reuse a stale
+        ## artifact and there is nothing here to clean.
+        writeLines(nlmixr2.md5, .md5File)
       }
     } else {
       writeLines(nlmixr2.md5, .md5File)
@@ -20,22 +27,29 @@
         PACKAGE = "nlmixr2est")
 }
 
-# This will be saved when compiled
-rxode2.api <- names(rxode2::.rxode2ptrs())
-
+## DO NOT re-add an rxode2 API version/name check here.
+##
+## There used to be one: the NAMES of rxode2's function-pointer table were captured
+## into `rxode2.api` when nlmixr2est was compiled, and .onLoad refused to start
+## ("nlmixr2est needs a different version of rxode2 api") whenever the live table's
+## names did not match that snapshot.
+##
+## It is the wrong check, and it was the approach that caused the ABI problems the
+## current design was requested to solve.  The table is read POSITIONALLY and is
+## ADDITIVE -- new entry points are appended, so an older consumer reads the lower
+## indices and ignores the rest, which is what makes an rxode2 upgrade safe without
+## rebuilding every downstream package.  Names are documentation, not the contract:
+## rxode2 5.1.6 corrected two drifted slot LABELS (slot 8 was mislabeled
+## `getSolvingOptionsInd` when it is `getSolvingOptions`, slot 9 named an export that
+## no longer exists) and the guard then refused a combination that was completely
+## sound, taking down every fresh-session test with it.
+##
+## The reverse case is not a reason to bring it back either: a downstream package
+## built against MORE slots than the installed rxode2 provides is caught where it
+## matters, by rxode2's own build-time check that no slot is left unset and by the
+## DESCRIPTION version requirement -- not by string-comparing a snapshot at load.
 .iniRxode2Ptr <- function() {
-  .ptr <- rxode2::.rxode2ptrs()
-  .nptr <- names(.ptr)
-  if (length(rxode2.api) > length(.nptr)) {
-    stop("nlmixr2est requires a newer version of rxode2 api, cannot run nlmixr2est\ntry `install.packages(\"rxode2\")` to get a newer version of rxode2", call.=FALSE)
-  } else {
-    .nptr <- .nptr[seq_along(rxode2.api)]
-    if (!identical(rxode2.api, .nptr)) {
-      .bad <- TRUE
-      stop("nlmixr2est needs a different version of rxode2 api, cannot run nlmixr2est\ntry `install.packages(\"rxode2\")` to get a newer version of rxode2, or update both packages", call.=FALSE)
-    }
-  }
-  .Call(`_nlmixr2est_iniRxodePtrs`, .ptr,
+  .Call(`_nlmixr2est_iniRxodePtrs`, rxode2::.rxode2ptrs(),
         PACKAGE = "nlmixr2est")
 }
 
@@ -65,8 +79,8 @@ rxode2.api <- names(rxode2::.rxode2ptrs())
 #' @author Matthew L. Fidler
 #' @examples
 #'
-#' # For tools like nlmixr2shiny, this export allows nlmixr2shiny to
-#' # not depend on `nlmixr2est`, but can import it instead
+#' # Lets tools like nlmixr2shiny import S3 registration without
+#' # depending on nlmixr2est
 #'
 #' .iniS3() # run to register S3 methods
 #'
@@ -103,6 +117,8 @@ rxode2.api <- names(rxode2::.rxode2ptrs())
   rxode2::.s3register("rxode2::rxUiDeparse", "tableControl")
   rxode2::.s3register("rxode2::rxUiDeparse", "agqControl")
   rxode2::.s3register("rxode2::rxUiDeparse", "laplaceControl")
+  rxode2::.s3register("rxode2::rxUiGet", "foceiOuter")
+  rxode2::.s3register("rxode2::rxUiGet", "impmapThetaSens")
   .resetCacheIfNeeded()
   .Call(`_rxode2version4`, as.integer(utils::packageVersion("rxode2") >= "4.0.0"))
 }
@@ -112,8 +128,11 @@ rxode2.api <- names(rxode2::.rxode2ptrs())
   backports::import(pkgname)
   .iniPtrs()
   .iniS3()
-
 }
+
+## Stamp type/description attrs onto the built-in nlmixr2Est.* methods at
+## namespace-build time (bindings not yet locked, so no unlockBinding needed).
+.nlmixr2EstTypeApply(environment())
 
 compiled.rxode2.md5 <- rxode2::rxMd5()
 
@@ -123,10 +142,5 @@ compiled.rxode2.md5 <- rxode2::rxMd5()
   .nlmixr2globalReset(TRUE)
   .iniPtrs()
   .iniS3()
-  if (utils::packageVersion("rxode2") < "4.0.0") {
-    packageStartupMessage("nlmixr2est ", utils::packageVersion("nlmixr2est"), " works best with rxode2 >= 4.0.0, please update rxode2")
-  }
-  ## nlmixr2SetupMemoize()
-  ## options(keep.source = TRUE)
   ## nocov end
 }

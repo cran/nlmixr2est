@@ -136,6 +136,14 @@ getValidNlmixrCtl.tableControl <- function(control) {
 #' @export
 getValidNlmixrCtl.default <- function(control) {
   .cls <- class(control)[1]
+  # An unknown est= reaches here before nlmixr2Est dispatch; show the tagged,
+  # category-grouped list of available methods (issue #750) when one exists.
+  .lines <- .nlmixr2EstTypeLines(current=.cls)
+  if (length(.lines) > 0L) {
+    stop("nlmixr2 estimation `est=\"", .cls, "\"` is not supported; available methods:\n",
+         paste(.lines, collapse="\n"),
+         call.=FALSE)
+  }
   stop("do not know how to validate control for `est=\"", .cls, "\"`, please add `getValidNlmixrCtl.", .cls, "` method",
        call.=FALSE)
 }
@@ -158,4 +166,84 @@ getValidNlmixrCtl.default <- function(control) {
     }
   }
   return(list(ctl=.out, rest=.in))
+}
+
+#' Optimizer convergence tolerance derived from `sigdig`
+#'
+#' `10^(-sigdig)` -- the same exponent `sigdig` sets for the ODE `rtol`, so the
+#' optimizer converges to exactly the precision the solve can support (no chasing
+#' below the solver noise floor).  Shared so every estimation method's optimizer
+#' ties to `sigdig` the same way.
+#' @param sigdig optimization significant digits
+#' @return the tolerance
+#' @noRd
+.sigdigOptTol <- function(sigdig) 10^(-sigdig)
+
+#' L-BFGS `factr` derived from `sigdig` (relative-f tolerance `10^-sigdig`)
+#' @param sigdig optimization significant digits
+#' @return the `factr` value (`tol / .Machine$double.eps`)
+#' @noRd
+.sigdigFactr <- function(sigdig) 10^(-sigdig) / .Machine$double.eps
+
+#' Scale a tuned default tolerance by `sigdig` around `sigdig = 4`
+#'
+#' Reproduces the method's historic tuned tolerance at `sigdig = 4` and
+#' tightens/loosens it by one order of magnitude per significant digit
+#' (`default * 10^(4 - sigdig)`).  Used where a method's optimizer default is a
+#' tuned value rather than the FOCEi `10^-sigdig` formula (nlm, nls, nlme).
+#'
+#' The anchor is 4, NOT the package default `sigdig` (3): at the default these
+#' tolerances therefore sit one order looser than their historic values, which is
+#' the intent -- `est="nls"` opts out by keeping `sigdig = 4` as ITS default,
+#' because its LM step is sensitive to solver noise.
+#' @param default the tolerance at `sigdig = 4`
+#' @param sigdig optimization significant digits
+#' @return the scaled tolerance
+#' @noRd
+.sigdigScale <- function(default, sigdig) default * 10^(4 - sigdig)
+
+#' Scale ODE solver tolerances from the optimization `sigdig`
+#'
+#' The optimization `sigdig` sets the optimizer tolerances directly (`10^-sigdig`,
+#' see [.sigdigOptTol()]); here it sets the ODE solver tolerances with ONE formula
+#' -- the same for every solver (stiff, non-stiff, auto-switch) so the story is
+#' simple and consistent with the optimizer:
+#'   `rtol = 10^-sigdig`, `atol = 10^(-sigdig-3)`
+#' The `rtol` exponent IS `sigdig`, and `atol` sits three orders below.  Sensitivity
+#' solves match the main solve (the gradient/covariance are built from them);
+#' steady-state solves run one order looser.  `tighten` shifts every exponent
+#' down by that many orders for a method that needs a tighter solve than the
+#' optimizer target (e.g. `est="nls"`, whose LM step is sensitive to solver noise).
+#' This mirrors the mapping moved into `rxode2::rxControl(sigdig=)` (rxode2 PR
+#' #1150); until that rxode2 release is the minimum dependency, nlmixr2est applies
+#' it to every auto-built `rxControl`.
+#' @param rxControl an `rxode2::rxControl()` object (modified and returned)
+#' @param sigdig optimization significant digits; `NULL` leaves `rxControl` as-is
+#' @param skip character vector of tolerance field names the user set explicitly
+#'   (e.g. from a `rxControl = list(atol = ...)`); these are left untouched so an
+#'   explicit `atol`/`rtol` overrides the `sigdig`-derived value
+#' @param tighten extra orders of magnitude to tighten every tolerance (default 0)
+#' @return `rxControl` with ODE solver tolerances set from `sigdig`
+#' @noRd
+.rxControlScaleSigdig <- function(rxControl, sigdig, skip = character(0), tighten = 0) {
+  if (is.null(sigdig) || is.null(rxControl)) return(rxControl)
+  .rtol <- 10^(-(sigdig + tighten))
+  .atol <- 10^(-(sigdig + 3 + tighten))
+  # only set a tolerance the user did not pass explicitly (skip).  Sensitivity
+  # solves match the main solve: the outer gradient and covariance are built from
+  # them, so a looser sens tolerance degrades analytic gradient/covariance
+  # accuracy (and leaves the optimizer's gradient less accurate than its
+  # objective).  Steady-state solves stay one order looser than the main solve.
+  .set <- function(field, value) {
+    if (!(field %in% skip)) rxControl[[field]] <<- rep_len(value, length(rxControl[[field]]))
+  }
+  .set("rtol", .rtol)
+  .set("atol", .atol)
+  .set("rtolSens", .rtol)
+  .set("atolSens", .atol)
+  .set("ssRtol", 10 * .rtol)
+  .set("ssAtol", 10 * .atol)
+  if (!is.null(rxControl$ssRtolSens)) .set("ssRtolSens", 10 * .rtol)
+  if (!is.null(rxControl$ssAtolSens)) .set("ssAtolSens", 10 * .atol)
+  rxControl
 }

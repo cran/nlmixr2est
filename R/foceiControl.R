@@ -1,25 +1,44 @@
-.foceiControlInternal <- c("genRxControl", "resetEtaSize",
+.foceiControlInternal <- c("genRxControl", "resetEtaSize", "foceType",
                            "resetThetaSize", "resetThetaFinalSize",
                            "outerOptFun", "outerOptTxt", "skipCov",
-                           "foceiMuRef", "predNeq", "nfixed", "nomega",
-                           "neta", "ntheta", "nF", "printTop", "needOptimHess")
+                           "foceiMuRef", "foceiMuCovEta", "predNeq", "nfixed", "nomega",
+                           "neta", "ntheta", "nF", "printTop", "needOptimHess",
+                           "iterPrintControl", "est", "foceiMuModel", "foceiMuGroupTheta",
+                           "foceiMuGroupEta", "foceiMuGroupCovStart", "foceiMuGroupCovCount",
+                           "foceiMuGroupCovTheta", "foceiMuGroupCovUserFixed",
+                           "foceiMuGroupThetaLower", "foceiMuGroupThetaUpper",
+                           "foceiMuGroupCovLower", "foceiMuGroupCovUpper",
+                           "foceiMuGroupCovData", "foceiMuGroupTol",
+                           "foceiMuGroupMaxCycles", "foceiMuGroupClampRetries",
+                           # derived from covMethod ("analytic" vs the finite-difference
+                           # formulas); kept internal so a built control round-trips.
+                           "covType",
+                           # foreign covariance ("sa"/"imp") deferred to a post-fit
+                           # recompute; internal so a built control round-trips.
+                           "covMethodDeferred",
+                           # subject-constant covariates stashed by .foceiFamilyReturn
+                           # for the analytic covariate-coefficient reuse; internal so
+                           # a built control round-trips (e.g. posthoc re-validation).
+                           "foceiConstCovs",
+                           # TRUE when the outer optimizer was defaulted (not user
+                           # specified); lets *f wrappers re-default under fast=TRUE
+                           "outerOptDefault")
 
 #' Control Options for FOCEi
 #'
-#' @param sigdig Optimization significant digits. This controls:
-#'
-#' \itemize{
-#'
-#'  \item The tolerance of the inner and outer optimization is \code{10^-sigdig}
-#'
-#'  \item The tolerance of the ODE solvers is
-#'  \code{0.5*10^(-sigdig-2)}; For the sensitivity equations and
-#'  steady-state solutions the default is \code{0.5*10^(-sigdig-1.5)}
-#'  (sensitivity changes only applicable for liblsoda)
-#'
-#'  \item The tolerance of the boundary check is \code{5 * 10 ^ (-sigdig + 1)}
-#'
-#' }
+#' @param sigdig Optimization significant digits.  One value drives, with a single
+#'   consistent formula, the inner/outer optimizer convergence tolerance
+#'   (\code{10^-sigdig}), the boundary check tolerance (\code{5*10^(-sigdig+1)}),
+#'   and the ODE solver tolerances: the \code{rtol} exponent IS \code{sigdig} and
+#'   \code{atol} sits three orders below, so \code{rtol = 10^-sigdig},
+#'   \code{atol = 10^(-sigdig-3)} for every solver (stiff, non-stiff or
+#'   auto-switching).  The sensitivity (\code{atolSens}/\code{rtolSens})
+#'   tolerances match the main solve (the outer gradient and covariance are built
+#'   from them); the steady-state (\code{ssAtol}/\code{ssRtol}) tolerances run one
+#'   order looser.
+#'   Keying the optimizer to the same \code{10^-sigdig} means it converges to
+#'   exactly the precision the solve supports.  At the default \code{sigdig = 3}
+#'   this is \code{atol = 1e-6}, \code{rtol = 1e-3}.
 #'
 #' @param sigdigTable Significant digits in the final output table.
 #'   If not specified, then it matches the significant digits in the
@@ -27,10 +46,7 @@
 #'
 #' @param epsilon Precision of estimate for n1qn1 optimization.
 #'
-#' @param print Integer representing when the outer step is
-#'     printed. When this is 0 or do not print the iterations.  1 is
-#'     print every function evaluation (default), 5 is print every 5
-#'     evaluations.
+#' @inheritParams iterPrintParams
 #'
 #' @param scaleTo Scale the initial parameter estimate to this value.
 #'     By default this is 1.  When zero or below, no scaling is performed.
@@ -38,19 +54,12 @@
 #' @param scaleObjective Scale the initial objective function to this
 #'     value.  By default this is 0 (meaning do not scale)
 #'
-#' @param derivEps Forward difference tolerances, which is a
-#'     vector of relative difference and absolute difference.  The
-#'     central/forward difference step size h is calculated as:
+#' @param derivEps Forward difference tolerances (relative, absolute); step
+#'     size \code{h = abs(x)*derivEps[1] + derivEps[2]}.
 #'
-#'         \code{h = abs(x)*derivEps[1] + derivEps[2]}
-#'
-#' @param derivMethod indicates the method for calculating
-#'     derivatives of the outer problem.  Currently supports
-#'     "switch", "central" and "forward" difference methods.  Switch
-#'     starts with forward differences.  This will switch to central
-#'     differences when abs(delta(OFV)) <= derivSwitchTol and switch
-#'     back to forward differences when abs(delta(OFV)) >
-#'     derivSwitchTol.
+#' @param derivMethod Derivative method for the outer problem: "switch",
+#'     "central", or "forward". "switch" starts forward and toggles to
+#'     central when \code{abs(delta(OFV)) <= derivSwitchTol}.
 #'
 #' @param derivSwitchTol The tolerance to switch forward to central
 #'     differences.
@@ -59,29 +68,94 @@
 #'     derivatives while calculating the covariance components
 #'     (Hessian and S).
 #'
-#' @param covMethod Method for calculating covariance.  In this
-#'     discussion, R is the Hessian matrix of the objective
-#'     function. The S matrix is the sum of individual
-#'     gradient cross-product (evaluated at the individual empirical
-#'     Bayes estimates).
+#' @param covMethod Method for calculating the covariance.  \code{"r,s"} (the
+#'     default) is the sandwich estimator (see below).  \code{"analytic"}
+#'     uses the exact analytic observed-information R-matrix (reported as
+#'     \eqn{R^{-1}}) and additionally returns the residual and \code{Omega} standard
+#'     errors; it covers FOCEI/FOCE fits with additive, proportional, or combined
+#'     error, mu-referenced/covariate/other structural parameters (and
+#'     non-mu-referenced etas), and SD-scale inter-occasion variability, and emits a
+#'     message and falls back to the finite-difference Hessian for anything out of
+#'     scope (FO, \code{nAGQ > 1}, censoring, DV-transformed error, bounded-parameter
+#'     transforms, a structural theta shared by two etas, non-SD \code{iovXform}, or a
+#'     pure-proportional variance that vanishes at a near-zero prediction).  The
+#'     finite-difference methods use R (the Hessian) and S (the sum of individual
+#'     gradient cross-products at the empirical Bayes estimates): \code{"r,s"} sandwich
+#'     (\code{solve(R)\%*\%S\%*\%solve(R)}), \code{"r"} Hessian-based
+#'     (\code{solve(R)}), \code{"s"} cross-product-based (\code{solve(S)}), or
+#'     \code{""} to skip the covariance step.  \code{"sa"} (SAEM Louis
+#'     stochastic-approximation FIM) and \code{"imp"} (importance-sampling
+#'     Monte-Carlo observed information) are also accepted for any method; they
+#'     are computed post-fit at the converged estimates by the decoupled
+#'     recompute engine.
 #'
-#' \itemize{
+#' @param covSolveTol absolute/relative ODE tolerance for the covariance solves --
+#'     the augmented-sensitivity solves behind \code{covMethod="analytic"} and the
+#'     perturbed solves behind the finite-difference methods.  \code{NULL} (default)
+#'     derives a tight tolerance from \code{sigdig}; supply a number to override it.
 #'
-#'  \item "\code{r,s}" Uses the sandwich matrix to calculate the
-#'  covariance, that is: \code{solve(R) \%*\% S \%*\% solve(R)}
+#' @param covFull shape of \code{fit$cov}.  \code{TRUE} (default) installs the
+#'     full theta + residual sigma + Omega covariance (assembled analytically for
+#'     \code{covMethod="analytic"}, or by central finite differences over the same
+#'     parameter set otherwise).  For the finite-difference methods it follows
+#'     \code{covMethod}: \code{"r,s"} is the full sandwich
+#'     \code{solve(Rfull) \%*\% Sfull \%*\% solve(Rfull)}, \code{"s"} is
+#'     \code{solve(Sfull)}, \code{"r"} is \code{solve(Rfull)}.  \code{FALSE}
+#'     installs only the structural-theta block (the historical shape).
 #'
-#'  \item "\code{r}" Uses the Hessian matrix to calculate the
-#'  covariance as \code{2 \%*\% solve(R)}
+#' @param fdChartrand Refine finite-difference slopes that the robust outlier
+#'     test flags (default \code{TRUE}).  When a subject's per-parameter slope
+#'     sits far outside the modified z-score interval of the others, its central
+#'     difference is suspect; those slopes -- and only those -- are recomputed
+#'     with a total-variation regularized derivative (Chartrand) on a wide
+#'     interval.  Set \code{FALSE} to keep the plain central difference.
 #'
-#'  \item "\code{s}" Uses the cross-product matrix to calculate the
-#'  covariance as \code{4 \%*\% solve(S)}
+#'     On by default because the outlier test is itself the gate: a well-behaved
+#'     problem flags nothing and pays nothing, so the cost falls only on the
+#'     complex fits where a slope really is an outlier -- exactly where you would
+#'     want the refinement, and where a user is least likely to know to ask for
+#'     it.  \code{fit$env$nFdOutlier} reports flagged parameters and refined
+#'     slopes, so you can see whether it engaged for a given fit.
 #'
-#'  \item "" Does not calculate the covariance step.
-#' }
+#'     Worth knowing when judging it: the measurements that originally motivated
+#'     this refinement were taken while the likelihood and the Shi step selection
+#'     were both faulty, so they do not evidence its value on current code, and it
+#'     has not been observed to trigger on ordinary fits.
+#'
+#' @param fast When \code{TRUE}, compute the outer (population) gradient
+#'     analytically from Almquist (2015) sensitivity equations instead of by
+#'     finite differences, and use the Eq-48 random-effect extrapolation for the
+#'     next inner-problem starting values.  Requires an analytic-scope model.
+#'     Conditionally Gaussian endpoints route through the general (f,R)
+#'     assembler, which covers more than the plain add/prop case -- multiple
+#'     endpoints, combined and power error, both-sides transforms and a single
+#'     estimated boxCox/yeoJohnson lambda.  A single non-Gaussian
+#'     (\code{ll()}/generalized) endpoint instead differentiates the
+#'     log-density directly, giving an exact inner Hessian and analytic outer
+#'     gradient.  Out of scope are \code{linCmt()}, \code{fo}, IOV, more than
+#'     one estimated lambda, a theta mu-referenced by several random effects,
+#'     and (for the non-Gaussian path) multiple endpoints, censoring or
+#'     \code{nAGQ > 1}; those fall back to the finite-difference gradient with
+#'     a message (linCmt() and out-of-scope log-likelihood models downgrade to
+#'     \code{fast=FALSE} up front).  When unspecified,
+#'     the outer optimizer defaults to \code{"lbfgsb3c"} (vs \code{"nlminb"} for
+#'     \code{fast=FALSE}); pairing \code{fast=TRUE} with a derivative-free
+#'     \code{outerOpt} reverts to \code{fast=FALSE}.  The \code{*f} methods (e.g.
+#'     \code{foceif}) default this to \code{TRUE}.
 #'
 #' @param covTryHarder If the R matrix is non-positive definite and
 #'     cannot be corrected to be non-positive definite try estimating
 #'     the Hessian on the unscaled parameter space.
+#'
+#' @param foceEbeTol Convergence tolerance on the score of the FOCE
+#'     frozen-variance EBE re-solve, which the analytic outer gradient
+#'     (\code{fast=TRUE}, \code{interaction=FALSE}) needs because FOCE's mode is
+#'     not the inner problem's mode.  \code{NULL} (default) uses \code{1e-9}; the
+#'     first iteration uses a looser \code{1e-3} so an already-stationary eta is
+#'     returned untouched.  Unlike the solver and optimizer tolerances this is not
+#'     derived from \code{sigdig} -- it is a convergence target on an inner Newton
+#'     rather than a precision request.  Set it explicitly to test whether a fit's
+#'     finite-difference fallbacks are tolerance-driven.
 #'
 #' @param hessEps is a double value representing the epsilon for the
 #'   Hessian calculation. This is used for the R matrix calculation.
@@ -91,23 +165,22 @@
 #'   log-likelihood estimation.  This is used for the R matrix
 #'   calculation.
 #'
-#' @param optimHessType The hessian type for when calculating the
-#'   individual hessian by numeric differences (in generalized
-#'   log-likelihood estimation).  The options are "central", and
-#'   "forward".  The central differences is what R's `optimHess()`
-#'   uses and is the default for this method. (Though the "forward" is
-#'   faster and still reasonable for most cases).  The Shi21 cannot be
-#'   changed for the Gill83 algorithm with the optimHess in a
-#'   generalized likelihood problem.
+#' @param optimHessType Hessian type for numeric-difference individual
+#'   Hessians in generalized log-likelihood estimation: "central" (matches
+#'   R's `optimHess()`, default) or "forward" (faster).
 #'
-#' @param optimHessCovType The hessian type for when calculating the
-#'   individual hessian by numeric differences (in generalized
-#'   log-likelihood estimation).  The options are "central", and
-#'   "forward".  The central differences is what R's `optimHess()`
-#'   uses.  While this takes longer in optimization, it is more
-#'   accurate, so for calculating the covariance and final likelihood,
-#'   the central differences are used. This also uses the modified
-#'   Shi21 method
+#' @param optimHessCovType Hessian type for numeric-difference individual
+#'   Hessians used for the covariance step/final likelihood: "central"
+#'   (more accurate, used here) or "forward".
+#'
+#' @param censOption Treatment of the second derivative for censored
+#'   (M2/M3/M4/BLQ) observations in the FOCEI family.  \code{"gauss"} (the default)
+#'   keeps the historic uncensored Gauss-Newton curvature, matching common PMx tools;
+#'   \code{"laplace"} uses the exact censored second derivative of the objective (a
+#'   proper Laplace inner Hessian and analytic covariance).  Accepted by
+#'   \code{saemControl}/\code{nlmControl} for a uniform interface but inert there --
+#'   SAEM (stochastic EM) has no Laplace inner Hessian, and NLM uses a
+#'   finite-difference Hessian that already reflects censoring exactly.
 #'
 #' @param shi21maxOuter The maximum number of steps for the
 #'   optimization of the forward-difference step size.  When not zero,
@@ -127,67 +200,46 @@
 #'   of the forward difference step size when using dosing events (lag
 #'   time, modeled duration/rate and bioavailability)
 #'
-#' @param centralDerivEps Central difference tolerances.  This is a
-#'   numeric vector of relative difference and absolute difference.
-#'   The central/forward difference step size h is calculated as:
+#' @param shi21hMax Upper bound on the adaptive shi21 finite-difference
+#'   step size for FOCEi gradients (both the inner eta and outer
+#'   theta/covariate finite differences).  The step-size search never
+#'   probes a parameter by more than this on its estimation scale; a
+#'   larger value lets the gradient of a flat, small-magnitude parameter
+#'   (e.g. a covariate coefficient near 0) clear the ODE-solver noise
+#'   floor, at the cost of risking a degenerate solve at the probe.
 #'
-#'         \code{h = abs(x)*derivEps[1] + derivEps[2]}
+#' @param shi21hMin Lower bound on the adaptive shi21 finite-difference
+#'   step size for FOCEi gradients.  The floor is limited by the ODE
+#'   solver tolerance (atol/rtol), not machine precision; below it the
+#'   finite difference is dominated by solver noise.
+#'
+#' @param centralDerivEps Central difference tolerances (relative,
+#'   absolute); step size \code{h = abs(x)*derivEps[1] + derivEps[2]}.
 #'
 #' @param lbfgsLmm An integer giving the number of BFGS updates
 #'     retained in the "L-BFGS-B" method, It defaults to 7.
 #'
-#' @param lbfgsPgtol is a double precision variable.
+#' @param lbfgsPgtol Projected-gradient convergence tolerance for
+#'     "L-BFGS-B": iteration stops when
+#'     \code{max(| proj g_i |) <= lbfgsPgtol}. Defaults to `0` (check
+#'     suppressed).
 #'
-#'     On entry pgtol >= 0 is specified by the user.  The iteration
-#'     will stop when:
+#' @param lbfgsFactr Convergence factor for "L-BFGS-B": converges when the
+#'     objective reduction is within \code{lbfgsFactr * .Machine$double.eps}.
+#'     Derived from \code{sigdig} as \code{10^-sigdig / .Machine$double.eps}, so
+#'     the objective reduction target IS \code{10^-sigdig}.
 #'
-#'        \code{max(\| proj g_i \| i = 1, ..., n) <= lbfgsPgtol}
+#' @param diagXform Transformation used on the diagonal of
+#'     \code{chol(solve(omega))} (the FOCEi-estimated parameters): one of
+#'     \code{"sqrt"} (default), \code{"log"}, or \code{"identity"}.
 #'
-#'     where pg_i is the ith component of the projected gradient.
-#'
-#'     On exit pgtol is unchanged.  This defaults to zero, when the
-#'     check is suppressed.
-#'
-#' @param lbfgsFactr Controls the convergence of the "L-BFGS-B"
-#'     method.  Convergence occurs when the reduction in the
-#'     objective is within this factor of the machine
-#'     tolerance. Default is 1e10, which gives a tolerance of about
-#'     \code{2e-6}, approximately 4 sigdigs.  You can check your
-#'     exact tolerance by multiplying this value by
-#'     \code{.Machine$double.eps}
-#'
-#' @param diagXform This is the transformation used on the diagonal
-#'     of the \code{chol(solve(omega))}. This matrix and values are the
-#'     parameters estimated in FOCEi. The possibilities are:
-#'
-#' \itemize{
-#'  \item \code{sqrt} Estimates the sqrt of the diagonal elements of \code{chol(solve(omega))}.  This is the default method.
-#'
-#'  \item \code{log} Estimates the log of the diagonal elements of \code{chol(solve(omega))}
-#'
-#'  \item \code{identity} Estimates the diagonal elements without any transformations
-#' }
-#'
-#' @param iovXform This is the transformation used on the diagonal
-#'     of the `iov`. The possibilities are:
-#'
-#' \itemize{
-#'
-#'  \item \code{sd} Estimate the IOV as the standard deviation for IOV
-#'
-#'  \item \code{var} Estimate the IOV as the variance for IOV.
-#'
-#'  \item \code{logsd} Estimate the IOV as the log(sd) instead of sd.
-#'
-#'  \item \code{logvar} Estimate the IOV as the log(var) instead of variance.
-#'
-#' }
+#' @param iovXform Transformation used on the diagonal of the IOV: one of
+#'     \code{"sd"}, \code{"var"}, \code{"logsd"}, or \code{"logvar"}.
 #'
 #' @param sumProd Is a boolean indicating if the model should change
 #'     multiplication to high precision multiplication and sums to
 #'     high precision sums using the PreciseSums package.  By default
 #'     this is \code{FALSE}.
-#'
 #'
 #' @param optExpression Optimize the rxode2 expression to speed up
 #'     calculation. By default this is turned on.
@@ -202,8 +254,6 @@
 #'
 #' @param ci Confidence level for some tables.  By default this is
 #'     0.95 or 95\% confidence.
-#'
-#' @param useColor Boolean indicating if focei can use ASCII color codes
 #'
 #' @param boundTol Tolerance for boundary issues.
 #'
@@ -224,14 +274,36 @@
 #' @param eigen A boolean indicating if eigenvectors are calculated
 #'     to include a condition number calculation.
 #'
-#' @param printNcol Number of columns to printout before wrapping
-#'     parameter estimates/gradient
-#'
 #' @param noAbort Boolean to indicate if you should abort the FOCEi
 #'     evaluation if it runs into troubles.  (default TRUE)
 #'
 #' @param interaction Boolean indicate FOCEi should be used (TRUE)
 #'     instead of FOCE (FALSE)
+#'
+#' @param foce Controls how FOCE (\code{interaction = FALSE}) evaluates the
+#'     residual variance R in the inner objective; ignored for FOCEi.  Either
+#'     \code{"nonmem"} (default) or \code{"foce+"}:
+#'
+#'     \itemize{
+#'
+#'     \item \code{"nonmem"} freezes R at the \code{eta = 0} population
+#'     prediction and holds it constant across the inner optimization, matching
+#'     NONMEM's FOCE.  Advantage: reproduces NONMEM FOCE objective and standard
+#'     errors, and an ODE model agrees with its closed-form (\code{linCmt})
+#'     equivalent.  Disadvantage: R ignores the individual (conditional)
+#'     heteroscedasticity, so it can be slightly less accurate than
+#'     \code{"foce+"} for proportional/combined error.
+#'
+#'     \item \code{"foce+"} evaluates R at the current conditional
+#'     \code{eta} (the live variance), keeping the truncated FOCE
+#'     inner gradient.  Advantage: uses the conditional variance and
+#'     is a bit more accurate than NONMEM's FOCE in some cases.
+#'     Disadvantage: does not match NONMEM FOCE.  This was the FOCE
+#'     behavior in \pkg{nlmixr2est} 6.0.1 and earlier. This does not
+#'     use the gradient of \code{eta} like the full \code{focei}
+#'     method, so it is not as accurate as \code{focei}.
+#'
+#'     }
 #'
 #' @param cholSEOpt Boolean indicating if the generalized Cholesky
 #'     should be used while optimizing.
@@ -254,22 +326,16 @@
 #'
 #' @param stateTrim Trim state amounts/concentrations to this value.
 #'
-#' @param resetEtaP represents the p-value for reseting the
-#'     individual ETA to 0 during optimization (instead of the saved
-#'     value).  The two test statistics used in the z-test are either
-#'     chol(omega^-1) \%*\% eta or eta/sd(allEtas).  A p-value of 0
-#'     indicates the ETAs never reset.  A p-value of 1 indicates the
-#'     ETAs always reset.
+#' @param resetEtaP P-value for resetting an individual ETA to 0 during
+#'     optimization, based on a z-test of \code{chol(omega^-1) \%*\% eta}
+#'     or \code{eta/sd(allEtas)}. `0` = never reset, `1` = always reset.
 #'
-#' @param resetThetaP represents the p-value for reseting the
-#'     population mu-referenced THETA parameters based on ETA drift
-#'     during optimization, and resetting the optimization.  A
-#'     p-value of 0 indicates the THETAs never reset.  A p-value of 1
-#'     indicates the THETAs always reset and is not allowed.  The
-#'     theta reset is checked at the beginning and when nearing a
-#'     local minima.  The percent change in objective function where
-#'     a theta reset check is initiated is controlled in
-#'     \code{resetThetaCheckPer}.
+#' @param resetThetaP P-value for resetting mu-referenced THETAs based on
+#'     ETA drift, checked at the start and near a local minimum (see
+#'     \code{resetThetaCheckPer}). `0` = never reset (the default); `1` is
+#'     not allowed.  Defaults to off: when the etas cannot re-center the
+#'     reset repeats without progress and can error the fit out, and where
+#'     it converges it reaches a worse optimum than leaving it off.
 #'
 #' @param resetThetaCheckPer represents objective function
 #'     \% percentage below which resetThetaP is checked.
@@ -277,42 +343,61 @@
 #' @param resetThetaFinalP represents the p-value for reseting the
 #'     population mu-referenced THETA parameters based on ETA drift
 #'     during optimization, and resetting the optimization one final time.
+#'     `0` = never reset (the default); see \code{resetThetaP}.
 #'
 #' @param resetHessianAndEta is a boolean representing if the
 #'     individual Hessian is reset when ETAs are reset using the
 #'     option \code{resetEtaP}.
 #'
-#' @param diagOmegaBoundUpper This represents the upper bound of the
-#'     diagonal omega matrix.  The upper bound is given by
-#'     diag(omega)*diagOmegaBoundUpper.  If
-#'     \code{diagOmegaBoundUpper} is 1, there is no upper bound on
-#'     Omega.
+#' @param muModel Mu-referenced-FOCEI-family regression variant: \code{"none"}
+#'     (default, ordinary FOCEI); \code{"lin"}
+#'     (\code{mfocei}/\code{mfoce}/\code{magq}/\code{mlaplace}) profiles
+#'     mu-referenced population thetas and covariate coefficients out of the
+#'     outer optimizer via closed-form OLS regression of each subject's
+#'     back-calculated value on the covariates (\code{muModelTol}/
+#'     \code{muModelMaxCycles}); \code{"irls"}
+#'     (\code{ifocei}/\code{ifoce}/\code{iagq}/\code{ilaplace}) reweights that
+#'     by inner-optimization curvature.  Bounded mu parameters are
+#'     regression-updated with a clamped step (\code{muModelClampRetries});
+#'     a user-fixed (\code{fix()}) mu theta is never updated.
 #'
-#' @param diagOmegaBoundLower This represents the lower bound of the
-#'     diagonal omega matrix.  The lower bound is given by
-#'     diag(omega)/diagOmegaBoundUpper.  If
-#'     \code{diagOmegaBoundLower} is 1, there is no lower bound on
-#'     Omega.
+#' @param muRefCovAlg When `TRUE` (default), algebraic expressions that can
+#'     be mu-referenced are internally rewritten as mu-referenced
+#'     covariates and restored after optimization. Mirrors
+#'     \code{saemControl(muRefCovAlg=)}/\code{nlmeControl(muRefCovAlg=)};
+#'     for \code{foceiControl()} only takes effect when
+#'     \code{muModel != "none"}.
 #'
-#' @param rhobeg Beginning change in parameters for bobyqa algorithm
-#'     (trust region).  By default this is 0.2 or 20% of the initial
-#'     parameters when the parameters are scaled to 1. rhobeg and
-#'     rhoend must be set to the initial and final values of a trust
-#'     region radius, so both must be positive with 0 < rhoend <
-#'     rhobeg. Typically rhobeg should be about one tenth of the
-#'     greatest expected change to a variable.  Note also that
-#'     smallest difference abs(upper-lower) should be greater than or
-#'     equal to rhobeg*2. If this is not the case then rhobeg will be
-#'     adjusted. (bobyqa)
+#' @param muModelTol Convergence tolerance for the mu-referenced-FOCEI-family
+#'     "re-optimize etas, then regress" cycle (\code{muModel != "none"}):
+#'     repeats until the max mu-group theta change drops below this value
+#'     or \code{muModelMaxCycles} is reached.
 #'
-#' @param rhoend The smallest value of the trust region radius that
-#'     is allowed. If not defined, then 10^(-sigdig-1) will be used. (bobyqa)
+#' @param muModelMaxCycles Maximum number of "re-optimize etas, regress"
+#'     cycles per outer iteration (see \code{muModel}, \code{muModelTol}).
 #'
-#' @param npt The number of points used to approximate the objective
-#'     function via a quadratic approximation for bobyqa. The value
-#'     of npt must be in the interval [n+2,(n+1)(n+2)/2] where n is
-#'     the number of parameters in par. Choices that exceed 2*n+1 are
-#'     not recommended. If not defined, it will be set to 2*n + 1. (bobyqa)
+#' @param muModelClampRetries Maximum number of active-set re-solve passes
+#'     per group per regression update when a bounded mu-referenced
+#'     parameter must be clamped to its bound (see \code{muModel}); on
+#'     hitting the cap the current clamped-feasible solution is used.
+#'
+#' @param diagOmegaBoundUpper Upper bound of the diagonal omega matrix, as
+#'     \code{diag(omega)*diagOmegaBoundUpper}. `1` = no upper bound.
+#'
+#' @param diagOmegaBoundLower Lower bound of the diagonal omega matrix, as
+#'     \code{diag(omega)/diagOmegaBoundLower}. `1` = no lower bound.
+#'
+#' @param rhobeg Initial trust region radius for the bobyqa outer optimizer
+#'     (with `rhoend`, must satisfy `0 < rhoend < rhobeg`). Default `0.2`
+#'     (20% of scaled parameters); adjusted upward if smaller than
+#'     `abs(upper-lower)/2`. (bobyqa)
+#'
+#' @param rhoend Final trust region radius. If not defined,
+#'     `10^(-sigdig)` is used. (bobyqa)
+#'
+#' @param npt Number of points for bobyqa's quadratic approximation to the
+#'     objective; must be in `[n+2, (n+1)(n+2)/2]`. Defaults to `2*n + 1`.
+#'     (bobyqa)
 #'
 #' @param eval.max Number of maximum evaluations of the objective function (nlmimb)
 #'
@@ -326,88 +411,32 @@
 #'
 #' @param reltol  tolerance for nlmixr2 (BFGS)
 #'
-#' @param gillK The total number of possible steps to determine the
-#'     optimal forward/central difference step size per parameter (by
-#'     the Gill 1983 method).  If 0, no optimal step size is
-#'     determined.  Otherwise this is the optimal step size
-#'     determined.
+#' @param gillK Max steps to determine the optimal forward/central
+#'     difference step size per parameter (Gill 1983). `0` = no optimal
+#'     step size determined.
 #'
-#' @param gillKcovLlik The total number of possible steps to determine
-#'   the optimal forward/central difference step per parameter when
-#'   using the generalized focei log-likelihood method (by the Gill
-#'   1986 method).  If 0, no optimal step size is
-#'   determined. Otherwise this is the optimal step size is determined
+#' @param gillKcovLlik Same as \code{gillK} but for the generalized focei
+#'   log-likelihood method (Gill 1986).
 #'
 #' @param gillRtol The relative tolerance used for Gill 1983
 #'     determination of optimal step size.
 #'
-#' @param scaleType The scaling scheme for nlmixr2.  The supported types are:
+#' @param scaleType The scaling scheme for nlmixr2: \code{"nlmixr2"}
+#'     (default) scales as \code{(current-init)*scaleC[i] + scaleTo}, with
+#'     \code{scaleTo} from \code{normType} and scales from \code{scaleC};
+#'     \code{"norm"} uses the simple scaling from \code{normType};
+#'     \code{"mult"} scales multiplicatively as \code{current/init*scaleTo};
+#'     \code{"multAdd"} scales linearly (\code{(current-init)+scaleTo}) for
+#'     parameters in an exponential block (e.g. \code{exp(theta)}) and
+#'     multiplicatively otherwise.
 #'
-#' \itemize{
-#' \item \code{nlmixr2}  In this approach the scaling is performed by the following equation:
-#'
-#'    \deqn{v_{scaled}}{Vscaled} = (\deqn{v_{current} - v_{init}}{Vcurrent - Vinit})*scaleC[i] + scaleTo
-#'
-#' The \code{scaleTo} parameter is specified by the \code{normType},
-#' and the scales are specified by \code{scaleC}.
-#'
-#' \item \code{norm} This approach uses the simple scaling provided
-#'     by the \code{normType} argument.
-#'
-#' \item \code{mult} This approach does not use the data
-#' normalization provided by \code{normType}, but rather uses
-#' multiplicative scaling to a constant provided by the \code{scaleTo}
-#' argument.
-#'
-#'   In this case:
-#'
-#'   \deqn{v_{scaled}}{Vscaled} = \deqn{v_{current}}{Vcurrent}/\deqn{v_{init}}{Vinit}*scaleTo
-#'
-#' \item \code{multAdd} This approach changes the scaling based on
-#' the parameter being specified.  If a parameter is defined in an
-#' exponential block (ie exp(theta)), then it is scaled on a
-#' linearly, that is:
-#'
-#'   \deqn{v_{scaled}}{Vscaled} = (\deqn{v_{current}-v_{init}}{Vcurrent-Vinit}) + scaleTo
-#'
-#' Otherwise the parameter is scaled multiplicatively.
-#'
-#'    \deqn{v_{scaled}}{Vscaled} = \deqn{v_{current}}{Vcurrent}/\deqn{v_{init}}{Vinit}*scaleTo
-#'
-#' }
-#'
-#' @param scaleC The scaling constant used with
-#'     \code{scaleType=nlmixr2}.  When not specified, it is based on
-#'     the type of parameter that is estimated.  The idea is to keep
-#'     the derivatives similar on a log scale to have similar
-#'     gradient sizes.  Hence parameters like log(exp(theta)) would
-#'     have a scaling factor of 1 and log(theta) would have a scaling
-#'     factor of ini_value (to scale by 1/value; ie
-#'     d/dt(log(ini_value)) = 1/ini_value or scaleC=ini_value)
-#'
-#'    \itemize{
-#'
-#'    \item For parameters in an exponential (ie exp(theta)) or
-#'    parameters specifying powers, boxCox or yeoJohnson
-#'    transformations , this is 1.
-#'
-#'    \item For additive, proportional, lognormal error structures,
-#'    these are given by 0.5*abs(initial_estimate)
-#'
-#'    \item Factorials are scaled by abs(1/digamma(initial_estimate+1))
-#'
-#'    \item parameters in a log scale (ie log(theta)) are transformed
-#'    by log(abs(initial_estimate))*abs(initial_estimate)
-#'
-#'    }
-#'
-#'    These parameter scaling coefficients are chose to try to keep
-#'    similar slopes among parameters.  That is they all follow the
-#'    slopes approximately on a log-scale.
-#'
-#'    While these are chosen in a logical manner, they may not always
-#'    apply.  You can specify each parameters scaling factor by this
-#'    parameter if you wish.
+#' @param scaleC Scaling constant used with \code{scaleType="nlmixr2"};
+#'     when not specified, chosen by parameter type to keep gradient sizes
+#'     similar on a log scale: `1` for exp()-transformed/power/boxCox/
+#'     yeoJohnson parameters, `0.5*abs(est)` for additive/proportional/
+#'     lognormal error parameters, `abs(1/digamma(est+1))` for factorials,
+#'     and `log(abs(est))*abs(est)` for log-scale parameters. May be set
+#'     explicitly per parameter if these defaults don't apply well.
 #'
 #' @param scaleC0 Number to adjust the scaling factor by if the initial
 #'     gradient is zero.
@@ -416,81 +445,27 @@
 #'
 #' @param scaleCmin Minimum value of the scaleC to prevent underflow.
 #'
-#' @param normType This is the type of parameter
-#'     normalization/scaling used to get the scaled initial values
-#'     for nlmixr2.  These are used with \code{scaleType} of.
+#' @param scaleCband Length-2 increasing pair `c(low, high)` (default
+#'   `c(0.1, 10)`).  Each `theta`'s derivative-based scaling constant
+#'   (`1/|init|` for a linear parameter, or the transform-specific
+#'   formula) is kept when it lands inside this band, and otherwise
+#'   replaced by the parameter's native magnitude `|init|`.  This catches
+#'   the singular cases -- `1/|init|` blowing up for a small covariate
+#'   initial estimate, `log()` at init `1`, `logit` at the interval
+#'   midpoint, `factorial`/`gamma` at a digamma zero -- while leaving the
+#'   well-scaled common case (and its results) untouched.
 #'
-#'     With the exception of \code{rescale2}, these come
-#'     from
-#'     \href{https://en.wikipedia.org/wiki/Feature_scaling}{Feature
-#'     Scaling}. The \code{rescale2} The rescaling is the same type
-#'     described in the
+#' @param normType Parameter normalization/scaling used to get scaled
+#'     initial values for \code{scaleType}, of the form
+#'     \code{Vscaled = (Vunscaled-C1)/C2} (see
+#'     \href{https://en.wikipedia.org/wiki/Feature_scaling}{Feature Scaling};
+#'     \code{rescale2} follows the
 #'     \href{http://apmonitor.com/me575/uploads/Main/optimization_book.pdf}{OptdesX}
-#'     software manual.
-#'
-#'     In general, all all scaling formula can be described by:
-#'
-#'     \deqn{v_{scaled}}{Vscaled} = (\deqn{v_{unscaled}-C_{1}}{Vunscaled-C1})/\deqn{C_{2}}{C2}
-#'
-#'
-#'     Where
-#'
-#'
-#'     The other data normalization approaches follow the following formula
-#'
-#'     \deqn{v_{scaled}}{Vscaled} = (\deqn{v_{unscaled}-C_{1}}{Vunscaled-C1})/\deqn{C_{2}}{C2}
-#'
-#' \itemize{
-#'
-#' \item \code{rescale2} This scales all parameters from (-1 to 1).
-#'     The relative differences between the parameters are preserved
-#'     with this approach and the constants are:
-#'
-#'     \deqn{C_{1}}{C1} = (max(all unscaled values)+min(all unscaled values))/2
-#'
-#'     \deqn{C_{2}}{C2} = (max(all unscaled values) - min(all unscaled values))/2
-#'
-#'
-#' \item \code{rescale} or min-max normalization. This rescales all
-#'     parameters from (0 to 1).  As in the \code{rescale2} the
-#'     relative differences are preserved.  In this approach:
-#'
-#'     \deqn{C_{1}}{C1} = min(all unscaled values)
-#'
-#'     \deqn{C_{2}}{C2} = max(all unscaled values) - min(all unscaled values)
-#'
-#'
-#' \item \code{mean} or mean normalization.  This rescales to center
-#'     the parameters around the mean but the parameters are from 0
-#'     to 1.  In this approach:
-#'
-#'     \deqn{C_{1}}{C1} = mean(all unscaled values)
-#'
-#'     \deqn{C_{2}}{C2} = max(all unscaled values) - min(all unscaled values)
-#'
-#' \item \code{std} or standardization.  This standardizes by the mean
-#'      and standard deviation.  In this approach:
-#'
-#'     \deqn{C_{1}}{C1} = mean(all unscaled values)
-#'
-#'     \deqn{C_{2}}{C2} = sd(all unscaled values)
-#'
-#' \item \code{len} or unit length scaling.  This scales the
-#'    parameters to the unit length.  For this approach we use the Euclidean length, that
-#'    is:
-#'
-#'     \deqn{C_{1}}{C1} = 0
-#'
-#'     \deqn{C_{2}}{C2} = \deqn{\sqrt(v_1^2 + v_2^2 + \cdots + v_n^2)}{sqrt(v_1^2 + v_2^2 + ... + v_n^2)}
-#'
-#'
-#' \item \code{constant} which does not perform data normalization. That is
-#'
-#'     \deqn{C_{1}}{C1} = 0
-#'
-#'     \deqn{C_{2}}{C2} = 1
-#'
-#' }
+#'     manual): \code{"rescale2"} scales all parameters to (-1, 1);
+#'     \code{"rescale"} (min-max) scales to (0, 1); \code{"mean"} centers on
+#'     the mean with range (0, 1); \code{"std"} standardizes by mean/sd;
+#'     \code{"len"} scales to unit (Euclidean) length; \code{"constant"}
+#'     performs no normalization (\code{C1=0}, \code{C2=1}).
 #'
 #' @param gillStep When looking for the optimal forward difference
 #'     step size, this is This is the step size to increase the
@@ -500,11 +475,9 @@
 #' @param gillFtol The gillFtol is the gradient error tolerance that
 #'     is acceptable before issuing a warning/error about the gradient estimates.
 #'
-#' @param gillKcov The total number of possible steps to determine
-#'     the optimal forward/central difference step size per parameter
-#'     (by the Gill 1983 method) during the covariance step.  If 0,
-#'     no optimal step size is determined.  Otherwise this is the
-#'     optimal step size determined.
+#' @param gillKcov Max steps to determine the optimal forward/central
+#'     difference step size per parameter (Gill 1983) during the
+#'     covariance step. `0` = no optimal step size determined.
 #'
 #' @param gillStepCov When looking for the optimal forward difference
 #'     step size, this is This is the step size to increase the
@@ -543,21 +516,14 @@
 #'     step size for the instead of the central difference step size
 #'     during the central differences for optimization.
 #'
-#' @param covSmall The covSmall is the small number to compare
-#'     covariance numbers before rejecting an estimate of the
-#'     covariance as the final estimate (when comparing sandwich vs
-#'     R/S matrix estimates of the covariance).  This number controls
-#'     how small the variance is before the covariance matrix is
-#'     rejected.
+#' @param covSmall Small number used to compare covariance estimates
+#'     (sandwich vs R/S matrix) before rejecting one as too small to be
+#'     the final covariance estimate.
 #'
-#' @param adjLik In nlmixr2, the objective function matches NONMEM's
-#'     objective function, which removes a 2*pi constant from the
-#'     likelihood calculation. If this is TRUE, the likelihood
-#'     function is adjusted by this 2*pi factor.  When adjusted this
-#'     number more closely matches the likelihood approximations of
-#'     nlme, and SAS approximations.  Regardless of if this is turned
-#'     on or off the objective function matches NONMEM's objective
-#'     function.
+#' @param adjLik When `TRUE`, adjusts the likelihood by the 2*pi constant
+#'     nlmixr2's objective function otherwise omits (to match NONMEM),
+#'     more closely matching nlme/SAS likelihood approximations. The
+#'     objective function itself always matches NONMEM regardless.
 #'
 #' @param gradTrim The parameter to adjust the gradient to if the
 #'     |gradient| is very large.
@@ -570,16 +536,11 @@
 #'     where |grad| > gradCalcCentralLarge where forward differences
 #'     switch to central differences.
 #'
-#' @param etaNudge By default initial ETA estimates start at zero;
-#'   Sometimes this doesn't optimize appropriately.  If this value is
-#'   non-zero, when the n1qn1 optimization didn't perform
-#'   appropriately, reset the Hessian, and nudge the ETA up by this
-#'   value; If the ETA still doesn't move, nudge the ETA down by this
-#'   value. By default this value is qnorm(1-0.05/2)*1/sqrt(3), the
-#'   first of the Gauss Quadrature numbers times by the 0.95\% normal
-#'   region. If this is not successful try the second eta nudge
-#'   number (below).  If +-etaNudge2 is not successful, then assign
-#'   to zero and do not optimize any longer
+#' @param etaNudge When n1qn1 optimization of an ETA (starting at zero)
+#'   misbehaves, reset the Hessian and nudge the ETA up by this value, then
+#'   down if it still doesn't move. Defaults to
+#'   `qnorm(1-0.05/2)*1/sqrt(3)`. Falls back to \code{etaNudge2}, then to
+#'   zero (stop optimizing) if unsuccessful.
 #'
 #' @param etaNudge2 This is the second eta nudge.  By default it is
 #'   qnorm(1-0.05/2)*sqrt(3/5), which is the n=3 quadrature point
@@ -597,6 +558,22 @@
 #' @param stickyRecalcN The number of bad ODE solves before reducing
 #'     the atol/rtol for the rest of the problem.
 #'
+#' @param outerMaxOdeRecalc Maximum number of times to reduce the ODE
+#'     tolerances for a single subject and retry when the analytic
+#'     outer (augmented sensitivity) solve fails.  Tracked separately
+#'     from `maxOdeRecalc`, which governs the inner problem.  A subject
+#'     that solves after loosening still contributes an analytic
+#'     gradient instead of dropping the whole gradient to finite
+#'     differences.
+#'
+#' @param outerOdeRecalcFactor The factor the atol/rtol is loosened by
+#'     on each analytic outer retry; the outer counterpart of
+#'     `odeRecalcFactor`.
+#'
+#' @param outerStickyRecalcN The number of bad analytic outer solves
+#'     for a subject before its loosened tolerance is kept for the rest
+#'     of the problem; the outer counterpart of `stickyRecalcN`.
+#'
 #' @param indTolRelax When `TRUE` (default), only subjects whose ODE
 #'     solve produced NaN/Inf have their tolerances relaxed, and the
 #'     relaxed tolerance persists across optimizer calls (sticky).
@@ -610,6 +587,14 @@
 #' @param eventType Event gradient type for dosing events; Can be
 #'   "central" or "forward"
 #'
+#' @param eventSens How sensitivities of dosing/event parameters
+#'   (absorption lag time, bioavailability, infusion rate and duration,
+#'   etc.) are computed.  `"fd"` uses the legacy finite
+#'   differences.  `"jump"` (the default) uses the analytic event ("jump")
+#'   sensitivities provided by `rxode2`, which add accuracy and can speed
+#'   up the gradient/Hessian by avoiding the extra finite-difference
+#'   solves for these parameters.
+#'
 #' @param gradProgressOfvTime This is the time for a single objective
 #'     function evaluation (in seconds) to start progress bars on gradient evaluations
 #'
@@ -619,42 +604,18 @@
 #'
 #' @param compress Should the object have compressed items
 #'
-#' @param etaMat Eta matrix for initial estimates or final estimates
-#'   of the ETAs.
+#' @param etaMat Initial (or final) ETA estimates; can also be a prior fit,
+#'   whose final ETAs are then used as initial values. By default, uses the
+#'   last fit's ETAs if supplied, else all ETAs start at zero (`NULL`).
+#'   `NA` disables reuse from a prior fit.
 #'
-#'   This can also be a fit to take use the final estimation estimates
-#'   and use them as the initial eta value of the next fit.
-#'
-#'   By default, it will be the initial values of the etas from the
-#'   last fit (if supplied) or missing, meaning all ETAs start at
-#'   zero (`NULL`)
-#'
-#'   When this value is `NA`, the initial ETA estimates are not taken
-#'   from the last fit.
-#'
-#' @param addProp specifies the type of additive plus proportional
-#'   errors, the one where standard deviations add (combined1) or the
-#'   type where the variances add (combined2).
-#'
-#' The combined1 error type can be described by the following equation:
-#'
-#'   \deqn{y = f + (a + b\times f^c) \times \varepsilon}{y = f + (a + b*f^c)*err}
-#'
-#' The combined2 error model can be described by the following equation:
-#'
-#'  \deqn{y = f + \sqrt{a^2 + b^2\times f^{2\times c}} \times \varepsilon}{y = f + sqrt(a^2 + b^2*(f^c)^2)*err}
-#'
-#'  Where:
-#'
-#'  - y represents the observed value
-#'
-#'  - f represents the predicted value
-#'
-#'  - a  is the additive standard deviation
-#'
-#'  - b is the proportional/power standard deviation
-#'
-#'  - c is the power exponent (in the proportional case c=1)
+#' @param addProp Type of additive-plus-proportional error: `"combined1"`,
+#'   where standard deviations add:
+#'   \deqn{y = f + (a + b\times f^c) \times \varepsilon}{y = f + (a + b*f^c)*err};
+#'   or `"combined2"`, where variances add:
+#'   \deqn{y = f + \sqrt{a^2 + b^2\times f^{2\times c}} \times \varepsilon}{y = f + sqrt(a^2 + b^2*(f^c)^2)*err}.
+#'   Here y = observed, f = predicted, a = additive sd, b = proportional/power
+#'   sd, c = power exponent (1 in the proportional case).
 #'
 #' @param odeRecalcFactor The ODE recalculation factor when ODE
 #'   solving goes bad, this is the factor the rtol/atol is reduced
@@ -664,65 +625,57 @@
 #' @param fallbackFD Fallback to the finite differences if the
 #'   sensitivity equations do not solve.
 #'
-#' @param smatPer A percentage representing the number of failed
-#'   parameter gradients for each individual (which are replaced with
-#'   the overall gradient for the parameter) out of the total number
-#'   of gradients parameters (ie `ntheta*nsub`) before the S matrix is
-#'   considered to be a bad matrix.
+#' @param smatPer Percentage of failed per-individual parameter gradients
+#'   (replaced with the overall parameter gradient) out of the total
+#'   (`ntheta*nsub`) above which the S matrix is considered bad.
 #'
-#' @param sdLowerFact A factor for multiplying the estimate by when
-#'   the lower estimate is zero and the error is known to represent a
-#'   standard deviation of a parameter (like add.sd, prop.sd, pow.sd,
-#'   lnorm.sd, etc).  When zero, no factor is applied.  If your
-#'   initial estimate is 0.15 and your lower bound is zero, then the
-#'   lower bound would be assumed to be 0.00015.
+#' @param sdLowerFact Factor multiplying the estimate when the lower bound
+#'   is zero for a standard-deviation error parameter (add.sd, prop.sd,
+#'   etc); e.g. estimate 0.15 with lower bound 0 assumes a lower bound of
+#'   0.00015. `0` disables this.
 #'
-#' @param zeroGradFirstReset boolean, when `TRUE` if the first
-#'   gradient is zero, reset the zero gradient to
-#'   `sqrt(.Machine$double.eps)` to get past the bad initial estimate,
-#'   otherwise error (and possibly reset), when `FALSE` error when the
-#'   first gradient is zero.  When `NA` on the last reset, have the
-#'   zero gradient ignored, otherwise error and look for another
-#'   value.  Default is `TRUE`
+#' @param zeroGradFirstReset When `TRUE` (default), reset a zero first
+#'   gradient to `sqrt(.Machine$double.eps)` instead of erroring; `FALSE`
+#'   errors; `NA` ignores it only on the last reset attempt.
 #'
-#' @param zeroGradRunReset boolean, when `TRUE` if a gradient is zero,
-#'   reset the zero gradient to `sqrt(.Machine$double.eps)` to get
-#'   past the bad estimate while running.  Otherwise error (and
-#'   possibly reset). Default is `TRUE`
+#' @param zeroGradRunReset When `TRUE` (default), reset a zero gradient
+#'   encountered mid-run to `sqrt(.Machine$double.eps)` instead of erroring.
 #'
-#' @param zeroGradBobyqa boolean, when `TRUE` if a gradient is zero,
-#'   the reset will change the method to the gradient free bobyqa
-#'   method. When `NA`, the zero gradient will change to bobyqa only
-#'   when the first gradient is zero.  Default is `TRUE`
+#' @param zeroGradBobyqa When `TRUE` (default), a zero-gradient reset
+#'   switches to the gradient-free bobyqa method; `NA` only does so for the
+#'   first zero gradient.
 #'
-#' @param mceta Integer indicating the type of Monte Carlo sampling to
-#'   perform for the best initial ETA estimate (based on
-#'   `omega`). When:
+#' @param mceta Monte Carlo sampling for the best initial ETA estimate
+#'   (based on `omega`): `-2` (default) uses the Almquist (2015) Eq-48
+#'   extrapolation `eta^0 = eta* + (d eta*/d theta)(theta_new - theta_old)`
+#'   when the analytic gradient supplies `d eta*/d theta` (`fast = TRUE`),
+#'   accepting the extrapolated eta only when it is within the standardized-eta
+#'   reset bound (else keeping the last eta, or resetting to 0 when that is also
+#'   out of bound); `-1` jumps between the extrapolated eta and eta=0, keeping
+#'   the better; both `-2` and `-1` fall back to keeping the last eta when no
+#'   analytic `d eta*/d theta` is available (`fast = FALSE`).  `0` uses eta=0
+#'   for each inner optimization; for `n>0`, the last eta, eta=0, and n-1
+#'   etas sampled from omega are each evaluated and the best (by inner
+#'   objective) is used.
 #'
-#'   - `-1` the last eta is used for the optimization (default)
+#' @param seed Integer seed (default `42`) used to make a FOCEi fit
+#'   reproducible and self-contained.  The fit (including the `mceta`
+#'   Monte-Carlo initial-ETA draws, which pull from rxode2's threefry engine)
+#'   runs inside [rxode2::rxWithSeed()], so it neither depends on the ambient
+#'   RNG state nor advances/leaks it -- repeated fits in the same session, and
+#'   fits following other estimation methods, give identical results.
 #'
-#'   - `0` eta=0 is used for each inner optimization
+#' @param warm Seeding of the n1qn1 inner-optimization Hessian:
+#'   `"calc"` (default) warm-starts each inner problem with the eta
+#'   Hessian calculated at the starting eta and the current theta;
+#'   since theta moves between outer evaluations it is always
+#'   recalculated, never reused from an earlier round.  `"save"` uses
+#'   the classic self-initialized Hessian.
 #'
-#'  For the rest of the `mceta`, each parameter's inner objective
-#'  function is calculated and the eta set with the best objective
-#'  function is used.  With these further options:
-#'
-#'   - `1` the last eta and eta=0 are used
-#'
-#'   - `2` the last eta and eta=0 are used, as well as 1 sampled eta
-#'   from the omega matrix
-#'
-#'   - `n` the last eta and eta=0 are used, as well as n-1 sampled
-#'   etas from the omega matrix
-#'
-#' @param nAGQ Number of Gauss-Hermite Adaptive Quadrature points to
-#'   take.  When `nAGQ=0`, the AGQ is not used.  With `nAGQ=1`, this
-#'   is equivalent to the Laplace method. The adaptive quadrature
-#'   expands every node for each of the ETAs, so it can be quite
-#'   expensive with a large amount of ETAs.  Once the EBE is obtained
-#'   for a subject, you will have nAGQ^neta additional function
-#'   evaluations for even nAGQ numbers and (nAGQ^neta)-1 additional
-#'   function evaluations for odd nAGQ numbers.
+#' @param nAGQ Number of Gauss-Hermite adaptive quadrature points. `0`
+#'   disables AGQ; `1` is equivalent to Laplace. Cost grows quickly with
+#'   ETAs: once the EBE is found, expect `nAGQ^neta` (even `nAGQ`) or
+#'   `(nAGQ^neta)-1` (odd `nAGQ`) additional evaluations per subject.
 #'
 #' @param agqLow The lower bound for adaptive quadrature
 #'   log-likelihood. By default this is -Inf; in the original nlmixr's
@@ -732,33 +685,40 @@
 #'   log-likelihood.  By default this is Inf; in the original nlmixr's
 #'   gnlmm was 400.
 #'
-#' @param boundedTransform boolean indicating if the bounded
-#'   parameters should by transformed when using a unbounded
-#'   optimization method to make sure they are in bounds.  By default
-#'   this is `TRUE`, which transforms during optimization and
-#'   back-transforms for the final estimates.  When `FALSE`, the
-#'   optimization is performed on the original scale and the bounds
-#'   are passed to the optimization method.  When `NA`, the bounded
-#'   parameters are transformed for the optimization, but the final
-#'   estimates are not back-transformed.
+#' @param boundedTransform When `TRUE` (default), bounded parameters are
+#'   transformed for unbounded optimization methods and back-transformed
+#'   for final estimates. `FALSE` optimizes on the original scale with
+#'   bounds passed to the optimizer. `NA` transforms for optimization but
+#'   skips the final back-transform.
+#'
+#' @param zeroTheta Positive magnitude (default `0.001`) used to nudge a
+#'   population parameter (`theta`) whose initial estimate is exactly `0`
+#'   off zero before estimation.  FOCEi scales a linear parameter by its
+#'   native magnitude `|init|`, which is `0` (no scale) for a zero
+#'   initial estimate, so the parameter is moved to `+zeroTheta` when it
+#'   is within the parameter's bounds, otherwise `-zeroTheta`; if neither
+#'   is within the bounds an error is raised.  Fixed parameters
+#'   (including those fixed at `0`) are left untouched.
+#'
+#' @param eventSens Controls how dosing/event-parameter (`alag`, `F`,
+#'   `rate`, `dur`) sensitivities are computed for THETA/ETA gradients:
+#'   `"jump"` (default) uses rxode2's analytic event sensitivities; `"fd"`
+#'   uses the legacy finite-difference behavior.
+#'
+#' @param sensMethod Method used to compute the ODE parameter sensitivities.
+#'   `"forward"` uses the classic variational (forward) sensitivity ODEs;
+#'   `"default"` is the same thing.
 #'
 #' @inheritParams rxode2::rxSolve
 #' @inheritParams minqa::bobyqa
 #'
 #' @details
 #'
-#' Note this uses the R's L-BFGS-B in \code{\link{optim}} for the
-#' outer problem and the BFGS \code{\link[n1qn1]{n1qn1}} with that
-#' allows restoring the prior individual Hessian (for faster
-#' optimization speed).
-#'
-#' However the inner problem is not scaled.  Since most eta estimates
-#' start near zero, scaling for these parameters do not make sense.
-#'
-#' This process of scaling can fix some ill conditioning for the
-#' unscaled problem.  The covariance step is performed on the
-#' unscaled problem, so the condition number of that matrix may not
-#' be reflective of the scaled problem's condition-number.
+#' Uses R's L-BFGS-B (\code{\link{optim}}) for the outer problem and BFGS
+#' \code{\link[n1qn1]{n1qn1}} (restoring the prior individual Hessian) for
+#' the inner problem, which is left unscaled since eta estimates start near
+#' zero. The covariance step is performed on the unscaled problem, so its
+#' condition number may differ from the scaled problem's.
 #'
 #' @author Matthew L. Fidler
 #'
@@ -788,28 +748,36 @@ foceiControl <- function(sigdig = 3, #
                          maxOuterIterations = 5000, #
                          n1qn1nsim = NULL, #
                          print = 1L, #
-                         printNcol = floor((getOption("width") - 23) / 12), #
+                         printNcol = NULL, #
                          scaleTo = 1.0, #
                          scaleObjective = 0, #
                          normType = c("rescale2", "mean", "rescale", "std", "len", "constant"), #
                          scaleType = c("nlmixr2", "norm", "mult", "multAdd"), #
                          scaleCmax = 1e5, #
                          scaleCmin = 1e-5, #
+                         scaleCband = c(0.1, 10), #
                          scaleC = NULL, #
                          scaleC0 = 1e5, #
                          derivEps = rep(20 * sqrt(.Machine$double.eps), 2), #
                          derivMethod = c("switch", "forward", "central"), #
                          derivSwitchTol = NULL, #
                          covDerivMethod = c("central", "forward"), #
-                         covMethod = c("r,s", "r", "s", ""), #
+                         covMethod = c("r,s", "analytic", "r", "s", "sa", "imp", ""), #
+                         covSolveTol = NULL, #
+                         covFull = TRUE, #
+                         fast = FALSE, #
+                         fdChartrand = TRUE, #
                          # norm of weights = 1/0.225
                          #hessEps = (1/0.225*.Machine$double.eps)^(1 / 4), #
+                         foceEbeTol = NULL, #
                          hessEps =(.Machine$double.eps)^(1/3),
                          #hessEpsLlik =(1/0.225*.Machine$double.eps)^(1/4),
                          hessEpsLlik =(.Machine$double.eps)^(1/3),
                          optimHessType = c("central", "forward"),
                          optimHessCovType=c("central", "forward"),
+                         censOption = c("gauss", "laplace"),
                          eventType = c("central", "forward"), #
+                         eventSens = c("jump", "fd"), #
                          centralDerivEps = rep(20 * sqrt(.Machine$double.eps), 2), #
                          lbfgsLmm = 7L, #
                          lbfgsPgtol = 0, #
@@ -822,38 +790,38 @@ foceiControl <- function(sigdig = 3, #
                          literalFix=TRUE,
                          literalFixRes=TRUE,
                          ci = 0.95, #
-                         useColor = crayon::has_color(), #
+                         useColor = NULL, #
                          boundTol = NULL, #
                          calcTables = TRUE,#
                          noAbort = TRUE, #
                          interaction = TRUE, #
+                         foce = c("nonmem", "foce+"), #
                          cholSEtol = (.Machine$double.eps)^(1 / 3), #
                          cholAccept = 1e-3, #
                          resetEtaP = 0.15, #
-                         resetThetaP = 0.05, #
-                         resetThetaFinalP = 0.15, #
+                         # Default OFF.  The ETA-drift theta reset re-centers a
+                         # mu-referenced theta by the mean eta and restarts.  When the
+                         # etas cannot re-center -- e.g. every omega fixed, or a model
+                         # whose misfit the etas must absorb -- the shift does not stick,
+                         # the drift returns and the reset repeats until the restart cap
+                         # errors the fit out.  Where it does converge it lands on a worse
+                         # optimum than not resetting at all.  Same failure mode as the
+                         # mu-referenced (lin/irls) families' linear centering.
+                         resetThetaP = 0, #
+                         resetThetaFinalP = 0, #
                          diagOmegaBoundUpper = 5, # diag(omega) = diag(omega)*diagOmegaBoundUpper; =1 no upper
                          diagOmegaBoundLower = 100, # diag(omega) = diag(omega)/diagOmegaBoundLower; = 1 no lower
                          cholSEOpt = FALSE, #
                          cholSECov = FALSE, #
                          fo = FALSE, #
                          covTryHarder = FALSE, #
-                         ## Ranking based on run 025
-                         ## L-BFGS-B: 20970.53 (2094.004    429.535)
-                         ## bobyqa: 21082.34 (338.677    420.754)
-                         ## lbfgsb3* (modified for tolerances):
-                         ## nlminb: 20973.468 (755.821    458.343)
-                         ## mma: 20974.20 (Time: Opt: 3000.501 Cov: 467.287)
-                         ## slsqp: 21023.89 (Time: Opt: 460.099; Cov: 488.921)
-                         ## lbfgsbLG: 20974.74 (Time: Opt: 946.463; Cov:397.537)
-                         outerOpt = c("nlminb",
-                                      "bobyqa",
+                         outerOpt = c("bobyqa",
+                                      "nlminb",
                                       "lbfgsb3c",
                                       "L-BFGS-B",
                                       "mma",
                                       "lbfgsbLG",
                                       "slsqp",
-                                      "Rvmmin",
                                       "uobyqa",
                                       "newuoa"), #
                          innerOpt = c("n1qn1", "BFGS"), #
@@ -869,11 +837,18 @@ foceiControl <- function(sigdig = 3, #
                          abstol = NULL, #
                          reltol = NULL, #
                          resetHessianAndEta = FALSE, #
+                         muModel = c("none", "irls", "lin"), #
+                         muRefCovAlg = TRUE, #
+                         muModelTol = 1e-5, #
+                         muModelMaxCycles = 20L, #
+                         muModelClampRetries = 10L, #
                          stateTrim = Inf, #
                          shi21maxOuter = 0L,
                          shi21maxInner = 20L,
                          shi21maxInnerCov =20L,
                          shi21maxFD=20L,
+                         shi21hMax=2.0,
+                         shi21hMin=1e-4,
                          gillK = 10L, #
                          gillStep = 4, #
                          gillFtol = 0, #
@@ -909,6 +884,9 @@ foceiControl <- function(sigdig = 3, #
                          etaMat = NULL, #
                          repeatGillMax = 1,#
                          stickyRecalcN = 4, #
+                         outerMaxOdeRecalc = 5, #
+                         outerOdeRecalcFactor = 10^(0.5), #
+                         outerStickyRecalcN = 4, #
                          indTolRelax = TRUE, #
                          gradProgressOfvTime = 10, #
                          addProp = c("combined2", "combined1"),
@@ -922,39 +900,44 @@ foceiControl <- function(sigdig = 3, #
                          zeroGradFirstReset=TRUE,
                          zeroGradRunReset=TRUE,
                          zeroGradBobyqa=TRUE,
-                         mceta=-1L,
+                         mceta=-2L,
+                         warm=c("calc", "save"),
                          nAGQ=0,
                          agqLow=-Inf,
                          agqHi=Inf,
+                         sensMethod = c("default", "forward"),
+                         zeroTheta=0.001,
                          boundedTransform=TRUE) { #
+  ## sensMethod: forward (variational) ODE parameter sensitivities.
+  sensMethod <- match.arg(sensMethod)
   if (!is.null(sigdig)) {
     checkmate::assertNumeric(sigdig, lower=1, finite=TRUE, any.missing=TRUE, len=1)
     if (is.null(boundTol)) {
       boundTol <- 5 * 10^(-sigdig + 1)
     }
     if (is.null(epsilon)) {
-      epsilon <- 10^(-sigdig - 1)
+      epsilon <- 10^(-sigdig)
     }
     if (is.null(abstol)) {
-      abstol <- 10^(-sigdig - 1)
+      abstol <- 10^(-sigdig)
     }
     if (is.null(reltol)) {
-      reltol <- 10^(-sigdig - 1)
+      reltol <- 10^(-sigdig)
     }
     if (is.null(rhoend)) {
-      rhoend <- 10^(-sigdig - 1)
+      rhoend <- 10^(-sigdig)
     }
     if (is.null(lbfgsFactr)) {
-      lbfgsFactr <- 10^(-sigdig - 1) / .Machine$double.eps
+      lbfgsFactr <- 10^(-sigdig) / .Machine$double.eps
     }
     if (is.null(rel.tol)) {
-      rel.tol <- 10^(-sigdig - 1)
+      rel.tol <- 10^(-sigdig)
     }
     if (is.null(x.tol)) {
-      x.tol <- 10^(-sigdig - 1)
+      x.tol <- 10^(-sigdig)
     }
     if (is.null(derivSwitchTol)) {
-      derivSwitchTol <- 2 * 10^(-sigdig - 1)
+      derivSwitchTol <- 2 * 10^(-sigdig)
     }
   }
   if (is.null(sigdigTable)) {
@@ -978,12 +961,20 @@ foceiControl <- function(sigdig = 3, #
     n1qn1nsim <- 10 * maxInnerIterations + 1
   }
   checkmate::assertIntegerish(n1qn1nsim, len=1, lower=1, any.missing=FALSE)
-  checkmate::assertIntegerish(print, len=1, lower=0, any.missing=FALSE)
-  checkmate::assertIntegerish(printNcol, len=1, lower=1, any.missing=FALSE)
+  # Print args are absorbed/validated by iterPrintControl(); `iterPrintControl`
+  # picked up from `...` handles the round-trip via do.call(foceiControl, .ctl).
+  .iterPrintControl <- .absorbIterPrintControl(print = print,
+                                               printNcol = printNcol,
+                                               useColor = useColor,
+                                               iterPrintControl = list(...)$iterPrintControl)
   checkmate::assertNumeric(scaleTo, len=1, lower=0, any.missing=FALSE)
   checkmate::assertNumeric(scaleObjective, len=1, lower=0, any.missing=FALSE)
   checkmate::assertNumeric(scaleCmax, lower=0, any.missing=FALSE, len=1)
   checkmate::assertNumeric(scaleCmin, lower=0, any.missing=FALSE, len=1)
+  checkmate::assertNumeric(scaleCband, lower=0, finite=TRUE, any.missing=FALSE, len=2)
+  if (scaleCband[1] >= scaleCband[2]) {
+    stop("'scaleCband' must be an increasing pair (low, high)", call.=FALSE)
+  }
   if (!is.null(scaleC)) {
     checkmate::assertNumeric(scaleC, lower=0, any.missing=FALSE)
   }
@@ -994,6 +985,7 @@ foceiControl <- function(sigdig = 3, #
     covTryHarder <- as.integer(covTryHarder)
   } else {
     checkmate::assertLogical(covTryHarder, any.missing=FALSE, len=1)
+    checkmate::assertLogical(fdChartrand, any.missing=FALSE, len=1)
     covTryHarder <- as.integer(covTryHarder)
   }
 
@@ -1049,6 +1041,12 @@ foceiControl <- function(sigdig = 3, #
   }
   optGillF <- as.integer(optGillF)
 
+  # FOCE EBE Newton tolerance.  Deliberately NOT derived from sigdig: this is a score
+  # convergence target on an inner Newton, not a solve precision, and coupling it to
+  # sigdig made the analytic FOCE gradient available or not depending on the requested
+  # digits.  Fixed at the value the routine shipped with.
+  if (is.null(foceEbeTol)) foceEbeTol <- 1e-9
+  checkmate::assertNumeric(foceEbeTol, lower=0, finite=TRUE, any.missing=FALSE, len=1)
   checkmate::assertNumeric(hessEps, lower=0, any.missing=FALSE, len=1)
   checkmate::assertNumeric(hessEpsLlik, lower=0, any.missing=FALSE, len=1)
   checkmate::assertNumeric(centralDerivEps, lower=0, any.missing=FALSE, len=2)
@@ -1068,7 +1066,6 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertLogical(literalFixRes, any.missing=FALSE, len=1)
 
   checkmate::assertNumeric(ci, any.missing=FALSE, len=1, lower=0, upper=1)
-  checkmate::assertLogical(useColor, any.missing=FALSE, len=1)
   checkmate::assertNumeric(boundTol, lower=0, any.missing=FALSE, len=1)
 
   checkmate::assertLogical(calcTables, len=1, any.missing=FALSE)
@@ -1081,6 +1078,12 @@ foceiControl <- function(sigdig = 3, #
     checkmate::assertLogical(interaction, len=1, any.missing=FALSE)
   }
   interaction <- as.integer(interaction)
+
+  foce <- match.arg(foce)
+  ## FOCE (interaction=FALSE) residual-variance choice: 0="nonmem" (eta=0 frozen R),
+  ## 1="foce+" (live conditional R; also covMethod="analytic" via ef$focePlus).
+  ## Ignored when interaction=TRUE (FOCEi).
+  foceType <- as.integer(foce == "foce+")
 
   checkmate::assertNumeric(cholSEtol, lower=0, any.missing=FALSE, len=1)
   checkmate::assertNumeric(cholAccept, lower=0, any.missing=FALSE, len=1)
@@ -1107,12 +1110,24 @@ foceiControl <- function(sigdig = 3, #
     .optimHessCovTypeIdx <- c("central" = 1L, "forward" = 3L)
     optimHessCovType <- setNames(.optimHessCovTypeIdx[match.arg(optimHessCovType)], NULL)
   }
+  # censOption: the censored (M2/M3/M4) inner-Hessian / 2nd-derivative treatment.
+  # "gauss" (default) keeps the historic uncensored Gauss-Newton curvature; "laplace"
+  # uses the exact censored 2nd derivative (a proper Laplace).  Shared with saem/nlm.
+  if (checkmate::testIntegerish(censOption, len=1, lower=0, upper=1, any.missing=FALSE)) {
+    censOption <- as.integer(censOption)
+  } else {
+    censOption <- setNames(c("gauss" = 0L, "laplace" = 1L)[match.arg(censOption)], NULL)
+  }
   if (checkmate::testIntegerish(eventType, len=1, lower=1, upper=3, any.missing=FALSE)) {
     eventType <- as.integer(eventType)
   } else {
     .eventTypeIdx <- c("central" = 2L, "forward" = 3L)
     eventType <- setNames(.eventTypeIdx[match.arg(eventType)], NULL)
   }
+  ## How dosing/event-parameter (alag, F, rate, dur, ...) sensitivities are
+  ## computed: "fd" (legacy finite differences) or "jump" (analytic jump/event
+  ## sensitivities from rxode2).  "fd" is the backward-compatible default.
+  eventSens <- match.arg(eventSens)
 
   .normTypeIdx <- c("rescale2" = 1L, "rescale" = 2L, "mean" = 3L, "std" = 4L, "len" = 5L, "constant" = 6L)
   if (checkmate::testIntegerish(normType, len=1, lower=1, upper=6, any.missing=FALSE)) {
@@ -1133,17 +1148,45 @@ foceiControl <- function(sigdig = 3, #
     covDerivMethod <- match.arg(covDerivMethod)
     covDerivMethod <- setNames(.methodIdx[covDerivMethod], NULL)
   }
+  # covMethod folds in the R-matrix (Hessian) source: "analytic" (the default) uses the
+  # exact analytic observed-information R-matrix, reported with the observed-information
+  # "r" formula; "r,s"/"r"/"s" use the finite-difference Hessian with that formula; ""
+  # skips the covariance step.  The analytic-vs-finite-difference choice is carried to the
+  # solver as the (internal, derived) covType string, which also travels via ... so a
+  # built control round-trips.
+  covType <- "fd"
+  # "sa"/"imp" are foreign to the focei kernel; skip the in-kernel cov step and
+  # recompute them post-fit at the converged estimates (see .covRecompute).
+  covMethodDeferred <- NA_character_
   if (checkmate::testIntegerish(covMethod, len=1, lower=0L, upper=3L, any.missing=FALSE)) {
     covMethod <- as.integer(covMethod)
+    .ct <- list(...)$covType
+    if (!is.null(.ct)) covType <- match.arg(.ct, c("analytic", "fd"))
   } else if (rxode2::rxIs(covMethod, "character")) {
     if (all(covMethod == "")) {
       covMethod <- 0L
     } else {
       covMethod <- match.arg(covMethod)
-      .covMethodIdx <- c("r,s" = 1L, "r" = 2L, "s" = 3L)
-      covMethod <- setNames(.covMethodIdx[match.arg(covMethod)], NULL)
+      if (covMethod %in% c("sa", "imp")) {
+        covMethodDeferred <- covMethod
+        covMethod <- 0L
+      } else if (identical(covMethod, "analytic")) {
+        covType <- "analytic"
+        covMethod <- 2L
+      } else {
+        .covMethodIdx <- c("r,s" = 1L, "r" = 2L, "s" = 3L)
+        covMethod <- setNames(.covMethodIdx[covMethod], NULL)
+      }
     }
   }
+  # round-tripped controls carry the deferred request as a ... field
+  if (is.na(covMethodDeferred) && !is.null(list(...)$covMethodDeferred)) {
+    covMethodDeferred <- list(...)$covMethodDeferred
+  }
+  if (!is.null(covSolveTol)) checkmate::assertNumeric(covSolveTol, len = 1, lower = 0,
+                                                      finite = TRUE, any.missing = FALSE)
+  checkmate::assertFlag(covFull)
+  checkmate::assertFlag(fast)
   .xtra <- list(...)
   .bad <- names(.xtra)
   .bad <- .bad[!(.bad %in% .foceiControlInternal)]
@@ -1160,10 +1203,20 @@ foceiControl <- function(sigdig = 3, #
   if (!is.null(.xtra$outerOptTxt)) {
     .outerOptTxt <- .xtra$outerOptTxt
   }
+  .outerOptDefault <- isTRUE(.xtra$outerOptDefault)
   outerOptFun <- NULL
   if (!is.null(.xtra$outerOptFun)) {
     outerOptFun <- .xtra$outerOptFun
   } else if (rxode2::rxIs(outerOpt, "character")) {
+    # Default outer optimizer (when the user did not specify one): lbfgsb3c for
+    # the analytic-gradient ("fast") methods, nlminb for the finite-difference
+    # methods.  An explicit outerOpt (a single string) skips this;
+    # outerOptDefault records that the default was taken so a *f wrapper
+    # (.foceiFastCtl) can re-default a round-tripped control under fast=TRUE.
+    if (missing(outerOpt)) {
+      outerOpt <- if (isTRUE(fast)) "lbfgsb3c" else "bobyqa"
+      .outerOptDefault <- TRUE
+    }
     outerOpt <- match.arg(outerOpt)
     .outerOptTxt <- outerOpt
     if (outerOpt == "bobyqa") {
@@ -1204,11 +1257,25 @@ foceiControl <- function(sigdig = 3, #
     outerOptFun <- outerOpt
     outerOpt <- -1L
   }
+  # A derivative-free outer optimizer never consumes the analytic 'fast' gradient,
+  # so computing it is wasted work: downgrade to fast=FALSE with a warning.
+  if (isTRUE(fast) && .outerOptTxt %in% c("bobyqa", "uobyqa", "newuoa")) {
+    warning("outerOpt='", .outerOptTxt,
+            "' is derivative-free; the analytic 'fast' gradient is unused -- reverting to fast=FALSE",
+            call.=FALSE)
+    fast <- FALSE
+  }
   if (checkmate::testIntegerish(innerOpt, lower=1, upper=2, len=1)) {
     innerOpt <- as.integer(innerOpt)
   } else {
     .innerOptFun <- c("n1qn1" = 1L, "BFGS" = 2L)
     innerOpt <- setNames(.innerOptFun[match.arg(innerOpt)], NULL)
+  }
+  if (checkmate::testIntegerish(warm, lower=0, upper=1, len=1, any.missing=FALSE)) {
+    warm <- as.integer(warm)
+  } else {
+    .warmIdx <- c("calc" = 1L, "save" = 0L)
+    warm <- setNames(.warmIdx[match.arg(warm)], NULL)
   }
   if (!is.null(.xtra$resetEtaSize)) {
     .resetEtaSize <- .xtra$resetEtaSize
@@ -1240,7 +1307,7 @@ foceiControl <- function(sigdig = 3, #
     checkmate::assertNumeric(resetThetaFinalP, lower=0, upper=1, len=1)
     if (resetThetaFinalP > 0 & resetThetaFinalP < 1) {
       .resetThetaFinalSize <- qnorm(1 - (resetThetaFinalP / 2))
-    } else if (resetThetaP <= 0) {
+    } else if (resetThetaFinalP <= 0) {
       .resetThetaFinalSize <- Inf
     } else {
       stop("cannot always reset THETAs", call.=FALSE)
@@ -1257,11 +1324,14 @@ foceiControl <- function(sigdig = 3, #
   } else {
     genRxControl <- FALSE
     if (is.null(rxControl)) {
-      rxControl <- rxode2::rxControl(sigdig=sigdig,
-                                     maxsteps=500000L)
+      rxControl <- .rxControlScaleSigdig(rxode2::rxControl(sigdig=sigdig,
+                                                           maxsteps=500000L), sigdig)
       genRxControl <- TRUE
+    } else if (inherits(rxControl, "rxControl")) {
+      # a fully-formed rxControl object is the user's explicit solving spec; leave
+      # it untouched so any atol/rtol it carries is respected
     } else if (is.list(rxControl)) {
-      rxControl <- do.call(rxode2::rxControl, rxControl)
+      rxControl <- .rxControlScaleSigdig(do.call(rxode2::rxControl, rxControl), sigdig, skip = names(rxControl))
     }
     if (!inherits(rxControl, "rxControl")) {
       stop("rxControl needs to be ode solving options from rxode2::rxControl()",
@@ -1290,6 +1360,15 @@ foceiControl <- function(sigdig = 3, #
     checkmate::assertLogical(resetHessianAndEta, any.missing=FALSE, len=1)
   }
   resetHessianAndEta <- as.integer(resetHessianAndEta)
+
+  muModel <- match.arg(muModel)
+  checkmate::assertLogical(muRefCovAlg, any.missing=FALSE, len=1)
+  checkmate::assertNumeric(muModelTol, lower=0, len=1, any.missing=FALSE)
+  checkmate::assertIntegerish(muModelMaxCycles, lower=1, len=1, any.missing=FALSE)
+  muModelMaxCycles <- as.integer(muModelMaxCycles)
+  checkmate::assertIntegerish(muModelClampRetries, lower=1, len=1, any.missing=FALSE)
+  muModelClampRetries <- as.integer(muModelClampRetries)
+
   checkmate::assertNumeric(stateTrim, lower=0, len=1, any.missing=FALSE)
   checkmate::assertNumeric(covSmall, lower=0, any.missing=FALSE, finite=TRUE)
   checkmate::assertLogical(adjLik, any.missing=FALSE, len=1)
@@ -1307,6 +1386,9 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertNumeric(resetThetaCheckPer, lower=0, upper=1, any.missing=FALSE, finite=TRUE)
   checkmate::assertIntegerish(repeatGillMax, any.missing=FALSE, lower=0, len=1)
   checkmate::assertIntegerish(stickyRecalcN, any.missing=FALSE, lower=0, len=1)
+  checkmate::assertIntegerish(outerMaxOdeRecalc, any.missing=FALSE, lower=0, len=1)
+  checkmate::assertNumeric(outerOdeRecalcFactor, len=1, lower=1, any.missing=FALSE)
+  checkmate::assertIntegerish(outerStickyRecalcN, any.missing=FALSE, lower=0, len=1)
   checkmate::assertLogical(indTolRelax, any.missing=FALSE, len=1)
   checkmate::assertNumeric(gradProgressOfvTime, any.missing=FALSE, lower=0, len=1)
   checkmate::assertNumeric(badSolveObjfAdj, any.missing=FALSE, len=1)
@@ -1319,7 +1401,16 @@ foceiControl <- function(sigdig = 3, #
   checkmate::assertIntegerish(shi21maxInner, lower=0, len=1, any.missing=FALSE)
   checkmate::assertIntegerish(shi21maxInnerCov, lower=0, len=1, any.missing=FALSE)
   checkmate::assertIntegerish(shi21maxFD, lower=0, len=1, any.missing=FALSE)
-  checkmate::assertIntegerish(mceta, lower=-1, len=1,any.missing=FALSE)
+  checkmate::assertNumber(zeroTheta, lower=0, finite=TRUE)
+  if (zeroTheta <= 0) {
+    stop("'zeroTheta' must be a positive number", call.=FALSE)
+  }
+  checkmate::assertNumber(shi21hMin, lower=0, finite=TRUE)
+  checkmate::assertNumber(shi21hMax, lower=0, finite=TRUE)
+  if (shi21hMax <= shi21hMin) {
+    stop("'shi21hMax' must be greater than 'shi21hMin'", call.=FALSE)
+  }
+  checkmate::assertIntegerish(mceta, lower=-2, len=1,any.missing=FALSE)
 
   checkmate::assertNumeric(smatPer, any.missing=FALSE, lower=0, upper=1, len=1)
   checkmate::assertIntegerish(nAGQ, lower=0, len=1, any.missing=FALSE)
@@ -1330,7 +1421,7 @@ foceiControl <- function(sigdig = 3, #
     maxOuterIterations = as.integer(maxOuterIterations),
     maxInnerIterations = as.integer(maxInnerIterations),
     n1qn1nsim = as.integer(n1qn1nsim),
-    print = as.integer(print),
+    iterPrintControl = .iterPrintControl,
     lbfgsLmm = as.integer(lbfgsLmm),
     lbfgsPgtol = as.double(lbfgsPgtol),
     lbfgsFactr = as.double(lbfgsFactr),
@@ -1340,6 +1431,12 @@ foceiControl <- function(sigdig = 3, #
     derivMethod = derivMethod,
     covDerivMethod = covDerivMethod,
     covMethod = covMethod,
+    covType = covType,
+    covMethodDeferred = covMethodDeferred,
+    covSolveTol = covSolveTol,
+    covFull = covFull,
+    fast = fast,
+    fdChartrand = as.integer(fdChartrand),
     centralDerivEps = centralDerivEps,
     eigen = eigen,
     diagXform = match.arg(diagXform),
@@ -1353,17 +1450,19 @@ foceiControl <- function(sigdig = 3, #
     sigdig = as.double(sigdig),
     sigdigTable=sigdigTable,
     scaleObjective = as.double(scaleObjective),
-    useColor = useColor,
     boundTol = as.double(boundTol),
     calcTables = calcTables,
-    printNcol = as.integer(printNcol),
     noAbort = noAbort,
     interaction = interaction,
+    foce = foce,
+    foceType = foceType,
     cholSEtol = as.double(cholSEtol),
+    foceEbeTol = as.double(foceEbeTol),
     hessEps = as.double(hessEps),
     hessEpsLlik = as.double(hessEpsLlik),
     optimHessType=optimHessType,
     optimHessCovType=optimHessCovType,
+    censOption=censOption,
     cholAccept = as.double(cholAccept),
     resetEtaSize = as.double(.resetEtaSize),
     resetThetaSize = as.double(.resetThetaSize),
@@ -1390,6 +1489,11 @@ foceiControl <- function(sigdig = 3, #
     reltol = reltol,
     derivSwitchTol = derivSwitchTol,
     resetHessianAndEta = resetHessianAndEta,
+    muModel = muModel,
+    muRefCovAlg = muRefCovAlg,
+    muModelTol = as.double(muModelTol),
+    muModelMaxCycles = muModelMaxCycles,
+    muModelClampRetries = muModelClampRetries,
     stateTrim = as.double(stateTrim),
     gillK = as.integer(gillK),
     gillKcov = as.integer(gillKcov),
@@ -1402,9 +1506,11 @@ foceiControl <- function(sigdig = 3, #
     normType = normType,
     scaleC = scaleC,
     scaleCmin = as.double(scaleCmin),
+    scaleCband = as.double(scaleCband),
     scaleCmax = as.double(scaleCmax),
     scaleC0 = as.double(scaleC0),
     outerOptTxt = .outerOptTxt,
+    outerOptDefault = .outerOptDefault,
     rmatNorm = rmatNorm,
     rmatNormLlik = rmatNormLlik,
     smatNorm = smatNorm,
@@ -1429,8 +1535,12 @@ foceiControl <- function(sigdig = 3, #
     etaMat = etaMat,
     repeatGillMax = as.integer(repeatGillMax),
     stickyRecalcN = as.integer(max(1, abs(stickyRecalcN))),
+    outerMaxOdeRecalc = as.integer(outerMaxOdeRecalc),
+    outerOdeRecalcFactor = as.double(outerOdeRecalcFactor),
+    outerStickyRecalcN = as.integer(max(1, abs(outerStickyRecalcN))),
     indTolRelax = as.logical(indTolRelax),
     eventType = eventType,
+    eventSens = eventSens,
     gradProgressOfvTime = gradProgressOfvTime,
     addProp = addProp,
     badSolveObjfAdj=badSolveObjfAdj,
@@ -1443,17 +1553,25 @@ foceiControl <- function(sigdig = 3, #
     shi21maxInner=shi21maxInner,
     shi21maxInnerCov=shi21maxInnerCov,
     shi21maxFD=shi21maxFD,
+    shi21hMax=shi21hMax,
+    shi21hMin=shi21hMin,
     smatPer=smatPer,
     sdLowerFact=sdLowerFact,
     zeroGradFirstReset=zeroGradFirstReset,
     zeroGradRunReset=zeroGradRunReset,
     zeroGradBobyqa=zeroGradBobyqa,
     mceta=as.integer(mceta),
+    warm=warm,
     nAGQ=as.integer(nAGQ),
     agqHi=as.double(agqHi),
     agqLow=as.double(agqLow),
-    boundedTransform=boundedTransform
+    sensMethod=sensMethod,
+    boundedTransform=boundedTransform,
+    zeroTheta=zeroTheta
   )
+  if (!is.null(.xtra$est)) {
+    .ret$est <- .xtra$est
+  }
   if (length(etaMat) == 1L && is.na(etaMat)) {
     .ret$etaMat <- NA
   } else if (!is.null(etaMat)) {
@@ -1478,44 +1596,68 @@ foceiControl <- function(sigdig = 3, #
   if (object$outerOpt == -1L && object$outerOptTxt == "custom") {
     warning("functions for `outerOpt` cannot be deparsed, reset to default",
             call.=FALSE)
-  } else if (!(object$outerOptTxt %in% c("nlminb", "stats::optimize"))) {
-    .outerOpt <- paste0("outerOpt=", deparse1(object$outerOptTxt))
+  } else if (!(object$outerOptTxt %in% c(.ret$outerOptTxt, "stats::optimize"))) {
+    .outerOpt <- paste0("outerOpt = ", deparse1(object$outerOptTxt))
   }
   .w <- .deparseDifferent(.ret, object, .foceiControlInternal)
-  if (length(.w) == 0 && length(.outerOpt) == 0) {
+  # covMethod folds the analytic-vs-finite-difference R-matrix choice (carried by the
+  # derived internal covType) into a single token; covType is never deparsed on its own.
+  .covMethodStr <- function(o) {
+    if (identical(o$covType, "analytic")) return("analytic")
+    if (identical(as.integer(o$covMethod), 0L)) return("")
+    .idx <- c("r,s" = 1L, "r" = 2L, "s" = 3L)
+    names(.idx)[match(as.integer(o$covMethod), .idx)]
+  }
+  .covTok <- character(0)
+  if (!identical(.covMethodStr(object), .covMethodStr(.ret))) {
+    .covTok <- paste0("covMethod = ", deparse1(.covMethodStr(object)))
+  }
+  if (length(.w) == 0 && length(.outerOpt) == 0 && length(.covTok) == 0) {
     return(str2lang(paste0(var, " <- ", type, "()")))
   }
   .n <- names(.ret)[.w]
-  .n <- .n[.n != "outerOpt"]
+  .n <- .n[!(.n %in% c("outerOpt", "covMethod"))]
+  if (length(.covTok) > 0) {
+    .n <- c(.n, "covMethod")
+  }
+  # preserve the formal-argument declaration order (names(.ret)) so the covMethod
+  # token lands in its natural position instead of always first
+  .n <- .n[order(match(.n, names(.ret)))]
   .retD <- c(vapply(.n, function(x) {
+    if (x == "covMethod") {
+      return(.covTok)
+    }
     .val <- .deparseShared(x, object[[x]])
     if (!is.na(.val)) {
       return(.val)
     }
     if (x == "innerOpt") {
       .innerOptFun <- c("n1qn1" = 1L, "BFGS" = 2L)
-      paste0("innerOpt =", deparse1(names(.innerOptFun[which(object[[x]] == .innerOptFun)])))
+      paste0("innerOpt = ", deparse1(names(.innerOptFun[which(object[[x]] == .innerOptFun)])))
+    } else if (x == "warm") {
+      .warmIdx <- c("calc" = 1L, "save" = 0L)
+      paste0("warm = ", deparse1(names(.warmIdx[which(object[[x]] == .warmIdx)])))
     } else if (x %in% c("optimHessType", "optimHessCovType")) {
       .methodIdx <- c("central" = 1L, "forward" = 3L)
-      paste0(x, " =", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
+      paste0(x, " = ", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
     } else if (x == "eventType") {
       .methodIdx <- c("central" = 2L, "forward" = 3L)
-      paste0(x, " =", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
+      paste0(x, " = ", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
     } else if (x %in% c("derivMethod", "covDerivMethod")) {
       .methodIdx <- c("forward" = 0L, "central" = 1L, "switch" = 3L)
-      paste0(x, " =", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
+      paste0(x, " = ", deparse1(names(.methodIdx[which(object[[x]] == .methodIdx)])))
     } else if (x == "covMethod") {
       if (object[[x]] == 0L) {
         paste0(x, " = \"\"")
       } else {
         .covMethodIdx <- c("r,s" = 1L, "r" = 2L, "s" = 3L)
-        paste0(x, " =", deparse1(names(.covMethodIdx[which(object[[x]] == .covMethodIdx)])))
+        paste0(x, " = ", deparse1(names(.covMethodIdx[which(object[[x]] == .covMethodIdx)])))
       }
     } else {
-      paste0(x, "=", deparse1(object[[x]]))
+      paste0(x, " = ", deparse1(object[[x]]))
     }
   }, character(1)), .outerOpt)
-  str2lang(paste(var, " <- ", type, "(", paste(.retD, collapse=","),")"))
+  str2lang(paste(var, " <- ", type, "(", paste(.retD, collapse=", "), ")"))
 }
 
 #' @export

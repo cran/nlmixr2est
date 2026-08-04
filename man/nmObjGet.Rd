@@ -9,6 +9,7 @@
 \alias{nmObjGet.phiR}
 \alias{nmObjGet.phiSE}
 \alias{nmObjGet.phiRSE}
+\alias{nmObjGet.phiCI}
 \alias{nmObjGet.dataSav}
 \alias{nmObjGet.idLvl}
 \alias{nmObjGet.covLvl}
@@ -37,6 +38,10 @@
 \alias{nmObjGet.control}
 \alias{nmObjGet.simulationModel}
 \alias{nmObjGet.rxControl}
+\alias{nmObjGet.mixList}
+\alias{nmObjGet.mixNum}
+\alias{nmObjGet.ranef}
+\alias{nmObjGet.eta}
 \alias{nmObjGet.rxControlWithVar}
 \alias{nmObjGet.saemDopredIpred}
 \alias{nmObjGet.saemDopredPred}
@@ -57,6 +62,8 @@ nmObjGet(x, ...)
 \method{nmObjGet}{phiSE}(x, ...)
 
 \method{nmObjGet}{phiRSE}(x, ...)
+
+\method{nmObjGet}{phiCI}(x, ...)
 
 \method{nmObjGet}{dataSav}(x, ...)
 
@@ -113,6 +120,14 @@ nmObjGet(x, ...)
 \method{nmObjGet}{simulationModel}(x, ...)
 
 \method{nmObjGet}{rxControl}(x, ...)
+
+\method{nmObjGet}{mixList}(x, ...)
+
+\method{nmObjGet}{mixNum}(x, ...)
+
+\method{nmObjGet}{ranef}(x, ...)
+
+\method{nmObjGet}{eta}(x, ...)
 
 \method{nmObjGet}{rxControlWithVar}(x, ...)
 

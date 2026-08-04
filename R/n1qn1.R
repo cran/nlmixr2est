@@ -1,9 +1,14 @@
 #' Control for n1qn1 estimation method in nlmixr2
 #'
+#' @inheritParams iterPrintParams
 #' @inheritParams foceiControl
 #' @inheritParams saemControl
 #' @inheritParams n1qn1::n1qn1
 #' @inheritParams nlmControl
+#'
+#' @param covMethod Method for calculating the covariance.  \code{"r"} (the
+#'   default) uses nlmixr2's \code{nlmixr2Hess()} Hessian; \code{"n1qn1"} uses
+#'   the optimizer's own Hessian; \code{""} skips the covariance step.
 #'
 #' @param returnN1qn1 return the n1qn1 output instead of the nlmixr2
 #'   fit
@@ -43,7 +48,7 @@
 #' # The nlm control has been modified slightly to include
 #' # extra components and name the parameters
 #' }
-n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
+n1qn1Control <- function(epsilon = NULL,
                          max_iterations = 10000,
                          nsim = 10000,
                          imp = 0,
@@ -55,8 +60,8 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
                          odeRecalcFactor=10^(0.5),
                          indTolRelax=TRUE,
 
-                         useColor = crayon::has_color(),
-                         printNcol = floor((getOption("width") - 23) / 12), #
+                         useColor = NULL,
+                         printNcol = NULL, #
                          print = 1L, #
 
                          normType = c("rescale2", "mean", "rescale", "std", "len", "constant"), #
@@ -72,11 +77,18 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
                          literalFix=TRUE,
                          literalFixRes=TRUE,
                          addProp = c("combined2", "combined1"),
+                         eventSens = c("jump", "fd"),
+                         sensMethod = c("default", "forward"),
                          calcTables=TRUE, compress=FALSE,
                          covMethod=c("r", "n1qn1", ""),
-                         adjObf=TRUE, ci=0.95, sigdig=4, sigdigTable=NULL,
+                         adjObf=TRUE, ci=0.95, sigdig=3, sigdigTable=NULL,
                          boundedTransform=TRUE, ...) {
 
+  # n1qn1 stopping tolerance from sigdig (FOCEi mechanism, matches foceiControl
+  # epsilon); a user-supplied value wins, sigdig=NULL keeps the historic default
+  if (is.null(epsilon)) {
+    epsilon <- if (!is.null(sigdig)) .sigdigOptTol(sigdig) else (.Machine$double.eps) ^ 0.25
+  }
   checkmate::assertNumeric(epsilon, len=1, any.missing=FALSE, lower=0)
   checkmate::assertIntegerish(max_iterations, len=1, any.missing=FALSE, lower=10)
   checkmate::assertIntegerish(nsim, len=1, any.missing=FALSE, lower=10)
@@ -95,7 +107,7 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
 
   .xtra <- list(...)
   .bad <- names(.xtra)
-  .bad <- .bad[!(.bad %in% "genRxControl")]
+  .bad <- .bad[!(.bad %in% c("genRxControl", "iterPrintControl"))]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste
     (paste0("'", .bad, "'", sep=""), collapse=", "),
@@ -113,14 +125,14 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
   }
   if (is.null(rxControl)) {
     if (!is.null(sigdig)) {
-      rxControl <- rxode2::rxControl(sigdig=sigdig)
+      rxControl <- .rxControlScaleSigdig(rxode2::rxControl(sigdig=sigdig), sigdig)
     } else {
       rxControl <- rxode2::rxControl(atol=1e-4, rtol=1e-4)
     }
     .genRxControl <- TRUE
   } else if (inherits(rxControl, "rxControl")) {
   } else if (is.list(rxControl)) {
-    rxControl <- do.call(rxode2::rxControl, rxControl)
+    rxControl <- .rxControlScaleSigdig(do.call(rxode2::rxControl, rxControl), sigdig, skip = names(rxControl))
   } else {
     stop("solving options 'rxControl' needs to be generated from 'rxode2::rxControl'", call=FALSE)
   }
@@ -135,9 +147,10 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
   }
   checkmate::assertIntegerish(sigdigTable, lower=1, len=1, any.missing=FALSE)
 
-  checkmate::assertLogical(useColor, any.missing=FALSE, len=1)
-  checkmate::assertIntegerish(print, len=1, lower=0, any.missing=FALSE)
-  checkmate::assertIntegerish(printNcol, len=1, lower=1, any.missing=FALSE)
+  .iterPrintControl <- .absorbIterPrintControl(print = print,
+                                               printNcol = printNcol,
+                                               useColor = useColor,
+                                               iterPrintControl = .xtra$iterPrintControl)
   if (checkmate::testIntegerish(scaleType, len=1, lower=1, upper=4, any.missing=FALSE)) {
     scaleType <- as.integer(scaleType)
   } else {
@@ -179,9 +192,7 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
     odeRecalcFactor=odeRecalcFactor,
     indTolRelax=indTolRelax,
 
-    useColor=useColor,
-    print=print,
-    printNcol=printNcol,
+    iterPrintControl = .iterPrintControl,
     scaleType=scaleType,
     normType=normType,
 
@@ -191,6 +202,8 @@ n1qn1Control <- function(epsilon = (.Machine$double.eps) ^ 0.25,
     scaleTo=scaleTo,
 
     addProp=match.arg(addProp),
+    eventSens=match.arg(eventSens),
+    sensMethod=match.arg(sensMethod),
     calcTables=calcTables,
     compress=compress,
     ci=ci, sigdig=sigdig, sigdigTable=sigdigTable,
@@ -216,15 +229,7 @@ rxUiDeparse.n1qn1Control <- function(object, var) {
 #' @author Matthew L. Fidler
 #' @noRd
 .n1qn1FamilyControl <- function(env, ...) {
-  .ui <- env$ui
-  .control <- env$control
-  if (is.null(.control)) {
-    .control <- nlmixr2est::n1qn1Control()
-  }
-  if (!inherits(.control, "n1qn1Control")) {
-    .control <- do.call(nlmixr2est::n1qn1Control, .control)
-  }
-  assign("control", .control, envir=.ui)
+  .nlmFamilyControlGeneric(env, nlmixr2est::n1qn1Control, "n1qn1Control")
 }
 
 #' @rdname nmObjHandleControlObject
@@ -282,7 +287,9 @@ getValidNlmixrCtl.n1qn1 <- function(control) {
                                 compress=.n1qn1Control$compress,
                                 ci=.n1qn1Control$ci,
                                 sigdigTable=.n1qn1Control$sigdigTable,
-                                indTolRelax=.n1qn1Control$indTolRelax)
+                                indTolRelax=.n1qn1Control$indTolRelax,
+                                eventSens=.n1qn1Control$eventSens,
+                                sensMethod=.n1qn1Control$sensMethod)
   if (assign) env$control <- .foceiControl
   .foceiControl
 }
@@ -299,8 +306,7 @@ getValidNlmixrCtl.n1qn1 <- function(control) {
   on.exit({.nlmFreeEnv()})
   # support gradient
   .ret <- bquote(n1qn1::n1qn1(
-    # Calls grad with every function evaluation, use .nlmixrOptimFunC
-    # which does as well
+    # call_eval is called every eval too, so use .nlmixrOptimFunC like call_grad does
     call_eval=.(nlmixr2est::.nlmixrOptimFunC),
     #call_eval=.(nlmixr2est::.nlmixrNlminbFunC),
     call_grad=.(nlmixr2est::.nlmixrOptimGradC),
@@ -335,65 +341,11 @@ getValidNlmixrCtl.n1qn1 <- function(control) {
 }
 
 .n1qn1FamilyFit <- function(env, ...) {
-  .ui <- env$ui
-  .control <- .ui$control
-  .data <- env$data
-  .ret <- new.env(parent=emptyenv())
-  # The environment needs:
-  # - table for table options
-  # - $origData -- Original Data
-  # - $dataSav -- Processed data from .foceiPreProcessData
-  # - $idLvl -- Level information for ID factor added
-  # - $covLvl -- Level information for items to convert to factor
-  # - $ui for ui fullTheta Full theta information
-  # - $etaObf data frame with ID, etas and OBJI
-  # - $cov For covariance
-  # - $covMethod for the method of calculating the covariance
-  # - $adjObf Should the objective function value be adjusted
-  # - $objective objective function value
-  # - $extra Extra print information
-  # - $method Estimation method (for printing)
-  # - $omega Omega matrix
-  # - $theta Is a theta data frame
-  # - $model a list of model information for table generation.  Needs a `predOnly` model
-  # - $message Message for display
-  # - $est estimation method
-  # - $ofvType (optional) tells the type of ofv is currently being used
-  # When running the focei problem to create the nlmixr object, you also need a
-  #  foceiControl object
-  .ret$table <- env$table
-  .foceiPreProcessData(.data, .ret, .ui, .control$rxControl)
-  .n1qn1 <- .collectWarn(.n1qn1FitModel(.ui, .ret$dataSav), lst = TRUE)
-  .ret$n1qn1 <- .n1qn1[[1]]
-  .ret <- .nlmFamilyAdjustOutput(.ret, "n1qn1")
-  .ret$message <- .ret$n1qn1$message
-  if (rxode2::rxGetControl(.ui, "returnN1qn1", FALSE)) {
-    return(.ret$n1qn1)
-  }
-  .ret$ui <- .ui
-  .ret$adjObf <- rxode2::rxGetControl(.ui, "adjObf", TRUE)
-  .ret$fullTheta <- .n1qn1GetTheta(.ret$n1qn1, .ui)
-  #.ret$etaMat <- NULL
-  #.ret$etaObf <- NULL
-  #.ret$omega <- NULL
-  .ret$control <- .control
-  .ret$extra <- ""
-  .nlmixr2FitUpdateParams(.ret)
-  nmObjHandleControlObject(.ret$control, .ret)
-  if (exists("control", .ui)) {
-    rm(list="control", envir=.ui)
-  }
-  .ret$est <- "n1qn1"
-  # There is no parameter history for nlme
-  .ret$objective <- 2 * as.numeric(.ret$n1qn1$value)
-  .ret$model <- .ui$ebe
-  .ret$ofvType <- "n1qn1"
-  .n1qn1ControlToFoceiControl(.ret)
-  .ret$theta <- .ret$ui$saemThetaDataFrame
-  .ret <- nlmixr2CreateOutputFromUi(.ret$ui, data=.ret$origData, control=.ret$control, table=.ret$table, env=.ret, est="n1qn1")
-  .env <- .ret$env
-  .env$method <- "n1qn1"
-  .ret
+  .nlmFamilyFitGeneric(
+    env, "n1qn1", .n1qn1FitModel, .n1qn1GetTheta,
+    objective = function(.fit) 2 * as.numeric(.fit$value),
+    controlToFocei = .n1qn1ControlToFoceiControl,
+    returnFlag = "returnN1qn1")
 }
 
 #' @rdname nlmixr2Est

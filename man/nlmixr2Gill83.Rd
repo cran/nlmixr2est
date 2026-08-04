@@ -32,11 +32,9 @@ and optimal forward difference interval}
 \item{gillRtol}{The relative tolerance used for Gill 1983
 determination of optimal step size.}
 
-\item{gillK}{The total number of possible steps to determine the
-optimal forward/central difference step size per parameter (by
-the Gill 1983 method).  If 0, no optimal step size is
-determined.  Otherwise this is the optimal step size
-determined.}
+\item{gillK}{Max steps to determine the optimal forward/central
+difference step size per parameter (Gill 1983). `0` = no optimal
+step size determined.}
 
 \item{gillStep}{When looking for the optimal forward difference
 step size, this is This is the step size to increase the
@@ -86,7 +84,7 @@ Get the optimal forward difference interval by Gill83 method
 }
 \examples{
 
-## These are taken from the numDeriv::grad examples to show how
+## These are taken from the numDeriv's grad examples to show how
 ## simple gradients are assessed with nlmixr2Gill83
 
 nlmixr2Gill83(sin, pi)

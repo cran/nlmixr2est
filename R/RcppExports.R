@@ -23,6 +23,58 @@ rxode2hasLlik <- function() {
     .Call(`_nlmixr2est_rxode2hasLlik`)
 }
 
+censNormalPartials_ <- function(cens, dv, lim, fv, rv, order) {
+    .Call(`_nlmixr2est_censNormalPartials_`, cens, dv, lim, fv, rv, order)
+}
+
+foceiSubjectGradFocei_ <- function(a, A, r1, r2, p, p1, perRf, perPs, perRs, ehat, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh) {
+    .Call(`_nlmixr2est_foceiSubjectGradFocei_`, a, A, r1, r2, p, p1, perRf, perPs, perRs, ehat, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh)
+}
+
+foceiSubjectGradFR_ <- function(a, A, aR, AR, Rsig, RsigDir, dvSens, censv, limv, censOpt, fv, yv, Rv, ehat, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol) {
+    .Call(`_nlmixr2est_foceiSubjectGradFR_`, a, A, aR, AR, Rsig, RsigDir, dvSens, censv, limv, censOpt, fv, yv, Rv, ehat, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol)
+}
+
+foceiGradAllFR_ <- function(a, A, aR, AR, Rsig, RsigDir, dvSens, censv, limv, censOpt, fv, yv, Rv, ehat, obsOffset, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, ncores) {
+    .Call(`_nlmixr2est_foceiGradAllFR_`, a, A, aR, AR, Rsig, RsigDir, dvSens, censv, limv, censOpt, fv, yv, Rv, ehat, obsOffset, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, ncores)
+}
+
+foceiSubjectGradFoceFR_ <- function(a, A, aRe, aRc, R0sig, dvSens, censv, limv, fv, yv, R0v, ehat, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, fp) {
+    .Call(`_nlmixr2est_foceiSubjectGradFoceFR_`, a, A, aRe, aRc, R0sig, dvSens, censv, limv, fv, yv, R0v, ehat, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, fp)
+}
+
+foceiGradAllFoceFR_ <- function(a, A, aRe, aRc, R0sig, dvSens, censv, limv, fv, yv, R0v, ehat, obsOffset, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, fp, ncores) {
+    .Call(`_nlmixr2est_foceiGradAllFoceFR_`, a, A, aRe, aRc, R0sig, dvSens, censv, limv, fv, yv, R0v, ehat, obsOffset, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, fp, ncores)
+}
+
+foceiSubjectRFR_ <- function(a, A, Ath, aR, AR, AthR, dvSens, dvSens2, censv, limv, fv, yv, Rv, ehat, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP) {
+    .Call(`_nlmixr2est_foceiSubjectRFR_`, a, A, Ath, aR, AR, AthR, dvSens, dvSens2, censv, limv, fv, yv, Rv, ehat, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP)
+}
+
+foceiRAllFR_ <- function(a, A, Ath, aR, AR, AthR, dvSens, dvSens2, censv, limv, fv, yv, Rv, ehat, obsOffset, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP, ncores) {
+    .Call(`_nlmixr2est_foceiRAllFR_`, a, A, Ath, aR, AR, AthR, dvSens, dvSens2, censv, limv, fv, yv, Rv, ehat, obsOffset, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP, ncores)
+}
+
+foceiSubjectRfoceFR_ <- function(a, A, Ath, aRe, aRc, ARe, ARc, dvSens, dvSens2, censv, limv, fv, yv, R0v, ehat, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP) {
+    .Call(`_nlmixr2est_foceiSubjectRfoceFR_`, a, A, Ath, aRe, aRc, ARe, ARc, dvSens, dvSens2, censv, limv, fv, yv, R0v, ehat, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP)
+}
+
+foceiRAllFoceFR_ <- function(a, A, Ath, aRe, aRc, ARe, ARc, dvSens, dvSens2, censv, limv, fv, yv, R0v, ehat, obsOffset, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP, ncores) {
+    .Call(`_nlmixr2est_foceiRAllFoceFR_`, a, A, Ath, aRe, aRc, ARe, ARc, dvSens, dvSens2, censv, limv, fv, yv, R0v, ehat, obsOffset, Oi, dOi, d2Oi, d2LD, neta, ndir, ndirP, nom, dirP, ncores)
+}
+
+foceiGradAllAgqFR_ <- function(a, A, aR, AR, Rsig, RsigDir, fv, yv, Rv, aN, aRN, RsigN, fN, RN, qx, qw, ehat, obsOffset, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, ncores) {
+    .Call(`_nlmixr2est_foceiGradAllAgqFR_`, a, A, aR, AR, Rsig, RsigDir, fv, yv, Rv, aN, aRN, RsigN, fN, RN, qx, qw, ehat, obsOffset, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, ncores)
+}
+
+impSirIndex_ <- function(zk, sirN, u0) {
+    .Call(`_nlmixr2est_impSirIndex_`, zk, sirN, u0)
+}
+
+impQrPoints_ <- function(isample, neta, shift) {
+    .Call(`_nlmixr2est_impQrPoints_`, isample, neta, shift)
+}
+
 freeFocei <- function() {
     invisible(.Call(`_nlmixr2est_freeFocei`))
 }
@@ -41,6 +93,19 @@ foceiLik <- function(theta) {
 
 foceiOfv <- function(theta) {
     .Call(`_nlmixr2est_foceiOfv`, theta)
+}
+
+#' Install the pooled analytic-gradient setup for a non-focei caller
+#'
+#' `est="vae"` with `nonMuTheta="grad"` evaluates the analytic outer gradient once per
+#' M-step, at its own theta/eta/omega, and has no fit env to hang the setup on.  This
+#' installs the setup once so `foceiGradPooledDirect_()` can be called repeatedly.
+#' @param st setup list from `.foceiGradPooledSetup()`
+#' @return TRUE if the setup describes a shape the C++ gradient handles
+#' @keywords internal
+#' @export
+foceiGradPooledSetupLoad_ <- function(st) {
+    .Call(`_nlmixr2est_foceiGradPooledSetupLoad_`, st)
 }
 
 foceiNumericGrad <- function(theta) {
@@ -95,6 +160,10 @@ nlmixr2Hess_ <- function(thetaT, fT, e, gillInfoT) {
     .Call(`_nlmixr2est_nlmixr2Hess_`, thetaT, fT, e, gillInfoT)
 }
 
+shi21CentralWrap <- function(f, t, f0, idx, ef) {
+    .Call(`_nlmixr2est_shi21CentralWrap`, f, t, f0, idx, ef)
+}
+
 #' Return the square root of general square matrix A
 #'
 #' @param m Matrix to take the square root of.
@@ -122,6 +191,220 @@ foceiCalcCov <- function(e) {
 #' @export
 foceiFitCpp_ <- function(e) {
     .Call(`_nlmixr2est_foceiFitCpp_`, e)
+}
+
+vaeInnerSetup_ <- function(e) {
+    .Call(`_nlmixr2est_vaeInnerSetup_`, e)
+}
+
+vaeInnerUpdatePar_ <- function(thFull, omega) {
+    .Call(`_nlmixr2est_vaeInnerUpdatePar_`, thFull, omega)
+}
+
+vaeInnerLik <- function(etaMat, cores, grad = FALSE, preds = FALSE) {
+    .Call(`_nlmixr2est_vaeInnerLik`, etaMat, cores, grad, preds)
+}
+
+#' Per-subject -2LL at a given theta, for hand-differencing the 8D2 fallback.
+#'
+#' Same path the finite difference uses (theta into par_ptr, pinned reference eta,
+#' innerOpt1() re-optimization), exposed so a difference can be taken in R at any step
+#' and compared against what shi settles on.  Restores the eta, the n1qn1 Hessian and
+#' fullTheta exactly as the FD phase does.
+#' @param thetaIn theta vector (length ntheta)
+#' @param ids0 0-based subject ids
+#' @return per-subject -2LL, NA where the subject could not be re-optimized
+#' @noRd
+foceiIndLik_ <- function(thetaIn, ids0) {
+    .Call(`_nlmixr2est_foceiIndLik_`, thetaIn, ids0)
+}
+
+#' Per-individual d(llik)/d(theta) for subjects whose augmented solve failed.
+#'
+#' Phase 8D2.  This is a SEPARATE phase and cannot be folded into the augmented solve
+#' loop: that loop runs inside OdeSwapEsBatch(odeSlotOuter), i.e. under the outer
+#' model's event-sensitivity shape, while this needs the INNER problem.  The shape is a
+#' process global that only changes at a batch boundary, so the two cannot interleave.
+#' The caller passes the subjects flagged by vaeOuterSolve_ (its "ok" attribute).
+#'
+#' Differences the subject's own likelihood with shi CENTRAL differences at an
+#' optimized step size, re-optimizing the subject through innerOpt1() at each perturbed
+#' theta.  The step sizes get their OWN per-subject store (fInd->outerThetaHf): they
+#' difference a different problem than the inner problem's etahf is tuned for, so
+#' sharing one store would mis-size both.
+#'
+#' Omega directions are NOT covered yet -- omega reaches an individual likelihood only
+#' through Omega^-1 and log|Omega|, so those perturbations are precomputed once outside
+#' this per-subject phase.  Until that lands the caller must still treat an omega
+#' direction as unavailable.
+#' @param ids0 0-based subject ids to difference
+#' @return nid x ntheta matrix of d(llik_i)/d(theta), NA where a subject could not be
+#'   re-optimized even at a perturbed theta
+#' @noRd
+foceiOuterFdInd_ <- function(ids0, analyticRef) {
+    .Call(`_nlmixr2est_foceiOuterFdInd_`, ids0, analyticRef)
+}
+
+vaeOuterSolve_ <- function(thVals, ebes, cols, cores) {
+    .Call(`_nlmixr2est_vaeOuterSolve_`, thVals, ebes, cols, cores)
+}
+
+#' Analytic outer gradient at a caller-supplied theta / eta / omega
+#'
+#' The same C++ core the fit's own gradient uses (`gradPooledCore`), but with the point
+#' passed in rather than read out of `op_focei`.  `est="vae"` with `nonMuTheta="grad"`
+#' needs exactly this: its M-step evaluates the gradient at a theta and an encoder eta
+#' matrix that are not the inner problem's, and at an omega that changes every step.
+#' Requires `foceiGradPooledSetupLoad_()` first, and a live FOCEi inner problem (the
+#' shared pool, `rxVaeOuter`, and the theta/eta par_ptr maps all come from it).
+#' @param thVals natural-scale theta, in ntheta order
+#' @param ebes nsub x neta matrix of etas to take the gradient at
+#' @param Oi inverse of the current Omega
+#' @param dOiEst list of d(Omega^-1)/d(estimation-scale omega element)
+#' @param tr28 the matching trace terms
+#' @param cores thread count
+#' @return natural-scale gradient (thetas, sigmas, omegas), or NULL if it declined
+#' @keywords internal
+#' @export
+foceiGradPooledDirect_ <- function(thVals, ebes, Oi, dOiEst, tr28, cores) {
+    .Call(`_nlmixr2est_foceiGradPooledDirect_`, thVals, ebes, Oi, dOiEst, tr28, cores)
+}
+
+#' FOCEI analytic outer gradient, computed entirely in C++.
+#'
+#' Phase 8E.  Solves the augmented model in the shared pool, finite-differences the
+#' subjects whose solve failed, stacks the per-subject sensitivities and runs the
+#' gradient kernel -- without returning to R in between.
+#'
+#' The round trip this replaces was not just slow (the per-observation ndir^2 cubes A
+#' and AR are the bulk of the data and were materialized twice, once wrapped out of C++
+#' and once read back in); it also let R run between the solve and the assembly, where
+#' it could disturb the shared solve pool.  Keeping the whole sequence in one C++ region
+#' removes both.
+#'
+#' Returns R_NilValue when it cannot do the job, and the caller falls back to the
+#' rxSolve route.
+#' @param thVals theta values, in the augmented model's positional order
+#' @param ebes nsub x neta matrix of EBEs (the etas the gradient is taken at)
+#' @param cols augmented-model lhs column map from .foceiAnalyticCols
+#' @param cores thread count
+#' @param Oi Omega^-1
+#' @param dOiEst neta x neta x nom cube of estimation-scale Omega^-1 derivatives
+#' @param tr28 Omega log-determinant derivative terms (length nom)
+#' @param neta,nth,nsg,nom problem dimensions
+#' @param dirTh 1-based direction index per theta
+#' @param sigCol 1-based sigma column per residual parameter
+#' @param censOpt censoring determinant treatment (censOption)
+#' @param lamDir 1-based direction indices of estimated transform lambdas (may be empty)
+#' @return list(g, etaP, jacSum, fdIds) or NULL
+#' @noRd
+foceiAnalyticGradPooled_ <- function(thVals, ebes, cols, cores, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, censOpt, lamDir) {
+    .Call(`_nlmixr2est_foceiAnalyticGradPooled_`, thVals, ebes, cols, cores, Oi, dOiEst, tr28, neta, nth, nsg, nom, dirTh, sigCol, censOpt, lamDir)
+}
+
+#' Build the nonparametric Psi (conditional-likelihood) matrix
+#'
+#' For an already set-up FOCEi inner problem (\code{vaeInnerSetup_}), evaluates
+#' \code{psi[i, k] = p(y_i | support point k)} for each subject \code{i} (rows)
+#' and support point \code{k} (columns), where each support point is an eta
+#' vector.  Exposed for testing the conditional-likelihood primitive.
+#'
+#' @param etaPoints Numeric matrix of support points, one per row (columns are
+#'   etas).
+#' @param cores Number of OpenMP threads.
+#' @return Numeric matrix psi (subjects in rows, support points in columns).
+#' @keywords internal
+#' @export
+npBuildPsi <- function(etaPoints, cores) {
+    .Call(`_nlmixr2est_npBuildPsi`, etaPoints, cores)
+}
+
+vaeIterPrintStart_ <- function(initPar, names, iterPrintControl, xform = NULL) {
+    .Call(`_nlmixr2est_vaeIterPrintStart_`, initPar, names, iterPrintControl, xform)
+}
+
+vaeIterPrintRow_ <- function(x, f, phase = "") {
+    .Call(`_nlmixr2est_vaeIterPrintRow_`, x, f, phase)
+}
+
+vaeIterPrintGet_ <- function(printLine = TRUE) {
+    .Call(`_nlmixr2est_vaeIterPrintGet_`, printLine)
+}
+
+adviThetaSensInfo_ <- function() {
+    .Call(`_nlmixr2est_adviThetaSensInfo_`)
+}
+
+adviElboGrad_ <- function(mu, omega, theta, logPopOmega, eps, muRefThetaIdx) {
+    .Call(`_nlmixr2est_adviElboGrad_`, mu, omega, theta, logPopOmega, eps, muRefThetaIdx)
+}
+
+adviLoop_ <- function(mu0, omega0, theta0, logPopOmega0, muRefThetaIdx, thetaMuRefEta, thetaFix, omegaFix, iters, seed, etaScale, tau, alpha, nMc, it0, sMu0, sOmega0, sTheta0, sLpo0, cores, divergeStop, parNames, iterPrintControl, xform, ipPhase, ipStart, ipEnd) {
+    .Call(`_nlmixr2est_adviLoop_`, mu0, omega0, theta0, logPopOmega0, muRefThetaIdx, thetaMuRefEta, thetaFix, omegaFix, iters, seed, etaScale, tau, alpha, nMc, it0, sMu0, sOmega0, sTheta0, sLpo0, cores, divergeStop, parNames, iterPrintControl, xform, ipPhase, ipStart, ipEnd)
+}
+
+adviElboGradFR_ <- function(mu, Lpack, theta, logPopOmega, eps, muRefThetaIdx) {
+    .Call(`_nlmixr2est_adviElboGradFR_`, mu, Lpack, theta, logPopOmega, eps, muRefThetaIdx)
+}
+
+adviLoopFR_ <- function(mu0, Lpack0, theta0, logPopOmega0, muRefThetaIdx, thetaMuRefEta, thetaFix, omegaFix, iters, seed, etaScale, tau, alpha, nMc, it0, sMu0, sL0, sTheta0, sLpo0, cores, divergeStop, parNames, iterPrintControl, xform, ipPhase, ipStart, ipEnd) {
+    .Call(`_nlmixr2est_adviLoopFR_`, mu0, Lpack0, theta0, logPopOmega0, muRefThetaIdx, thetaMuRefEta, thetaFix, omegaFix, iters, seed, etaScale, tau, alpha, nMc, it0, sMu0, sL0, sTheta0, sLpo0, cores, divergeStop, parNames, iterPrintControl, xform, ipPhase, ipStart, ipEnd)
+}
+
+adviLoopFB_ <- function(mu0, scale0, theta0, logPopOmega0, mPop0, LpopPack0, phiThetaIdx, phiOmIdx, phiMuRef, muRefThetaIdx, fr, iters, seed, etaScale, tau, alpha, nMc, it0, sMu0, sScale0, smPop0, sLpop0, cores, divergeStop, parNames, iterPrintControl, xform, ipPhase, ipStart, ipEnd) {
+    .Call(`_nlmixr2est_adviLoopFB_`, mu0, scale0, theta0, logPopOmega0, mPop0, LpopPack0, phiThetaIdx, phiOmIdx, phiMuRef, muRefThetaIdx, fr, iters, seed, etaScale, tau, alpha, nMc, it0, sMu0, sScale0, smPop0, sLpop0, cores, divergeStop, parNames, iterPrintControl, xform, ipPhase, ipStart, ipEnd)
+}
+
+adviOptimize_ <- function(args) {
+    .Call(`_nlmixr2est_adviOptimize_`, args)
+}
+
+vaeInnerFree_ <- function() {
+    .Call(`_nlmixr2est_vaeInnerFree_`)
+}
+
+foceiLikLoad_ <- function(e) {
+    .Call(`_nlmixr2est_foceiLikLoad_`, e)
+}
+
+foceiLikUnload_ <- function() {
+    .Call(`_nlmixr2est_foceiLikUnload_`)
+}
+
+foceiLikSetTheta_ <- function(theta) {
+    .Call(`_nlmixr2est_foceiLikSetTheta_`, theta)
+}
+
+foceiLikEval_ <- function(etaMat, cores, retType) {
+    .Call(`_nlmixr2est_foceiLikEval_`, etaMat, cores, retType)
+}
+
+vaeElboStepCpp_ <- function(params, prep, zPopR, omegaR, aR, alphaKL, epsR, nMix, mixProbR, cores, withGrad = TRUE) {
+    .Call(`_nlmixr2est_vaeElboStepCpp_`, params, prep, zPopR, omegaR, aR, alphaKL, epsR, nMix, mixProbR, cores, withGrad)
+}
+
+vaeDecoderPxz_ <- function(E, y) {
+    .Call(`_nlmixr2est_vaeDecoderPxz_`, E, y)
+}
+
+vaeDecoderSolveSubject_ <- function(solveFn, eta, tol, maxRecalc, recalcFactor, fdFallback) {
+    .Call(`_nlmixr2est_vaeDecoderSolveSubject_`, solveFn, eta, tol, maxRecalc, recalcFactor, fdFallback)
+}
+
+vaeDecoderElboStep_ <- function(params, prep, zPopR, omegaR, aVecR, alphaKL, epsR, solveFn, yListR, withGrad, tol, maxRecalc, recalcFactor, fdFallback) {
+    .Call(`_nlmixr2est_vaeDecoderElboStep_`, params, prep, zPopR, omegaR, aVecR, alphaKL, epsR, solveFn, yListR, withGrad, tol, maxRecalc, recalcFactor, fdFallback)
+}
+
+vaeTrainCpp_ <- function(params, prep, control, nMix, mixProbR, cores, row0, parNames, iterPrintControl, xform, structIdx0) {
+    .Call(`_nlmixr2est_vaeTrainCpp_`, params, prep, control, nMix, mixProbR, cores, row0, parNames, iterPrintControl, xform, structIdx0)
+}
+
+vaeBestSubset_ <- function(mu, covMat, omega, isFree, penaltyPerCov, strategy = "lifo", group = NULL, block = NULL) {
+    .Call(`_nlmixr2est_vaeBestSubset_`, mu, covMat, omega, isFree, penaltyPerCov, strategy, group, block)
+}
+
+vaeScoreSupports_ <- function(y, covMat, omega, penaltyPerCov, supports, polish = TRUE, group = NULL, block = NULL) {
+    .Call(`_nlmixr2est_vaeScoreSupports_`, y, covMat, omega, penaltyPerCov, supports, polish, group, block)
 }
 
 boxCox_ <- function(x = 1L, lambda = 1, yj = 0L) {
@@ -154,6 +437,42 @@ nlmUnscalePar <- function(p) {
 
 nlmSolveR <- function(theta) {
     .Call(`_nlmixr2est_nlmSolveR`, theta)
+}
+
+#' Per-subject prediction and Jacobian for mixed-effects engines
+#'
+#' Like the population gradient solver but takes a per-subject
+#' \code{nsub x ntheta} parameter matrix (\code{phi = beta + b}, as
+#' supplied by \code{lme4::nlmer}) instead of one shared \code{theta}.
+#' Requires \code{.nlmSetupEnv()} to already be loaded.
+#'
+#' @param thetaMat A \code{nsub x ntheta} matrix of per-subject
+#'   parameter values.  Row \code{id} is solved against subject
+#'   \code{id} (in the loaded \code{etTrans} order).
+#'
+#' @return A \code{nobsTot x (ntheta+1)} matrix in the loaded
+#'   (\code{etTrans}) observation order: column 1 is the prediction
+#'   (\code{rx_pred_}) and columns 2..(ntheta+1) are
+#'   \code{d(pred)/d(THETA[i])}.
+#'
+#' @details This is an internal function and should not be called
+#'   directly.
+#'
+#' @param record When \code{TRUE}, record this evaluation's population
+#'   parameter estimate -- the per-subject mean of \code{thetaMat}'s columns
+#'   (\code{phi = beta + b} averaged over subjects, which equals the fixed
+#'   effect exactly for parameters without a random effect) -- into the
+#'   resident nlm parameter history via the shared scale machinery.  This is
+#'   how an external optimizer (e.g. \code{lme4::nlmer}) populates the
+#'   iteration print and the history recovered by \code{nlmGetParHist()}.  No
+#'   objective value is recorded (the scale's \code{showOfv} is expected to be
+#'   0 for these engines).  Defaults to \code{FALSE}.
+#'
+#' @author Matthew L. Fidler
+#' @keywords internal
+#' @export
+nlmerSolveGrad <- function(thetaMat, record = FALSE) {
+    .Call(`_nlmixr2est_nlmerSolveGrad`, thetaMat, record)
 }
 
 nlmSetScaleC <- function(scaleC) {
@@ -200,6 +519,25 @@ nlmCensInfo <- function() {
     .Call(`_nlmixr2est_nlmCensInfo`)
 }
 
+#' Recover and finalize the resident nlm parameter history
+#'
+#' Returns the parameter history accumulated in the resident nlm scaling
+#' struct (one row per iteration type per recorded evaluation) as a data
+#' frame, and stops further recording/printing (\code{save} and \code{every}
+#' are reset to 0).  Must be called while \code{.nlmSetupEnv()} is still
+#' loaded -- i.e. before \code{.nlmFreeEnv()}.  Used by \code{.nlmFinalizeList}
+#' for the standard nlm-family estimators and directly by externally-optimized
+#' engines such as \code{babelmixr2}'s nlmer.
+#'
+#' @param p When \code{TRUE} (default) also print the final iteration line.
+#'
+#' @return A data frame of the recorded parameter history.
+#'
+#' @details This is an internal function and should not be called directly.
+#'
+#' @author Matthew L. Fidler
+#' @keywords internal
+#' @export
 nlmGetParHist <- function(p = TRUE) {
     .Call(`_nlmixr2est_nlmGetParHist`, p)
 }
@@ -212,10 +550,119 @@ nlmAdjustCov <- function(CovIn, theta) {
     .Call(`_nlmixr2est_nlmAdjustCov`, CovIn, theta)
 }
 
+#' Diagnostic: NPAG objective at a fixed grid and residual multiplier gamma
+#' @param etaPoints support points, one per row
+#' @param cores threads
+#' @param gamma residual-error multiplier
+#' @return offset-corrected marginal log-likelihood
+#' @keywords internal
+#' @export
+npObjAtGamma_ <- function(etaPoints, cores, gamma) {
+    .Call(`_nlmixr2est_npObjAtGamma_`, etaPoints, cores, gamma)
+}
+
+#' Run the NPAG adaptive-grid cycle on a set-up inner problem
+#'
+#' Requires the FOCEi inner problem to be set up (\code{.npInnerSetup}).  Runs
+#' the full Yamada adaptive-grid cycle (Sobol grid -> Psi -> Burke IPM ->
+#' condensation -> expansion -> convergence) and returns the discrete mixing
+#' distribution.  Exposed for testing ahead of the full fit-object wiring.
+#'
+#' @param lower,upper Numeric vectors, the per-eta support-point box.
+#' @param points Initial Sobol grid size.
+#' @param cycles Maximum cycles.
+#' @param cores OpenMP threads.
+#' @param gammaOptimize Optimize the residual-error magnitude (gamma) each cycle
+#'   (only valid for uncensored normal endpoints).
+#' @return A list with \code{support} (support points, eta space; one per row),
+#'   \code{weights}, \code{objf} (log-likelihood), \code{gamma}, \code{cycles},
+#'   and \code{converged}.
+#' @keywords internal
+#' @export
+npagCycle_ <- function(lower, upper, points = 2028L, cycles = 100L, cores = 1L, gammaOptimize = FALSE) {
+    .Call(`_nlmixr2est_npagCycle_`, lower, upper, points, cycles, cores, gammaOptimize)
+}
+
+#' Burke interior-point weight solver (nonparametric maximum likelihood)
+#'
+#' Solves the convex nonparametric-maximum-likelihood weight problem for a fixed
+#' set of support points: given the likelihood matrix \code{psi} (subjects in
+#' rows, support points in columns) it returns the maximum-likelihood mixing
+#' weights and the objective (log-likelihood).  Exposed for testing the C++
+#' interior-point routine against golden fixtures.
+#'
+#' @param psi Numeric matrix, \code{psi[i, k] = p(y_i | support point k)}, with
+#'   subjects in rows and support points in columns.
+#' @return A list with \code{weights} (length \code{ncol(psi)}, non-negative,
+#'   summing to 1) and \code{objective} (the maximized log-likelihood).
+#' @keywords internal
+#' @export
+npIpmBurke <- function(psi) {
+    .Call(`_nlmixr2est_npIpmBurke`, psi)
+}
+
+#' Sobol initial grid over a box (nonparametric engines)
+#'
+#' @param n Number of support points.
+#' @param lower,upper Numeric vectors giving the per-dimension box bounds.
+#' @return Numeric matrix, one support point per row.
+#' @keywords internal
+#' @export
+npSobolGrid_ <- function(n, lower, upper) {
+    .Call(`_nlmixr2est_npSobolGrid_`, n, lower, upper)
+}
+
+#' Condense support points (nonparametric engines)
+#'
+#' @param lambda Support-point weights.
+#' @param psi Conditional-likelihood matrix (subjects x support points).
+#' @param ratio Weight-threshold ratio (keep weight > max*ratio).
+#' @param tol QR rank-revealing tolerance.
+#' @return List with 1-based kept indices from the weight threshold
+#'   (\code{weightKeep}) and from the subsequent QR pass (\code{qrKeep}).
+#' @keywords internal
+#' @export
+npCondense_ <- function(lambda, psi, ratio = 1e-3, tol = 1e-8) {
+    .Call(`_nlmixr2est_npCondense_`, lambda, psi, ratio, tol)
+}
+
+odeSwapRetryTest_ <- function(nFail, maxOdeRecalc, stickyRecalcN, odeRecalcFactor, relaxMode, sticky0, restoreTolOnSuccess) {
+    .Call(`_nlmixr2est_odeSwapRetryTest_`, nFail, maxOdeRecalc, stickyRecalcN, odeRecalcFactor, relaxMode, sticky0, restoreTolOnSuccess)
+}
+
+odeSwapPlanFor_ <- function(neq, nlhs) {
+    .Call(`_nlmixr2est_odeSwapPlanFor_`, neq, nlhs)
+}
+
+#' Record which model role rxode2's event path is bound to (R-side installs).
+#' Roles: -1 unknown, 0 pred, 1 inner, 2 outer, 3 hess2.
+#' @param slot role id
+#' @return NULL
+#' @noRd
+odeSwapEsNoteInstalled_ <- function(slot) {
+    .Call(`_nlmixr2est_odeSwapEsNoteInstalled_`, slot)
+}
+
+odeSwapInfo_ <- function() {
+    .Call(`_nlmixr2est_odeSwapInfo_`)
+}
+
 augPredTrans <- function(pred, ipred, lambda, yjIn, low, hi) {
     .Call(`_nlmixr2est_augPredTrans`, pred, ipred, lambda, yjIn, low, hi)
 }
 
+#' Get the ODE states of a model (rxode2 v3/v4 compatible)
+#'
+#' Calls \code{rxode2::rxState()} (or \code{rxode2::rxStateOde()} with
+#' rxode2 version 4) on the input.
+#'
+#' @param inp rxode2 model (or symengine environment) to query
+#'
+#' @return character vector of ODE state names
+#'
+#' @author Matthew L. Fidler
+#' @keywords internal
+#' @export
 rxode2stateOde <- function(inp) {
     .Call(`_nlmixr2est_rxode2stateOde`, inp)
 }
@@ -230,6 +677,10 @@ saem_fit <- function(xSEXP) {
 
 nlmixr2Parameters <- function(theta, eta) {
     .Call(`_nlmixr2est_nlmixr2Parameters`, theta, eta)
+}
+
+vaeEncoderFwdBwd <- function(dataIn, lengths, covIn, eps, Wih, Whh, bih, bhh, fcW, fcB, zDim, gZ, gLogSigmaDirect) {
+    .Call(`_nlmixr2est_vaeEncoderFwdBwd`, dataIn, lengths, covIn, eps, Wih, Whh, bih, bhh, fcW, fcB, zDim, gZ, gLogSigmaDirect)
 }
 
 # Register entry points for exported C++ functions

@@ -7,6 +7,8 @@
 #include "nearPD.h"
 #include "shi21.h"
 #include "inner.h"
+#include "odeSwap.h"
+#include "rxomp.h"
 #include <atomic>
 
 #define _(String) (String)
@@ -14,8 +16,8 @@
 #include "scale.h"
 
 
-#define nlmOde(id) ind_solve(rx, id, rxInner.dydt_liblsoda, rxInner.dydt_lsoda_dum, rxInner.jdum_lsoda, rxInner.dydt, rxInner.update_inis, rxInner.global_jt)
-#define predOde(id) ind_solve(rx, id, rxPred.dydt_liblsoda, rxPred.dydt_lsoda_dum, rxPred.jdum_lsoda, rxPred.dydt, rxPred.update_inis, rxPred.global_jt)
+// Solves go through odeSwapSolveInd(slot, id) -- see the note in inner.cpp.  nlm's
+// "inner" slot holds the theta-sensitivity model (nlmSetup registers thetaGrad there).
 
 struct nlmOptions {
   unsigned int ntheta=0;
@@ -23,7 +25,6 @@ struct nlmOptions {
   int *nobs = NULL;
   int *idS  = NULL;
   int *idF  = NULL;
-  int *xPar = NULL;
   unsigned int nobsTot = 0;
   double *thetahf=NULL; // Shi step size
   double *thetahh=NULL;
@@ -33,22 +34,14 @@ struct nlmOptions {
   double *grSave    = NULL;
   double *hSave     = NULL;
   double *scaleC    = NULL;
-  double *logitThetaLow = NULL;
-  double *logitThetaHi  = NULL;
 
-  int eventType=3; // eventType
+  int eventType=3;
   int shi21maxFD=1000; //maxiter for shi
   int stickyTol=0;
   int stickyRecalcN=1;
   int stickyRecalcN2=0;
-  // Per-subject inner-retry counter, sized at setup() to nsub.  Replaces
-  // the formerly shared stickyRecalcN2 plain int that was racy under the
-  // parallel-for over subjects in nlmSolveF / nlmSolveGradId.  Each
-  // subject owns its own slot, so the retry decision (and therefore the
-  // per-subject solve outcome) is deterministic across runs at any cores
-  // setting.  The shared `stickyRecalcN2` member above is kept for
-  // backward compatibility with code that just records "did we ever
-  // bump tolerances at all".
+  // Per-subject retry counter (sized to nsub at setup()); avoids the data race
+  // the old shared plain-int had under the parallel-for over subjects.
   std::vector<int> stickyRecalcN2Per;
   int stickyRecalcN1=0;
   int maxOdeRecalc;
@@ -74,6 +67,13 @@ struct nlmOptions {
   std::atomic<int> naZero{0};
   std::atomic<int> naGrad{0};
   int hasFR=0; // 1 if predOnly model has rx_pred_f_ (lhs[1]) and rx_r_ (lhs[2])
+  // Index of rx_pred_ in each model's lhs.  The gradient (thetaGrad) model emits
+  // the intermediate parameter assignments (eg ka/cl/v needed by the sensitivity
+  // ODEs) as leading lhs, so rx_pred_ is not lhs[0]; the sensitivity columns and
+  // rx_pred_f_/rx_r_ follow contiguously.  Located by name at setup so the reads
+  // stay correct regardless of how many intermediates precede rx_pred_.
+  int predOffset=0; // rx_pred_ index in the predOnly model (rxPred)
+  int gradOffset=0; // rx_pred_ index in the thetaGrad model (rxInner)
   scaling scale;
   bool loaded=false;
 };
@@ -87,7 +87,6 @@ RObject nlmFree() {
   nlmOp.nobs    = NULL;
   nlmOp.idS     = NULL;
   nlmOp.idF     = NULL;
-  nlmOp.xPar    = NULL;
   if (nlmOp.thetahf != NULL) R_Free(nlmOp.thetahf);
   nlmOp.thetahf = NULL;
   nlmOp.thetahh = NULL;
@@ -97,10 +96,11 @@ RObject nlmFree() {
   nlmOp.hSave = NULL;
   nlmOp.initPar = NULL;
   nlmOp.scaleC  = NULL;
-  nlmOp.logitThetaLow = NULL;
-  nlmOp.logitThetaHi  = NULL;
 
   nlmOp.loaded = false;
+  // The registry's entry points come from this fit's model DLLs; nlmSetup()
+  // calls nlmFree() first, so clearing here also gives it a clean slate.
+  odeSwapClearAll();
   return R_NilValue;
 }
 
@@ -110,24 +110,33 @@ RObject nlmSetup(Environment e) {
   List control = e["control"];
 
   RObject pred = e["predOnly"];
-  List mvp = rxode2::rxModelVars_(pred);
-  rxUpdateFuns(as<SEXP>(mvp["trans"]), &rxPred);
-  // Check if predOnly model has rx_pred_f_ (lhs[1]) and rx_r_ (lhs[2]) for censoring support
-  CharacterVector predLhs = as<CharacterVector>(mvp["lhs"]);
-  nlmOp.hasFR = 0;
-  for (int i = 0; i < predLhs.size(); ++i) {
-    std::string lhsName = as<std::string>(predLhs[i]);
-    if (lhsName == "rx_pred_f_" || lhsName == "rx_r_") nlmOp.hasFR++;
+  // Loud, not silent: the old code called rxModelVars_ directly and would have
+  // thrown here, and a skipped registration would quietly zero predOffset/hasFR.
+  if (!odeSwapRegister(odeSlotPred, "pred", pred, &rxPred)) {
+    stop(_("nlm cannot be run without an rxode2 'predOnly' model"));
   }
-  nlmOp.hasFR = (nlmOp.hasFR == 2) ? 1 : 0;
+  // Check if predOnly model has rx_pred_f_ and rx_r_ for censoring support
+  nlmOp.hasFR = (odeSwapLhsIndex(odeSlotPred, "rx_pred_f_") >= 0 &&
+                 odeSwapLhsIndex(odeSlotPred, "rx_r_") >= 0) ? 1 : 0;
+  int _ip = odeSwapLhsIndex(odeSlotPred, "rx_pred_");
+  nlmOp.predOffset = (_ip < 0) ? 0 : _ip;
   resetCensFlag();
 
   nlmOp.solveType = as<int>(control["solveType"]);
   RObject model;
+  nlmOp.gradOffset = 0;
   if (e.exists("thetaGrad")) {
     model = e["thetaGrad"];
-    List mv = rxode2::rxModelVars_(model);
-    rxUpdateFuns(as<SEXP>(mv["trans"]), &rxInner);
+    // The sensitivity model takes the inner slot: it is nlm's largest structure
+    // and (below) sizes the shared solve pool, exactly as rxInner does for focei.
+    if (!odeSwapRegister(odeSlotInner, "thetaGrad", model, &rxInner)) {
+      stop(_("nlm cannot be run without an rxode2 'thetaGrad' model"));
+    }
+    // rx_pred_ is preceded by the intermediate parameter assignments the
+    // sensitivity ODEs need; locate it by name (the sensitivity columns and
+    // rx_pred_f_/rx_r_ follow contiguously).
+    int _ig = odeSwapLhsIndex(odeSlotInner, "rx_pred_");
+    nlmOp.gradOffset = (_ig < 0) ? 0 : _ig;
   } else {
     if (nlmOp.solveType != solveType_nls_pred) {
       nlmOp.solveType = solveType_pred;
@@ -143,7 +152,7 @@ RObject nlmSetup(Environment e) {
   nlmOp.stickyRecalcN=as<int>(control["stickyRecalcN"]);
   nlmOp.stickyTol=0;
   nlmOp.stickyRecalcN2=0;
-  nlmOp.stickyRecalcN2Per.assign((size_t)getRxNsub(rx), 0);
+  // per-subject sticky counter sized below, after rxSolve_ sets up `rx`
   nlmOp.stickyRecalcN1=0;
   nlmOp.reducedTol = 0;
   nlmOp.reducedTol2 = 0;
@@ -162,7 +171,12 @@ RObject nlmSetup(Environment e) {
   nlmOp.hessErr = control["hessErr"];
 
 
-  rxode2::rxSolve_(model, rxControl,
+  // Size the pool for the largest registered model rather than assuming it is
+  // `model`.  Today thetaGrad always dominates predOnly, so this is the same
+  // object -- but now it is derived, not assumed.
+  SEXP _poolSEXP = odeSwapPoolModelSEXP();
+  RObject poolModel = (_poolSEXP == R_NilValue) ? model : RObject(_poolSEXP);
+  rxode2::rxSolve_(poolModel, rxControl,
                    R_NilValue,//const Nullable<CharacterVector> &specParams =
                    R_NilValue,//const Nullable<List> &extraArgs =
                    p,//const RObject &params =
@@ -170,12 +184,13 @@ RObject nlmSetup(Environment e) {
                    R_NilValue, // inits
                    1);//const int setupOnly = 0
   rx = getRxSolve_();
+  // Size the per-subject inner-retry counter now that `rx` is valid.
+  nlmOp.stickyRecalcN2Per.assign((size_t)getRxNsub(rx), 0);
 
-  nlmOp.thetaFD = R_Calloc((size_t)nlmOp.ntheta * 2u + (size_t)getRxNsub(rx) * 3u, int); // [ntheta]
+  nlmOp.thetaFD = R_Calloc((size_t)nlmOp.ntheta + (size_t)getRxNsub(rx) * 3u, int); // [ntheta]
   nlmOp.nobs = nlmOp.thetaFD + nlmOp.ntheta; // [nsub]
   nlmOp.idS = nlmOp.nobs + getRxNsub(rx); // [nsub]
   nlmOp.idF = nlmOp.idS + getRxNsub(rx); // [nsub]
-  nlmOp.xPar = nlmOp.idF + getRxNsub(rx); // [ntheta]
 
   // now calculate nobs per id
   nlmOp.nobsTot = 0U;
@@ -205,31 +220,27 @@ RObject nlmSetup(Environment e) {
   switch(nlmOp.solveType) {
   case solveType_nls:
     nlmOp.thetahf = R_Calloc(
-      nlmOp.ntheta * (5 + (size_t)getRxNsub(rx)) +
+      nlmOp.ntheta * (3 + (size_t)getRxNsub(rx)) +
       (size_t)nlmOp.nobsTot * ((size_t)1 + (size_t)nlmOp.ntheta),
       double); // [ntheta*nsub]
     nlmOp.thetaSave = nlmOp.thetahf + nlmOp.ntheta*getRxNsub(rx); // [ntheta]
     nlmOp.initPar = nlmOp.thetaSave + nlmOp.ntheta; // [ntheta]
     nlmOp.scaleC  = nlmOp.initPar   + nlmOp.ntheta; // [ntheta]
-    nlmOp.logitThetaLow = nlmOp.scaleC + nlmOp.ntheta; // [ntheta]
-    nlmOp.logitThetaHi  = nlmOp.logitThetaLow + nlmOp.ntheta; // [ntheta]
-    nlmOp.valSave = nlmOp.logitThetaHi + nlmOp.ntheta; //[nlmOp.nobsTot]
+    nlmOp.valSave = nlmOp.scaleC    + nlmOp.ntheta; //[nlmOp.nobsTot]
     nlmOp.grSave  = nlmOp.valSave + nlmOp.nobsTot; // [nlmOp.nobsTot*ntheta]
     break;
   case solveType_nls_pred:
-    nlmOp.thetahf = R_Calloc(nlmOp.ntheta*(4+(size_t)getRxNsub(rx)), double);// [ntheta*nsub]
+    nlmOp.thetahf = R_Calloc(nlmOp.ntheta*(2+(size_t)getRxNsub(rx)), double);// [ntheta*nsub]
     nlmOp.initPar = nlmOp.thetahf + nlmOp.ntheta*getRxNsub(rx); // [ntheta]
     nlmOp.scaleC  = nlmOp.initPar   + nlmOp.ntheta; // [ntheta]
-    nlmOp.logitThetaLow = nlmOp.scaleC + nlmOp.ntheta; // [ntheta]
-    nlmOp.logitThetaHi  = nlmOp.logitThetaLow + nlmOp.ntheta; // [ntheta]
     break;
   default:
-    // 7*ntheta + nsub*ntheta + 1 + ntheta*ntheta
-    // ntheta*(7+nsub+ntheta) + 1
+    // 5*ntheta + nsub*ntheta + 1 + ntheta*ntheta
+    // ntheta*(5+nsub+ntheta) + 1
 #define ntheta nlmOp.ntheta
 #define nsub getRxNsub(rx)
     //nsub*ntheta
-    nlmOp.thetahf = R_Calloc(ntheta*((size_t)nsub + 7 + ntheta) + 1, double); //[nsub*ntheta]
+    nlmOp.thetahf = R_Calloc(ntheta*((size_t)nsub + 5 + ntheta) + 1, double); //[nsub*ntheta]
     nlmOp.thetahh = nlmOp.thetahf   + ntheta*nsub; // [ntheta]
     nlmOp.thetaSave = nlmOp.thetahh + ntheta; // [ntheta]
     nlmOp.valSave = nlmOp.thetaSave + ntheta; // [1]
@@ -237,8 +248,6 @@ RObject nlmSetup(Environment e) {
     nlmOp.hSave = nlmOp.grSave + ntheta;// [ntheta*ntheta]
     nlmOp.initPar = nlmOp.hSave + ntheta*ntheta; // [ntheta]
     nlmOp.scaleC  = nlmOp.initPar   + ntheta; // [ntheta]
-    nlmOp.logitThetaLow = nlmOp.scaleC + ntheta; // [ntheta]
-    nlmOp.logitThetaHi  = nlmOp.logitThetaLow + ntheta; // [ntheta]
 #undef ntheta
 #undef nsub
 
@@ -247,22 +256,30 @@ RObject nlmSetup(Environment e) {
 
   std::copy(&p[0], &p[0] + nlmOp.ntheta, nlmOp.initPar);
 
+  // useColor/printNcol/print args below are placeholders, overwritten by
+  // scaleApplyIterPrintControl() right after (mirrors saem/focei wiring).
   scaleSetup(&(nlmOp.scale),
              nlmOp.initPar,
              nlmOp.scaleC,
-             nlmOp.xPar,
-             nlmOp.logitThetaLow,
-             nlmOp.logitThetaHi,
              as<CharacterVector>(e["thetaNames"]) ,
-             as<int>(control["useColor"]),
-             as<int>(control["printNcol"]),
-             as<int>(control["print"]),
+             /*useColor*/0, /*printNcol*/1, /*print*/0,
              as<int>(control["normType"]),
              as<int>(control["scaleType"]),
              as<double>(control["scaleCmin"]),
              as<double>(control["scaleCmax"]),
              as<double>(control["scaleTo"]),
              nlmOp.ntheta);
+  scaleAttachXform(&(nlmOp.scale),
+                   as<List>(control["xform"]));
+  scaleApplyIterPrintControl(&(nlmOp.scale),
+                             as<List>(control["iterPrintControl"]));
+  // Optional: hide the objective ("Function Val.") column.  Engines driven by
+  // an external optimizer that records parameters only -- e.g. nlmer via
+  // nlmerSolveGrad(record=TRUE) -- set this so the header (printed right after
+  // setup) and iteration rows agree.  Defaults to shown.
+  if (control.containsElementNamed("showOfv")) {
+    nlmOp.scale.showOfv = as<int>(control["showOfv"]);
+  }
   nlmOp.needFD=false;
   for (int i = 0; i < nlmOp.ntheta; ++i) {
     nlmOp.thetaFD[i] = needFD[i];
@@ -300,68 +317,47 @@ NumericVector nlmUnscalePar(NumericVector p) {
   return ret;
 }
 
-// Per-subject "did THIS solve fail" check — same idea as inner.cpp's
-// indHasBadSolve(): scan ind->solve for NaN/Inf rather than reading
-// the shared op->badSolve flag, which can be flipped by another
-// thread's failure mid-loop and induce a non-deterministic retry.
+// Shared with inner.cpp: scan ind->solve for NaN/Inf over the span this
+// subject's solve actually wrote, instead of the shared op->badSolve flag which
+// another thread can flip mid-loop.
 static inline bool nlmIndHasBadSolve(rx_solving_options *op,
                                      rx_solving_options_ind *ind) {
-  int neq = getOpNeq(op);
-  if (neq <= 0) return false;
-  double *solve = getIndSolve(ind);
-  int n = neq * getIndNallTimes(ind);
-  for (int i = 0; i < n; ++i) {
-    if (ISNA(solve[i]) || std::isnan(solve[i]) || std::isinf(solve[i])) {
-      return true;
-    }
-  }
-  return false;
+  return odeSwapIndBadSolve(op, ind);
+}
+
+// nlm latches a different "reduced tolerance" flag per solve kind, and (unlike
+// FOCEi) never un-sticks a subject that recovered -- see OdeRetryOpts.
+struct NlmRetryHooks {
+  int *reducedFlag;
+  void onRetry() { *reducedFlag = 1; }
+  void onSticky() { nlmOp.stickyTol = 1; }
+};
+
+static inline OdeRetryOpts nlmRetryOpts() {
+  OdeRetryOpts o;
+  o.maxOdeRecalc = nlmOp.maxOdeRecalc;
+  o.stickyRecalcN = nlmOp.stickyRecalcN;
+  o.odeRecalcFactor = nlmOp.odeRecalcFactor;
+  o.relaxMode = odeRelaxGlobal;
+  o.restoreTolOnSuccess = false;
+  o.resetBadSolveEachRetry = false;
+  return o;
 }
 
 void nlmSolveNlm(int id) {
   rx_solving_options *op = getSolvingOptions(rx);
   rx_solving_options_ind *ind = getSolvingOptionsInd(rx, id);
-  nlmOde(id);
-  int j=0;
-  int &perN = nlmOp.stickyRecalcN2Per[(size_t)id];
-  while (perN <= nlmOp.stickyRecalcN &&
-         nlmIndHasBadSolve(op, ind) && j < nlmOp.maxOdeRecalc) {
-    perN++;
-    nlmOp.reducedTol  = 1;
-    atolRtolFactor_(nlmOp.odeRecalcFactor);
-    setIndSolve(ind, -1);
-    nlmOde(id);
-    j++;
-  }
-  if (j != 0) {
-    // tolFactor persists on ind — stiff subjects retain loosened tolerance.
-    if (perN > nlmOp.stickyRecalcN) {
-      nlmOp.stickyTol=1;
-    }
-  }
+  NlmRetryHooks hk; hk.reducedFlag = &nlmOp.reducedTol;
+  odeSwapSolveRetry(op, ind, nlmOp.stickyRecalcN2Per[(size_t)id],
+                    [&]{ odeSwapSolveInd(odeSlotInner, id); }, nlmRetryOpts(), hk);
 }
 
 void nlmSolvePred(int &id) {
   rx_solving_options *op = getSolvingOptions(rx);
   rx_solving_options_ind *ind = getSolvingOptionsInd(rx, id);
-  predOde(id);
-  int j=0;
-  int &perN = nlmOp.stickyRecalcN2Per[(size_t)id];
-  while (perN <= nlmOp.stickyRecalcN &&
-         nlmIndHasBadSolve(op, ind) && j < nlmOp.maxOdeRecalc) {
-    perN++;
-    nlmOp.reducedTol2 = 1;
-    atolRtolFactor_(nlmOp.odeRecalcFactor);
-    setIndSolve(ind, -1);
-    predOde(id);
-    j++;
-  }
-  if (j != 0) {
-    // tolFactor persists on ind — stiff subjects retain loosened tolerance.
-    if (perN > nlmOp.stickyRecalcN) {
-      nlmOp.stickyTol=1;
-    }
-  }
+  NlmRetryHooks hk; hk.reducedFlag = &nlmOp.reducedTol2;
+  odeSwapSolveRetry(op, ind, nlmOp.stickyRecalcN2Per[(size_t)id],
+                    [&]{ odeSwapSolveInd(odeSlotPred, id); }, nlmRetryOpts(), hk);
 }
 
 extern arma::vec calcGradForward(arma::vec &f0, arma::vec &grPH,  double h);
@@ -391,6 +387,13 @@ void nlmSolveFid(double *retD, int nobs, arma::vec &theta, int id) {
   arma::vec ret(retD, nobs, false, true);
   rx_solving_options_ind *ind =  updateParamRetInd(theta, id);
   rx_solving_options *op = getSolvingOptions(rx);
+  // The shared pool is sized for nlm's SENSITIVITY model (nlmSetup gives it the inner
+  // slot as nlm's largest structure), so a pred solve must be compacted to the pred
+  // model's own state count.  The guard is held for the WHOLE function, not just around
+  // the solve: getOpIndSolve() below strides ind->solve by the effective neq, so
+  // releasing it after nlmSolvePred() would read the predictions back at the sensitivity
+  // model's stride.  Same discipline as the inline pred fallback in likInner0.
+  OdeSwapScope neqGuard(odeSlotPred, ind, op);
   iniSubjectE(id, 1, ind, op, rx, rxPred.update_inis);
   nlmSolvePred(id);
   int kk, k=0;
@@ -405,11 +408,12 @@ void nlmSolveFid(double *retD, int nobs, arma::vec &theta, int id) {
       continue;
     } else if (getIndEvid(ind, kk) == 0) {
       rxPred.calc_lhs(id, curT, getOpIndSolve(op, ind, j), lhs);
-      if (ISNA(lhs[0])) {
+      int po = nlmOp.predOffset; // rx_pred_ index (intermediates may precede it)
+      if (ISNA(lhs[po])) {
         nlmOp.naZero.store(1, std::memory_order_relaxed);
-        lhs[0] = 0.0;
+        lhs[po] = 0.0;
       }
-      double val = lhs[0];
+      double val = lhs[po];
       if (nlmOp.hasFR && (hasRxCens(rx) || hasRxLimit(rx))) {
         int yj = getIndYj(ind), dist = 0, yj0 = 0;
         _splitYj(&yj, &dist, &yj0);
@@ -423,8 +427,8 @@ void nlmSolveFid(double *retD, int nobs, arma::vec &theta, int id) {
             if (ISNA(limiti)) limiti = R_NegInf;
           }
           if (censi != 0 || (R_FINITE(limiti) && !ISNA(limiti))) {
-            double f = lhs[1]; // rx_pred_f_
-            double r = lhs[2]; // rx_r_
+            double f = lhs[po + 1]; // rx_pred_f_
+            double r = lhs[po + 2]; // rx_r_
             double ll = doCensNormal1((double)censi, dvi, limiti, -val, f, r, 0);
             val = -ll;
           }
@@ -453,7 +457,9 @@ arma::vec nlmSolveF(arma::vec &theta) {
 #pragma omp parallel for num_threads(cores)
 #endif
   for (int id = 0; id < getRxNsub(rx); ++id) {
+    setRxThreadId(omp_get_thread_num());
     nlmSolveFid(retD + nlmOp.idS[id], nlmOp.nobs[id], theta, id);
+    setRxThreadId(-1);
   }
   return ret;
 }
@@ -505,17 +511,20 @@ arma::mat nlmSolveGradId(arma::vec &theta, int id) {
           hasCensObs = (censi != 0) || (R_FINITE(limiti) && !ISNA(limiti));
         }
       }
-      for (int kk = 0; kk < getOpNlhs(op); ++kk) {
-        if (kk > nlmOp.ntheta) break; // skip rx_pred_f_ and rx_r_ lhs values
-        if (ISNA(lhs[kk])) {
-          lhs[kk] = 0.0;
+      // rx_pred_ is at lhs[gradOffset]; the ntheta sensitivity columns follow
+      // contiguously, then rx_pred_f_ and rx_r_.  ret column 0 is the objective
+      // and columns 1..ntheta are the theta gradients (offset only the lhs read).
+      int go = nlmOp.gradOffset;
+      for (int kk = 0; kk <= (int)nlmOp.ntheta; ++kk) {
+        if (ISNA(lhs[go + kk])) {
+          lhs[go + kk] = 0.0;
           nlmOp.naZero.store(1, std::memory_order_relaxed);
         }
         if (kk == 0) {
-          double val = lhs[0];
+          double val = lhs[go];
           if (hasCensObs) {
-            double f = lhs[nlmOp.ntheta + 1]; // rx_pred_f_
-            double r = lhs[nlmOp.ntheta + 2]; // rx_r_
+            double f = lhs[go + nlmOp.ntheta + 1]; // rx_pred_f_
+            double r = lhs[go + nlmOp.ntheta + 2]; // rx_r_
             if (!ISNA(f) && !ISNA(r)) {
               double ll = doCensNormal1((double)censi, dvi, limiti, -val, f, r, 0);
               val = -ll;
@@ -525,7 +534,7 @@ arma::mat nlmSolveGradId(arma::vec &theta, int id) {
         } else if (hasCensObs) {
           ret(k, kk) = R_NaN; // force finite differences for censored observations
         } else {
-          ret(k, kk) = scaleAdjustGradScale(&(nlmOp.scale), lhs[kk], &theta[0], kk-1);
+          ret(k, kk) = scaleAdjustGradScale(&(nlmOp.scale), lhs[go + kk], &theta[0], kk-1);
         }
       }
       k++;
@@ -610,9 +619,77 @@ arma::mat nlmSolveGrad(arma::vec &theta) {
 #pragma omp parallel for num_threads(cores)
 #endif
   for (int id = 0; id < getRxNsub(rx); ++id) {
+    setRxThreadId(omp_get_thread_num());
     ret.rows(nlmOp.idS[id], nlmOp.idF[id]) = nlmSolveGradId(theta, id);
+    setRxThreadId(-1);
   }
   return ret;
+}
+
+//' Per-subject prediction and Jacobian for mixed-effects engines
+//'
+//' Like the population gradient solver but takes a per-subject
+//' \code{nsub x ntheta} parameter matrix (\code{phi = beta + b}, as
+//' supplied by \code{lme4::nlmer}) instead of one shared \code{theta}.
+//' Requires \code{.nlmSetupEnv()} to already be loaded.
+//'
+//' @param thetaMat A \code{nsub x ntheta} matrix of per-subject
+//'   parameter values.  Row \code{id} is solved against subject
+//'   \code{id} (in the loaded \code{etTrans} order).
+//'
+//' @return A \code{nobsTot x (ntheta+1)} matrix in the loaded
+//'   (\code{etTrans}) observation order: column 1 is the prediction
+//'   (\code{rx_pred_}) and columns 2..(ntheta+1) are
+//'   \code{d(pred)/d(THETA[i])}.
+//'
+//' @details This is an internal function and should not be called
+//'   directly.
+//'
+//' @param record When \code{TRUE}, record this evaluation's population
+//'   parameter estimate -- the per-subject mean of \code{thetaMat}'s columns
+//'   (\code{phi = beta + b} averaged over subjects, which equals the fixed
+//'   effect exactly for parameters without a random effect) -- into the
+//'   resident nlm parameter history via the shared scale machinery.  This is
+//'   how an external optimizer (e.g. \code{lme4::nlmer}) populates the
+//'   iteration print and the history recovered by \code{nlmGetParHist()}.  No
+//'   objective value is recorded (the scale's \code{showOfv} is expected to be
+//'   0 for these engines).  Defaults to \code{FALSE}.
+//'
+//' @author Matthew L. Fidler
+//' @keywords internal
+//' @export
+//[[Rcpp::export]]
+RObject nlmerSolveGrad(arma::mat &thetaMat, bool record=false) {
+  if (!nlmOp.loaded) stop("'nlm' problem not loaded");
+  if (nlmOp.solveType == solveType_pred) stop("incorrect solve type");
+  int nsub = getRxNsub(rx);
+  if ((int)thetaMat.n_rows != nsub) {
+    stop("'thetaMat' must have one row per subject");
+  }
+  if ((int)thetaMat.n_cols != (int)nlmOp.ntheta) {
+    stop("'thetaMat' must have one column per estimated parameter");
+  }
+  arma::mat ret(nlmOp.nobsTot, nlmOp.ntheta+1);
+  rx_solving_options *op = getSolvingOptions(rx);
+  int cores = getOpCores(op);
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(cores)
+#endif
+  for (int id = 0; id < nsub; ++id) {
+    setRxThreadId(omp_get_thread_num());
+    arma::vec th = thetaMat.row(id).t();
+    ret.rows(nlmOp.idS[id], nlmOp.idF[id]) = nlmSolveGradId(th, id);
+    setRxThreadId(-1);
+  }
+  if (record) {
+    // Population parameter estimate = column means of the per-subject phi.
+    // No objective is available here (lme4 owns the deviance), so record the
+    // parameters only -- NA_REAL fills the unused Function-Val slot, which the
+    // scale hides when showOfv == 0.
+    arma::vec mu = arma::mean(thetaMat, 0).t();
+    scalePrintFun(&(nlmOp.scale), mu.memptr(), NA_REAL);
+  }
+  return wrap(ret);
 }
 
 //[[Rcpp::export]]
@@ -993,12 +1070,31 @@ SEXP nlmCensInfo() {
   return ret;
 }
 
+//' Recover and finalize the resident nlm parameter history
+//'
+//' Returns the parameter history accumulated in the resident nlm scaling
+//' struct (one row per iteration type per recorded evaluation) as a data
+//' frame, and stops further recording/printing (\code{save} and \code{every}
+//' are reset to 0).  Must be called while \code{.nlmSetupEnv()} is still
+//' loaded -- i.e. before \code{.nlmFreeEnv()}.  Used by \code{.nlmFinalizeList}
+//' for the standard nlm-family estimators and directly by externally-optimized
+//' engines such as \code{babelmixr2}'s nlmer.
+//'
+//' @param p When \code{TRUE} (default) also print the final iteration line.
+//'
+//' @return A data frame of the recorded parameter history.
+//'
+//' @details This is an internal function and should not be called directly.
+//'
+//' @author Matthew L. Fidler
+//' @keywords internal
+//' @export
 //[[Rcpp::export]]
 RObject nlmGetParHist(bool p=true) {
   nlmOp.scale.save = 0;
-  nlmOp.scale.print = 0;
+  nlmOp.scale.every = 0;
   if (p) {
-    scalePrintLine(min2(nlmOp.scale.npars, nlmOp.scale.printNcol));
+    scalePrintLine(&(nlmOp.scale), min2(nlmOp.scale.npars, nlmOp.scale.ncol));
   }
   return scaleParHisDf(&(nlmOp.scale));
 }

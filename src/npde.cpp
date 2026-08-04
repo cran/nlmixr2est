@@ -48,7 +48,17 @@ arma::mat getSimMatById(arma::Col<int>& idLoc, arma::vec &sim, unsigned int& id,
 arma::mat decorrelateNpdeEigenMat(arma::mat& varsim, unsigned int& warn) {
   arma::vec eigval;
   arma::mat eigvec;
-  arma::eig_sym(eigval, eigvec, varsim, "std");
+  // This is the bool-returning form of eig_sym(): on failure (e.g. a non-finite
+  // varsim from a degenerate fit) it leaves eigval/eigvec empty and returns
+  // false, which would silently yield a 0x0 decorrelation matrix and later abort
+  // the NPDE matrix multiply. Treat failure as an exception so decorrelateNpdeMat
+  // falls through to its cholSE__/diagonal fallbacks.
+  // symmatu(): varsim is accumulated from simulated replicates, so its two triangles can
+  // differ in the last bits and eig_sym warns "given matrix is not symmetric" (it would
+  // then silently use one triangle anyway).  Same guard as the FOCEi Hessian.
+  if (!arma::eig_sym(eigval, eigvec, arma::symmatu(varsim), "std")) {
+    throw std::runtime_error("eig_sym failed");
+  }
   eigval = sqrt(eigval);
   arma::mat iEigVec;
   try{
@@ -112,22 +122,16 @@ arma::mat decorrelateNpdeMat(arma::mat& varsim, unsigned int& warn, unsigned int
 
 
 
-// This is similar to a truncated normal BUT the truncated normal handles the range (low,hi)
-// so instead of updating the DV based on cdf method, simply use the truncated normal
-// we also don't need to back-calculate the simulated DV value
+// Like a truncated normal but without needing to back-calculate the simulated DV value.
 static inline void handleCensNpdeCdf(calcNpdeInfoId &ret, arma::Col<int> &cens, arma::vec &limit,
                                      int &censMethod, bool &doLimit,
                                      unsigned int i, arma::vec &ru2,  arma::vec &ru3, unsigned int& K, bool &ties) {
   if (censMethod != CENS_CDF) return;
-  // For left censoring NPDE the probability is already calculated with the current pd
-  // 1. Replace value with lloq
-  // 2. The current pd represents the probability being below the limit of quantitation;
-  //    If it is right censored 1-pde[i] represents the probability of being above the limit of quantitation
-  // 4. For blq the pd is replaced with runif(0, p(bloq)) or runif(p(paloq), 1)
-  // 5. The epred is then replaced with back-calculated uniform value based on sorted tcomp of row
+  // pd already holds the below-limit probability (left cens) or 1-pd (right cens);
+  // replace with runif over that range, then back-calculate EPRED from sorted tcomp.
   arma::vec curRow;
-  unsigned int j, j2;
-  double low, hi, low2, hi2;
+  unsigned int j2;
+  double low2, hi2;
   switch (cens[i]) {
   case 1:
     curRow = sort(trans(ret.matsim.row(i)));
@@ -142,18 +146,17 @@ static inline void handleCensNpdeCdf(calcNpdeInfoId &ret, arma::Col<int> &cens, 
   default:
     return;
   }
-  // Now back-calculate the EPRED
-  j = trunc(ret.pd[i]*K);
+  // Back-calculate the imputed transformed observation from the marginal (npd)
+  // percentile pd2; yobst is a single value shared by both the npde and npd
+  // tracks, so only the marginal percentile (which indexes the sorted simulated
+  // row curRow) is meaningful here.
   j2 = trunc(ret.pd2[i]*K);
-  low = curRow[j];
+  // pd2 can round to 1.0; clamp to keep curRow indices in bounds
+  if (j2 >= K) j2 = K - 1;
   low2 = curRow[j2];
-  if (j+1 == K) hi = 2*low - curRow[j-1];
-  else hi = curRow[j+1];
-  if (j2+1 == K) hi2 = 2*low2 - curRow[j2-1];
+  if (j2+1 >= K) hi2 = (j2 > 0) ? (2*low2 - curRow[j2-1]) : low2;
   else hi2 = curRow[j2+1];
-  // check if this makes sense
-  // Use npd instead of npde as suggested by Nguyen2017
-  // Could be turned on/off by npdeControl()
+  // Use npd instead of npde as suggested by Nguyen2017; toggled by npdeControl()
   if (ties) {
     ret.yobst[i] = hi2;
   }
@@ -182,7 +185,6 @@ static inline void handleNpdeNAandCalculateEpred(calcNpdeInfoId& ret, unsigned i
 static inline void calculatePD(calcNpdeInfoId& ret, unsigned int& id, unsigned int &K, double &tolChol) {
   ret.ydsim = ret.matsim.rows(ret.obs);
   ret.varsim = cov(trans(ret.ydsim));
-  Rcpp::wrap(wrap(ret.varsim));
   ret.ymat = decorrelateNpdeMat(ret.varsim, ret.warn, id, tolChol); // pd= npd
   ret.ymat2 = varNpdMat(ret.varsim); // pd2 = pd
   arma::mat ymatt = trans(ret.ymat);
@@ -342,6 +344,11 @@ extern "C" SEXP _nlmixr2est_npdeCalc(SEXP npdeSim, SEXP dvIn, SEXP evidIn, SEXP 
   //arma::vec npde(REAL(npdeSEXP), dv.size(), false, true);
   SEXP s0 = rx_protect.protect(VECTOR_ELT(npdeSim, 0));
   int simLen = Rf_length(s0);
+  if (simLen == 0) {
+    // rx_protect (rxProtect RAII) unprotects on scope exit, including when
+    // stop() throws, so no manual UNPROTECT is needed here.
+    stop("npdeCalc: simulation input has zero rows");
+  }
   arma::Col<int> aSimIdVec(INTEGER(s0), simLen, false, true);
   arma::Col<int> aIdVec(INTEGER(VECTOR_ELT(npdeSim, 1)), simLen, false, true);
   unsigned int nid, K;
@@ -429,17 +436,43 @@ extern "C" SEXP _nlmixr2est_npdeCalc(SEXP npdeSim, SEXP dvIn, SEXP evidIn, SEXP 
   dvf.zeros();
   eres.zeros();
 
-  for (unsigned int curid = 0; curid < idLoc.size()-1; ++curid) {
-    calcNpdeInfoId idInfo = calcNpdeId(idLoc, sim, dvt, evid, cens, limit, censMethod, doLimit, curid, K, tolChol, ties, ru, ru2, ru3,
-                                       lambda, yj, hi, low);
-    npde(span(idLoc[curid],idLoc[curid+1]-1)) = idInfo.npde;
-    npd(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.npd;
-    pde(span(idLoc[curid],idLoc[curid+1]-1)) = idInfo.pd;
-    pd(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.pd2;
-    epred(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.epred;
-    dvf(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.yobs;
-    eres(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.eres;
-    warn[curid] = idInfo.warn;
+  {
+    int _nid = (int)(idLoc.size() - 1);
+#ifdef _OPENMP
+    // Get rxode2 thread count; called here in R context, before any OMP region
+    Rcpp::Function _rxGetThreads = Rcpp::Environment::namespace_env("rxode2")["getRxThreads"];
+    int _cores = Rcpp::as<int>(_rxGetThreads(false));
+    bool _doParallel = (_cores > 1);
+#pragma omp parallel for num_threads(_cores) schedule(dynamic) if(_doParallel)
+#endif
+    for (int _curid = 0; _curid < _nid; ++_curid) {
+      unsigned int curid = (unsigned int)_curid;
+      // A C++ exception must never escape this OMP region -- doing so calls
+      // std::terminate() and aborts R. Any per-subject numerical failure (e.g. a
+      // degenerate simulated covariance) is caught here and that subject's npde
+      // is set NA instead.
+      try {
+        calcNpdeInfoId idInfo = calcNpdeId(idLoc, sim, dvt, evid, cens, limit, censMethod, doLimit, curid, K, tolChol, ties, ru, ru2, ru3,
+                                           lambda, yj, hi, low);
+        npde(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.npde;
+        npd(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.npd;
+        pde(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.pd;
+        pd(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.pd2;
+        epred(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.epred;
+        dvf(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.yobs;
+        eres(span(idLoc[curid], idLoc[curid+1]-1)) = idInfo.eres;
+        warn[curid] = idInfo.warn;
+      } catch (...) {
+        npde(span(idLoc[curid], idLoc[curid+1]-1)).fill(NA_REAL);
+        npd(span(idLoc[curid], idLoc[curid+1]-1)).fill(NA_REAL);
+        pde(span(idLoc[curid], idLoc[curid+1]-1)).fill(NA_REAL);
+        pd(span(idLoc[curid], idLoc[curid+1]-1)).fill(NA_REAL);
+        epred(span(idLoc[curid], idLoc[curid+1]-1)).fill(NA_REAL);
+        dvf(span(idLoc[curid], idLoc[curid+1]-1)).fill(NA_REAL);
+        eres(span(idLoc[curid], idLoc[curid+1]-1)).fill(NA_REAL);
+        warn[curid] = NPDE_NPD;
+      }
+    }
   }
   std::string sCholPinv = "";
   int nCholPinv = 0;

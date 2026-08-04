@@ -53,22 +53,14 @@ mu2env$expit <- rxode2::expit
 
 #' Get mu3 covariate
 #'
-#' This function evaluates a given expression within a specific
-#' environment and data context.
+#' Evaluates an expression within the symengine/data context to build a
+#' new data column for traditional mu referencing.
 #'
-#' @param data The data frame that will be optimized, will contain the
-#'   covariates built into the expression to built a new data column
-#'   for traditional mu referencing
-#'
-#' @param .datEnv The environment that contains the symengine
-#'   environment used to gather expressions and help evaluate them in
-#'   the context of the data and model.
-#'
-#' @param .tmp A string representing the expression to be evaluated to
-#'   see if it will produce a new dataset column without errors.
-#'
+#' @param data The data frame that will contain the new column.
+#' @param .datEnv Environment holding the symengine used to evaluate
+#'   expressions in the context of the data and model.
+#' @param .tmp A string expression to evaluate.
 #' @return The evaluated result of the expression
-#'
 #' @noRd
 #' @keywords internal
 #' @author Matthew L. Fidler
@@ -86,20 +78,13 @@ mu2env$expit <- rxode2::expit
 #' Process and transform a call to change string assigment to integer
 #' assigments according to `rxode2`'s rules
 #'
-#' This function recursively processes a call object `x` and
-#' transforms it based on the provided string assignments in
-#' `strAssign`.  It specifically looks for equality (`==`) and
-#' inequality (`!=`) comparisons and replaces parts of the call with
-#' numeric indices from `strAssign`.
-#'
-#' This is used to transform mu4 covariates to mu covariates.
+#' Recursively walks call `x`, replacing `==`/`!=` comparisons against
+#' names in `strAssign` with their numeric index. Used to transform mu4
+#' covariates to mu covariates.
 #'
 #' @param x A call object to be processed.
-#'
 #' @param strAssign A named list of string assignments used for transformation.
-#'
 #' @return A transformed call object with parts replaced by numeric indices.
-#'
 #' @noRd
 .uiGetMu4f <- function(x, strAssign) {
   if (is.call(x)) {
@@ -132,22 +117,14 @@ mu2env$expit <- rxode2::expit
   x
 }
 
-#' @title Internal Function to Process mu4 expressions with symengine
-#'   and string replacement
-#' @description This function processes the input data using the
-#'   SymEngine environment and the `rxode2` package
+#' Process mu4 expressions with symengine and string replacement
 #'
-#' @param data The data to be processed; if it has the right
-#'   information it will create a new column to be added as a
+#' @param data The data to be processed; may gain a new column for a
 #'   traditional mu-expression in `nlmixr2`
-#'
-#' @param .datEnv The environment containing the symengine which is
-#'   the rxode2 model translated for use with symengine. Also in this
-#'   environment is the ui which contains the rxode2 ui model
-#'
+#' @param .datEnv Environment containing the symengine (rxode2 model
+#'   translated for symengine) and the ui
 #' @param .tmp A temporary expression to be evaluated within the
 #'   SymEngine context.
-#'
 #' @return The result of evaluating the processed expression within
 #'   the data environment.
 #' @noRd
@@ -294,6 +271,15 @@ mu2env$expit <- rxode2::expit
   if (!.isMuMethod(est, control)) {
     return(NULL)
   }
+  # Common time-varying / non-time-varying mu-ref covariate split for every
+  # mu-referenced method (saem, mu-focei family, vae): non-time-varying
+  # covariates are absorbed into the phi term, time-varying ones stay as beta
+  # regressors.  Only the split is shared -- the model expansion still differs
+  # (saem drops lone etas into phi, mu-focei/vae keep them).  Removed in
+  # .uiFinalizeMu2hook / each method's on.exit.
+  .tv <- tryCatch(.nlmixrTimeVaryingCovariates(data, ui, control$rxControl),
+                  error = function(e) character(0))
+  .nlmixrSetMuRefTimeVarying(ui, .tv)
   if (length(ui$mu2RefCovariateReplaceDataFrame$covariate) > 0L) {
     .uiModifyForCovs(ui, data)
   } else {
@@ -342,6 +328,10 @@ mu2env$expit <- rxode2::expit
         class(ret) <- .cls
       }
     }
+  }
+  # remove the shared time-varying mu-ref split staged in .uiApplyMu2hook
+  if (!is.null(ret$env) && !is.null(ret$env$ui)) {
+    .nlmixrRmMuRefTimeVarying(ret$env$ui)
   }
   # Reset symengine environments
   .saemModelEnv$symengine <- NULL

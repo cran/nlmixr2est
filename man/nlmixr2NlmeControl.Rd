@@ -10,10 +10,10 @@ nlmixr2NlmeControl(
   pnlsMaxIter = 100,
   msMaxIter = 100,
   minScale = 0.001,
-  tolerance = 1e-05,
+  tolerance = NULL,
   niterEM = 25,
-  pnlsTol = 0.001,
-  msTol = 1e-06,
+  pnlsTol = NULL,
+  msTol = NULL,
   returnObject = FALSE,
   msVerbose = FALSE,
   msWarnNoConv = TRUE,
@@ -39,9 +39,12 @@ nlmixr2NlmeControl(
   compress = TRUE,
   adjObf = TRUE,
   ci = 0.95,
-  sigdig = 4,
+  sigdig = 3,
   sigdigTable = NULL,
   muRefCovAlg = TRUE,
+  eventSens = c("jump", "fd"),
+  print = NULL,
+  covMethod = c("nlme", "analytic", "r,s", "r", "s", "sa", "imp", ""),
   ...
 )
 
@@ -50,10 +53,10 @@ nlmeControl(
   pnlsMaxIter = 100,
   msMaxIter = 100,
   minScale = 0.001,
-  tolerance = 1e-05,
+  tolerance = NULL,
   niterEM = 25,
-  pnlsTol = 0.001,
-  msTol = 1e-06,
+  pnlsTol = NULL,
+  msTol = NULL,
   returnObject = FALSE,
   msVerbose = FALSE,
   msWarnNoConv = TRUE,
@@ -79,9 +82,12 @@ nlmeControl(
   compress = TRUE,
   adjObf = TRUE,
   ci = 0.95,
-  sigdig = 4,
+  sigdig = 3,
   sigdigTable = NULL,
   muRefCovAlg = TRUE,
+  eventSens = c("jump", "fd"),
+  print = NULL,
+  covMethod = c("nlme", "analytic", "r,s", "r", "s", "sa", "imp", ""),
   ...
 )
 }
@@ -235,29 +241,13 @@ this is \code{FALSE}.}
 object (by default FALSE).  If any of the nlme specific options
 of `random`, `fixed`, `sens`, the nlme object is returned}
 
-\item{addProp}{specifies the type of additive plus proportional
-  errors, the one where standard deviations add (combined1) or the
-  type where the variances add (combined2).
-
-The combined1 error type can be described by the following equation:
-
-  \deqn{y = f + (a + b\times f^c) \times \varepsilon}{y = f + (a + b*f^c)*err}
-
-The combined2 error model can be described by the following equation:
-
- \deqn{y = f + \sqrt{a^2 + b^2\times f^{2\times c}} \times \varepsilon}{y = f + sqrt(a^2 + b^2*(f^c)^2)*err}
-
- Where:
-
- - y represents the observed value
-
- - f represents the predicted value
-
- - a  is the additive standard deviation
-
- - b is the proportional/power standard deviation
-
- - c is the power exponent (in the proportional case c=1)}
+\item{addProp}{Type of additive-plus-proportional error: `"combined1"`,
+where standard deviations add:
+\deqn{y = f + (a + b\times f^c) \times \varepsilon}{y = f + (a + b*f^c)*err};
+or `"combined2"`, where variances add:
+\deqn{y = f + \sqrt{a^2 + b^2\times f^{2\times c}} \times \varepsilon}{y = f + sqrt(a^2 + b^2*(f^c)^2)*err}.
+Here y = observed, f = predicted, a = additive sd, b = proportional/power
+sd, c = power exponent (1 in the proportional case).}
 
 \item{calcTables}{This boolean is to determine if the foceiFit
 will calculate tables. By default this is \code{TRUE}}
@@ -271,42 +261,49 @@ function.  By default this is \code{TRUE}}
 \item{ci}{Confidence level for some tables.  By default this is
 0.95 or 95\% confidence.}
 
-\item{sigdig}{Optimization significant digits. This controls:
-
-\itemize{
-
- \item The tolerance of the inner and outer optimization is \code{10^-sigdig}
-
- \item The tolerance of the ODE solvers is
- \code{0.5*10^(-sigdig-2)}; For the sensitivity equations and
- steady-state solutions the default is \code{0.5*10^(-sigdig-1.5)}
- (sensitivity changes only applicable for liblsoda)
-
- \item The tolerance of the boundary check is \code{5 * 10 ^ (-sigdig + 1)}
-
-}}
+\item{sigdig}{Optimization significant digits.  One value drives, with a single
+consistent formula, the inner/outer optimizer convergence tolerance
+(\code{10^-sigdig}), the boundary check tolerance (\code{5*10^(-sigdig+1)}),
+and the ODE solver tolerances: the \code{rtol} exponent IS \code{sigdig} and
+\code{atol} sits three orders below, so \code{rtol = 10^-sigdig},
+\code{atol = 10^(-sigdig-3)} for every solver (stiff, non-stiff or
+auto-switching).  The sensitivity (\code{atolSens}/\code{rtolSens})
+tolerances match the main solve (the outer gradient and covariance are built
+from them); the steady-state (\code{ssAtol}/\code{ssRtol}) tolerances run one
+order looser.
+Keying the optimizer to the same \code{10^-sigdig} means it converges to
+exactly the precision the solve supports.  At the default \code{sigdig = 3}
+this is \code{atol = 1e-6}, \code{rtol = 1e-3}.}
 
 \item{sigdigTable}{Significant digits in the final output table.
 If not specified, then it matches the significant digits in the
 `sigdig` optimization algorithm.  If `sigdig` is NULL, use 3.}
 
-\item{muRefCovAlg}{This controls if algebraic expressions that can
-  be mu-referenced are treated as mu-referenced covariates by:
+\item{muRefCovAlg}{When `TRUE` (default), algebraic expressions that can
+be mu-referenced are internally rewritten as mu-referenced
+covariates and restored after optimization. Mirrors
+\code{saemControl(muRefCovAlg=)}/\code{nlmeControl(muRefCovAlg=)};
+for \code{foceiControl()} only takes effect when
+\code{muModel != "none"}.}
 
-  1. Creating a internal data-variable `nlmixrMuDerCov#` for each
-     algebraic mu-referenced expression
+\item{eventSens}{Controls how dosing/event-parameter (`alag`, `F`,
+`rate`, `dur`) sensitivities are computed for THETA/ETA gradients:
+`"jump"` (default) uses rxode2's analytic event sensitivities; `"fd"`
+uses the legacy finite-difference behavior.}
 
-  2. Change the algebraic expression to `nlmixrMuDerCov# * mu_cov_theta`
+\item{print}{Convenience alias for the shared nlmixr `print` control.
+`nlme` prints progress through its own `verbose` option, so `print`
+maps to it: `print=0` runs quietly (`verbose=FALSE`) and any positive
+value is verbose (`verbose=TRUE`).  When `print` is not supplied an
+explicit `verbose` is used as given.}
 
-  3. Use the internal mu-referenced covariate for saem
-
-  4. After optimization is completed, replace `model({})` with old
-  `model({})` expression
-
-  5. Remove `nlmixrMuDerCov#` from nlmix2 output
-
-In general, these covariates should be more accurate since it
-changes the system to a linear compartment model.  Therefore, by default this is `TRUE`.}
+\item{covMethod}{Covariance method: `"analytic"` (default) computes the
+focei observed-information covariance at the converged nlme estimates
+post-fit (falling back to the finite-difference `"r,s"` -> `"r"`/`"s"`
+chain when out of analytic scope); `"r,s"`, `"r"`, `"s"` request the
+finite-difference forms directly; `"nlme"` and `""` skip the recompute
+and keep nlme's own standard errors.  When the recompute fails the
+`"nlme"` covariance is kept.}
 
 \item{...}{Further, named control arguments to be passed to
    \code{\link{nlminb}} (apart from \code{trace} and \code{iter.max}
@@ -319,7 +316,7 @@ a nlmixr-nlme list
 \description{
 The values supplied in the function call replace the defaults and
 a list with all possible arguments is returned.  The returned list
-is used as the ‘control’ argument to the ‘nlme’ function.
+is used as the `control` argument to the `nlme` function.
 }
 \examples{
 nlmeControl()

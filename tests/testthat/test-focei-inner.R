@@ -70,13 +70,20 @@ nmTest({
 
     ETA <- matrix(c(-0.147736086922763, -0.294637022436797), ncol = 2)
 
+    ## sigdig pinned: this asserts the CONVERGED inner objective to three
+    ## decimals, and sigdig drives the solver tolerances (rtol = 10^-sigdig).
+    ## At the sigdig=3 default (rtol=1e-3) the solve cannot resolve that third
+    ## decimal -- it returns 418.9344 where sigdig 4/5/6 all give 418.9353 -- so
+    ## the assertion failed on solver precision, not on the objective.  The
+    ## reference value is unchanged; only the solve is now tight enough to
+    ## reproduce it independently of whatever the default sigdig happens to be.
     fitPi <- .nlmixr(
       m1, w7,
       est="focei",
       foceiControl(
         etaMat = ETA,
         maxOuterIterations = 0, maxInnerIterations = 0,
-        covMethod = ""
+        covMethod = "", sigdig = 6
       )
     )
 
@@ -114,5 +121,46 @@ nmTest({
     expect_equal(c("tka", "tcl", "tv", "add.sd"), row.names(fit$parFixedDf))
   })
 
+  test_that("focei model with sine over a compound argument builds (#513)", {
+    # A trig function whose argument is a compound expression divided by
+    # something (here 2*3.14*(time-mtime1)/period) used to lose its argument in
+    # the symengine round-trip, emitting sin()/cos() with no argument and
+    # failing to compile ("too few arguments to function 'sin'").  Requires the
+    # rxFromSE fix in rxode2; skip on an rxode2 that still drops the argument.
+    skip_if(rxode2::rxFromSE("sin((a-b)/c)") == "sin()",
+            "installed rxode2 predates the rxFromSE compound-argument fix")
+
+    ehc <- function() {
+      ini({
+        tKa <- log(10)
+        tCl <- log(93794.73)
+        tV <- log(973551.9)
+        tKemp <- log(30)
+        tmtime1 <- log(1)
+        tperiod <- 6
+        add.err <- c(0, 0.01)
+        prop.err <- c(0, 0.2)
+        eta.Ka ~ 0.1
+        eta.mtime1 ~ 0.1
+      })
+      model({
+        Ka <- exp(tKa + eta.Ka)
+        Cl <- exp(tCl)
+        V <- exp(tV)
+        Kemp <- exp(tKemp)
+        mtime1 <- exp(tmtime1 + eta.mtime1)
+        period <- tperiod
+        SINE <- sin(2 * 3.14 * (time - mtime1) / period)
+        EHC <- ifelse(SINE > 0, SINE, 0)
+        d/dt(depot) = -Ka * depot + Kemp * GB * EHC
+        d/dt(center) = Ka * depot - Cl / V * center
+        d/dt(GB) = -Kemp * GB * EHC
+        Cp <- center / V
+        Cp ~ add(add.err) + prop(prop.err)
+      })
+    }
+    f <- suppressMessages(ehc())
+    expect_error(f$foceiModel, NA)
+  })
 
 })

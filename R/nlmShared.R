@@ -9,63 +9,24 @@
 #'
 #' @param data rxode2 compatible data for solving/setting up
 #'
-#' @param modelInfo A list containing the following elements:
-#'
-#' - `predOnly` -- A model with only predictions calculated.  These
-#' predictions should be in terms of `THETA[#]` and `DV`.  The
-#'
-#' - `eventTheta` is an indicator if the `THETA[#]` is related to an
-#' event (like `dur(x)` `f(x)`).  These variables will use Shi2021
-#' finite differences and need to be indicated when setting up the
-#' solving environment.  When finite differences are required, this is
-#' `1L` when they are not it should be `0L`.  This should match the
-#' length of `par`
-#'
-#' - `thetaGrad` -- needed when solveType != 1; a model that gives the
-#' value and gradient of each `THETA[#]`
-#'
-#' An example can be found with `ui$nlmSensModel` or `ui$nlmRxModel`
-#'
-#' @param control is a control structure with a few required elements:
-#'
-#' - `rxControl` represents the rxode2 solving options
-#' - `solveType` integer indicating the solveType (optional)
-#' - `stickyRecalcN`
-#' - `maxOdeRecalc`
-#' - `odeRecalcFactor`
-#' - `eventType` (optional)
-#' - `shi21maxFD` (optional)
-#' - `shiErr` (optional)
-#' - `optimHessType` (optional)
-#' - `shi21maxHess` (optional)
-#' - `hessErr` (optional)
-#' - `useColor`
-#' - `printNcol`
-#' - `print`
-#' - `normType`
-#' - `scaleType`
-#' - `scaleCmin`
-#' - `scaleCmax`
-#' - `scaleTo`
-#' - `scaleC`
-#' - `gradTo` (optional); if missing assumed gradTo=0
+#' @param modelInfo A list with `predOnly` (predictions-only model in terms of
+#'   `THETA[#]`/`DV`), `eventTheta` (0/1 per THETA flagging event-related
+#'   parameters that need Shi2021 finite differences, same length as `par`),
+#'   and `thetaGrad` (needed when solveType != 1; gives value/gradient per
+#'   THETA). See `ui$nlmSensModel` or `ui$nlmRxModel` for examples.
+#' @param control control structure; required: `rxControl`, `stickyRecalcN`,
+#'   `maxOdeRecalc`, `odeRecalcFactor`. Optional: `solveType`, `eventType`,
+#'   `shi21maxFD`, `shiErr`, `optimHessType`, `shi21maxHess`, `hessErr`,
+#'   `useColor`, `printNcol`, `print`, `normType`, `scaleType`, `scaleCmin`,
+#'   `scaleCmax`, `scaleTo`, `scaleC`, `gradTo` (default 0 if missing).
 #' @param lower lower bounds, will be scaled if present
 #' @param upper upper bounds, will be scaled if present
-#' @return nlm solve environment; of interest
-#'
-#' `$par.ini` -- scaled parameter initial value
-#'
-#' `$lower` -- scaled parameter lower value
-#'
-#' `$upper` -- scaled parameter upper value
-#'
-#' `$.ctl`  -- control structure
+#' @return nlm solve environment; key fields: `$par.ini`, `$lower`, `$upper`
+#'   (all scaled), and `$.ctl` (control structure).
 #'
 #' @details
 #'
-#' In between using this, rxode2 solving should not be called.
-#'
-#' This will also print the header for solving (if print != 0)
+#' No rxode2 solving should occur between setup calls; prints the solving header if `print != 0`.
 #'
 #' @author Matthew Fidler
 #' @keywords internal
@@ -103,6 +64,15 @@
   if (!any(names(.ctl) == "hessErr")) {
     .ctl$hessErr <-   (.Machine$double.eps)^(1/3)
   }
+  # nlmSetup (nlm.cpp) reads control$iterPrintControl; external callers that
+  # hand-build a control (e.g. babelmixr2 fmeMcmc) may omit it, so synthesize
+  # one from the scalar print args instead of erroring in C.
+  if (!inherits(.ctl$iterPrintControl, "iterPrintControl")) {
+    .ctl$iterPrintControl <-
+      .absorbIterPrintControl(print = if (is.null(.ctl$print)) 1L else .ctl$print,
+                              printNcol = .ctl$printNcol,
+                              useColor = .ctl$useColor)
+  }
 
   .env <- new.env(parent=emptyenv())
   .env$rxControl <- .ctl$rxControl
@@ -114,12 +84,36 @@
   } else {
     nlmixr2global$nlmEnv$model <- .env$predOnly <- .f$predOnly
   }
+  ## Delay differential equation models need a dense-output solver so delay()
+  ## history is recorded and interpolated (also by the forward-sensitivity /
+  ## jump-sensitivity states).  nlm.cpp calls rxSolve_ directly, bypassing
+  ## rxSolve()'s hasDelay enforcement, so replicate it here: dense dop853 (which
+  ## needs no analytic Jacobian) unless an in-engine sensitivity method (>=200)
+  ## is already selected -- those record their own dense history.
+  if (isTRUE(rxode2::rxModelVars(nlmixr2global$nlmEnv$model)$flags[["hasDelay"]] == 1L)) {
+    .env$rxControl$dense <- TRUE
+    if (is.null(.env$rxControl$method) || .env$rxControl$method < 200L) {
+      .env$rxControl$method <- 0L
+      .env$rxControl$stiff2 <- 0L
+    }
+  }
   .env$param <- setNames(par, sprintf("THETA[%d]", seq_along(par)))
   .nlmFitDataSetup(data)
   .env$needFD <- .f$eventTheta
+  # Ship a single xform sub-list so C wires log/logit/probit back-transforms
+  # via scaleAttachXform (src/scale.h), like focei/saem; nlm-family prints thetas in `par` order.
+  .ctl$xform <- .iterPrintXParFromUi(ui, names(par))
   .env$control <- .ctl
   .env$data <- nlmixr2global$nlmEnv$data
   .Call(`_nlmixr2est_nlmSetup`, .env)
+  ## Activate event-jump sensitivity (if eventSens="jump") now, before the
+  ## scaleC solve -- doing it after would mis-scale dosing params from a jump-less gradient. Deactivated in .nlmFreeEnv; no-op for "fd".
+  .env$esActive <- FALSE
+  if (!is.null(.env$thetaGrad)) {
+    .env$esActive <- isTRUE(tryCatch(
+      rxode2::rxEventSensLoadModel(.env$thetaGrad),
+      error = function(e) FALSE))
+  }
   if (is.null(.ctl$scaleC) && .ctl$scaleType == 2L && .ctl$gradTo > 0) {
     .tmp <- .Call(`_nlmixr2est_nlmGetScaleC`, par, .ctl$gradTo)
     if (length(.tmp) == 0L) {
@@ -164,6 +158,8 @@
 .nlmFreeEnv <- function() {
  .Call(`_nlmixr2est_nlmFree`)
  rxode2::rxSolveFree()
+ ## Deactivate any event-jump sensitivity injection from .nlmSetupEnv; no-op if never activated.
+ tryCatch(rxode2::rxEventSensDeactivate(), error = function(e) NULL)
 }
 #' Finalizes output list
 #'
@@ -320,4 +316,215 @@
 #' @author Matthew L. Fidler
 .nlmAdjustCov <- function(cov, parScaled) {
   .Call(`_nlmixr2est_nlmAdjustCov`, cov, parScaled)
+}
+
+#' Uppercase data column names except the model covariates
+#'
+#' @param nms character vector of column names
+#' @param covNames character vector of model covariate names (kept as-is)
+#' @return character vector of names, upper-cased except those in `covNames`
+#' @author Matthew L. Fidler
+#' @noRd
+.nmUpcaseNonCov <- function(nms, covNames) {
+  if (is.null(covNames)) covNames <- character(0)
+  vapply(nms, function(.x) {
+    if (.x %in% covNames) .x else toupper(.x)
+  }, character(1), USE.NAMES = FALSE)
+}
+
+#' Detect the time-varying covariate columns for mu-referenced estimators (SAEM/NLME)
+#'
+#' @param dataSav preprocessed event-table data (from `.foceiPreProcessData()`)
+#' @param ui rxode2 ui model (uses `ui$mv0`)
+#' @param rxControl rxode2 control (for `addlKeepsCov`/`addlDropSs`/`ssAtDoseTime`)
+#' @return character vector of time-varying covariate column names (possibly empty)
+#' @author Matthew L. Fidler
+#' @noRd
+.nlmixrTimeVaryingCovariates <- function(dataSav, ui, rxControl) {
+  .et <- rxode2::etTrans(dataSav, ui$mv0, addCmt = TRUE,
+                         addlKeepsCov = rxControl$addlKeepsCov,
+                         addlDropSs = rxControl$addlDropSs,
+                         ssAtDoseTime = rxControl$ssAtDoseTime)
+  .nTv <- attr(class(.et), ".rxode2.lst")$nTv
+  # nTv == 0 means no time-varying covariates; otherwise they follow the first 6 columns
+  if (!is.null(.nTv) && .nTv == 0L) {
+    return(character(0))
+  }
+  names(.et)[-seq_len(6)]
+}
+
+#' Stage the mu-referenced covariate split (time-varying vs not) into the ui env
+#'
+#' Splits the mu-referenced covariates: non-time-varying ones stay in
+#' `muRefFinal` so they are absorbed into the phi term by the mu-ref drop
+#' (`.saemDropMuRefFromModel` -> `$saemModel0` collapses the model to `phi +
+#' timeVaryingCovariate*beta_cov`); time-varying ones are removed from
+#' `muRefFinal` so they remain in the model as `beta_cov` regressors.  Both
+#' `muRefFinal` and `timeVaryingCovariates` are assigned into the ui env and MUST
+#' be removed on exit with `.nlmixrRmMuRefTimeVarying()`.  Shared by saem, the
+#' mu-referenced focei family and vae so they all detect time-varying covariates
+#' the same way.  Only the time-varying *split* is shared here; the model
+#' expansion differs by method -- saem collapses lone etas into phi (theta forced
+#' to 0), while vae and mu-referenced focei keep the etas as the inner problem
+#' needs them.
+#'
+#' @param ui rxode2 ui (an environment) to stage the split into
+#' @param timeVaryingCovariates character vector from
+#'   `.nlmixrTimeVaryingCovariates()`
+#' @return `ui`, invisibly (called for the side-effect assignments)
+#' @noRd
+.nlmixrSetMuRefTimeVarying <- function(ui, timeVaryingCovariates) {
+  .muRefCovariateDataFrame <- ui$muRefCovariateDataFrame
+  if (length(timeVaryingCovariates) > 0) {
+    # A log-scale (exp-transformed) time-varying mu covariate can fit better
+    # untransformed; the historical warning is left disabled but the detection
+    # is kept so the behavior is easy to restore.
+    .w <- which(.muRefCovariateDataFrame$covariate %in% timeVaryingCovariates)
+    .covPar <- .muRefCovariateDataFrame[.w, "theta"]
+    .w2 <- which(ui$muRefCurEval$parameter %in% .covPar)
+    if (length(.w2) > 0) {
+      .w3 <- which("exp" == ui$muRefCurEval$curEval[.w2])
+      if (length(.w3) > 0) {
+        .w2 <- .w2[.w3]
+        .texp <- ui$muRefCurEval$parameter[.w2]
+        .pars <- .muRefCovariateDataFrame$covariateParameter[.muRefCovariateDataFrame$theta %in% .texp]
+        ## warning(paste0("log-scale mu referenced time varying covariates (",
+        ##                paste(.pars, collapse=", "), ") may have better results ...
+      }
+    }
+    # keep only non-time-varying covariates in the absorbed (mu-ref) set
+    .muRefCovariateDataFrame <-
+      .muRefCovariateDataFrame[!(.muRefCovariateDataFrame$covariate %in% timeVaryingCovariates), ]
+  }
+  assign("muRefFinal", .muRefCovariateDataFrame, ui)
+  assign("timeVaryingCovariates", timeVaryingCovariates, ui)
+  invisible(ui)
+}
+
+#' Remove the staged mu-ref time-varying covariate info from the ui env
+#'
+#' Undoes `.nlmixrSetMuRefTimeVarying()`; call from the estimation method's
+#' `on.exit()` so the shared ui object is left unmodified after the fit.
+#' @noRd
+.nlmixrRmMuRefTimeVarying <- function(ui) {
+  if (is.environment(ui) && exists("muRefFinal", envir = ui, inherits = FALSE)) {
+    rm(list = "muRefFinal", envir = ui)
+  }
+  if (is.environment(ui) && exists("timeVaryingCovariates", envir = ui, inherits = FALSE)) {
+    rm(list = "timeVaryingCovariates", envir = ui)
+  }
+  invisible(ui)
+}
+
+#' Shared control setup for the nlm-family estimation methods
+#'
+#' @param env dispatch environment (provides `ui` and `control`)
+#' @param controlFn the method's `*Control()` constructor (e.g. `nlmControl`)
+#' @param controlClass the control object's S3 class (e.g. `"nlmControl"`)
+#' @return Nothing; assigns the resolved control onto `env$ui`
+#' @author Matthew L. Fidler
+#' @export
+#' @keywords internal
+.nlmFamilyControlGeneric <- function(env, controlFn, controlClass) {
+  .ui <- env$ui
+  .control <- env$control
+  if (is.null(.control)) {
+    .control <- controlFn()
+  }
+  if (!inherits(.control, controlClass)) {
+    .control <- do.call(controlFn, .control)
+  }
+  assign("control", .control, envir = .ui)
+}
+
+#' Shared fit driver for the nlm-family estimation methods
+#'
+#' @param env dispatch environment (provides `ui`, `control`, `data`, `table`)
+#' @param method estimation-method string; also the slot the raw fit is stored
+#'   under (e.g. `"nlm"` -> `.ret[["nlm"]]`)
+#' @param fitModel `function(ui, dataSav)` running the optimizer
+#' @param getTheta `function(fit, ui)` returning the full theta vector
+#' @param controlToFocei `function(env)` translating the control to a
+#'   focei-style control for output assembly
+#' @param returnFlag rxode2 control flag name that short-circuits and returns the
+#'   raw optimizer result (e.g. `"returnNlm"`)
+#' @param message `function(fit)` returning the `$message` (default `fit$message`)
+#' @param emitFitWarnings when TRUE, re-emit the warnings collected from
+#'   `fitModel` via `warning()` (nlm does this; the others do not)
+#' @param extra `$extra` print string, or a `function(control)` returning it
+#' @param adjustOutput when TRUE, run `.nlmFamilyAdjustOutput()`
+#' @param objective optional `function(fit)` returning the raw objective; when
+#'   `NULL` the driver does not set `$objective` (a `postSetup` closure did)
+#' @param postSetup optional `function(ret, ui, fitList)` returning a modified
+#'   `ret`, run right after the raw fit is stored and before
+#'   `.nlmFamilyAdjustOutput()` (for methods that set cov/covMethod/objective
+#'   with custom values)
+#' @return the assembled nlmixr2 fit (or the raw optimizer result if `returnFlag`)
+#' @author Matthew L. Fidler
+#' @export
+.nlmFamilyFitGeneric <- function(env, method, fitModel, getTheta,
+                                 controlToFocei, returnFlag,
+                                 objective = NULL,
+                                 message = function(fit) fit$message,
+                                 emitFitWarnings = FALSE,
+                                 extra = "",
+                                 adjustOutput = TRUE,
+                                 postSetup = NULL) {
+  .ui <- env$ui
+  .control <- .ui$control
+  .data <- env$data
+  .ret <- new.env(parent = emptyenv())
+  .ret$table <- env$table
+  nlmixrWithTiming("setup", {
+    .foceiPreProcessData(.data, .ret, .ui, .control$rxControl)
+  })
+  # fitModel builds the symengine/sensitivity model and runs the optimizer;
+  # time it as "optimize" so the work is not left in the "other" bucket (the
+  # nlm-family model build and iterative solve are intertwined -- the
+  # sensitivity model is the optimization model).
+  .fit <- nlmixrWithTiming("optimize", {
+    .collectWarn(fitModel(.ui, .ret$dataSav), lst = TRUE)
+  })
+  .ret[[method]] <- .fit[[1]]
+  if (!is.null(postSetup)) {
+    .ret <- postSetup(.ret, .ui, .fit)
+  }
+  if (adjustOutput) {
+    .ret <- .nlmFamilyAdjustOutput(.ret, method)
+  }
+  .ret$message <- NULL
+  if (emitFitWarnings) {
+    lapply(.fit[[2]], function(.w) warning(.w, call. = FALSE))
+  }
+  if (rxode2::rxGetControl(.ui, returnFlag, FALSE)) {
+    return(.ret[[method]])
+  }
+  .ret$message <- message(.ret[[method]])
+  .ret$ui <- .ui
+  .ret$adjObf <- rxode2::rxGetControl(.ui, "adjObf", TRUE)
+  .ret$fullTheta <- getTheta(.ret[[method]], .ui)
+  .ret$control <- .control
+  .ret$extra <- if (is.function(extra)) extra(.control) else extra
+  .nlmixr2FitUpdateParams(.ret)
+  nmObjHandleControlObject(.ret$control, .ret)
+  if (exists("control", .ui)) {
+    rm(list = "control", envir = .ui)
+  }
+  .ret$est <- method
+  if (!is.null(objective)) {
+    .ret$objective <- objective(.ret[[method]])
+  }
+  # building the EBE model is another symengine model build; time it as "setup"
+  .ret$model <- nlmixrWithTiming("setup", {
+    .ui$ebe
+  })
+  .ret$ofvType <- method
+  controlToFocei(.ret)
+  .ret$theta <- .ret$ui$saemThetaDataFrame
+  .ret <- nlmixr2CreateOutputFromUi(.ret$ui, data = .ret$origData,
+                                    control = .ret$control, table = .ret$table,
+                                    env = .ret, est = method)
+  .env <- .ret$env
+  .env$method <- method
+  .ret
 }

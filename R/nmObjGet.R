@@ -21,23 +21,17 @@ nmObjGet <- function(x, ...) {
     .nmObjEnsureObjective(x[[1]])
   }
   if (.rstudioComplete()) {
-    # If Rstudio is running completion, then we need to simply
-    # return a dummy object so it doesn't calculate the value.
-    #
-    # However, if the object actually exists, then use the rxUiGet.default method
-    # to get the value.
+    # During Rstudio completion, return a dummy/rstudio value instead of computing the real one.
     .v <- as.character(utils::methods("nmObjGet"))
     .cls <- .arg
     .method <- paste0("nmObjGet.", .cls)
     if (.method %in% .v) {
-      # If there is a rstudio value in the method, assume that is what you
-      # wish to return for the rstudio auto-completion method
+      # Use the rstudio attr as the auto-completion return value, if present
       .rstudio <- attr(utils::getS3method("nmObjGet", .cls), "rstudio")
       if (length(.rstudio) == 0) {
         return(list("calculated value"))
       } else if (is.na(.rstudio)) {
-        # If the rstudio value is NA, then we assume that it is a passthrough
-        # and we return the value the next method
+        # NA rstudio value means passthrough to the next method's return value
       } else {
         return(.rstudio)
       }
@@ -49,14 +43,37 @@ nmObjGet <- function(x, ...) {
 #' @export
 nmObjGet.iniUi <- function(x, ...) {
   .env <- x[[1]]
+  .iniDf0 <- get("iniDf0", envir=.env)
+  if (is.null(.iniDf0)) return(NULL)
+  ## When the estimation method changes the model STRUCTURE (e.g. est="vae"
+  ## covariate selection), the original model is stashed as a full ui in iniDf0;
+  ## return it directly. Otherwise iniDf0 is the original iniDf data.frame -- swap
+  ## it into the (structurally identical) final ui.
+  if (!is.data.frame(.iniDf0)) {
+    .ui <- rxode2::rxUiDecompress(.iniDf0)
+    return(if (nlmixr2global$finalUiCompressed) rxode2::rxUiCompress(.ui) else .ui)
+  }
   .ui <- .cloneEnv(rxode2::rxUiDecompress(get("ui", .env)))
-  .iniDf <- get("iniDf0", envir=.env)
-  if (is.null(.iniDf)) return(NULL)
-  assign("iniDf", .iniDf, envir=.ui)
+  assign("iniDf", .iniDf0, envir=.ui)
   rxode2::rxUiCompress(.ui)
 }
 attr(nmObjGet.iniUi, "desc") <- "The initial ui used to run the model"
 attr(nmObjGet.iniUi, "rstudio") <- emptyenv()
+
+#' @export
+nmObjGet.uiIni <- nmObjGet.iniUi
+
+#' @export
+nmObjGet.iniDf0 <- function(x, ...) {
+  .env <- x[[1]]
+  .iniDf0 <- get("iniDf0", envir=.env)
+  if (is.null(.iniDf0)) return(NULL)
+  ## a ui (structure changed) -> the original model's iniDf; else the data.frame
+  if (!is.data.frame(.iniDf0)) return(rxode2::rxUiDecompress(.iniDf0)$iniDf)
+  .iniDf0
+}
+attr(nmObjGet.iniDf0, "desc") <- "The initial estimate data frame of the original model"
+attr(nmObjGet.iniDf0, "rstudio") <- emptyenv()
 
 #' Set if the nlmixr2 object will return a compressed ui
 #'
@@ -117,23 +134,17 @@ nmObjGetData <- function(x, ...) {
     stop("'x' is wrong type for 'nmObjGetData'", call.=FALSE)
   }
   if (.rstudioComplete()) {
-    # If Rstudio is running completion, then we need to simply
-    # return a dummy object so it doesn't calculate the value.
-    #
-    # However, if the object actually exists, then use the rxUiGet.default method
-    # to get the value.
+    # During Rstudio completion, return a dummy/rstudio value instead of computing the real one.
     .v <- as.character(utils::methods("nmObjGetData"))
     .cls <- class(x)[1]
     .method <- paste0("nmObjGetData.", .cls)
     if (.method %in% .v) {
-      # If there is a rstudio value in the method, assume that is what you
-      # wish to return for the rstudio auto-completion method
+      # Use the rstudio attr as the auto-completion return value, if present
       .rstudio <- attr(utils::getS3method("nmObjGetData", .cls), "rstudio")
       if (length(.rstudio) == 0) {
         return(list("calculated value"))
       } else if (is.na(.rstudio)) {
-        # If the rstudio value is NA, then we assume that it is a passthrough
-        # and we return the value the next method
+        # NA rstudio value means passthrough to the next method's return value
       } else {
         return(.rstudio)
       }
@@ -204,50 +215,11 @@ nmObjGet.default <- function(x, ...) {
     .ret <- get(.arg, envir = .env)
     if (inherits(.ret, "raw")) {
       .type <- rxode2::rxGetSerialType_(.ret)
-      if (.type == "qs2") {
-        .ret <- try(qs2::qs_deserialize(.ret), silent=TRUE)
-        if (inherits(.ret, "try-error")) {
-          warning("cannot deserialize object '", .arg, "' (qs2)", call.=FALSE)
-          .ret <- NULL
-        }
-      } else if (.type == "qdata") {
-        .ret <- try({
-          rxode2::rxReq("qs2")
-          qs2::qd_deserialize(.ret)
-        })
-        if (inherits(.ret, "try-error")) {
-          warning("cannot deserialize object '", .arg, "' (qdata)", call.=FALSE)
-          .ret <- NULL
-        }
-      } else if (.type == "qs") {
-        .ret <- try(rxode2::rxOldQsDes(.ret), silent=TRUE)
-        if (inherits(.ret, "try-error")) {
-          .ret <- try({
-            rxode2::rxOldQsDes(get(.arg, envir = .env))
-          })
-          if (inherits(.ret, "try-error")) {
-            warning("cannot deserialize object '", .arg, "' (qs)", call.=FALSE)
-            .ret <- NULL
-          }
-        }
-      } else if (.type == "xz") {
-        .ret <- try(unserialize(memDecompress(.ret, type="xz")), silent=TRUE)
-        if (inherits(.ret, "try-error")) {
-          warning("cannot deserialize object '", .arg, "' (xz)", call.=FALSE)
-          .ret <- NULL
-        }
-      } else if (.type == "bzip2") {
-        .ret <- try(unserialize(memDecompress(.ret, type="bzip2")), silent=TRUE)
-        if (inherits(.ret, "try-error")) {
-          warning("cannot deserialize object '", .arg, "' (bzip2)", call.=FALSE)
-          .ret <- NULL
-        }
-      } else if (.type == "base") {
-        .ret <- try(unserialize(.ret), silent=TRUE)
-        if (inherits(.ret, "try-error")) {
-          warning("cannot deserialize object '", .arg, "' (base)", call.=FALSE)
-          .ret <- NULL
-        }
+      .ret <- try(.deserializeRaw(.ret, .type), silent=TRUE)
+      if (inherits(.ret, "try-error")) {
+        warning("cannot deserialize object '", .arg, "' (", .type, ")",
+                call.=FALSE)
+        .ret <- NULL
       }
     }
     return(.ret)
@@ -299,7 +271,7 @@ attr(nmObjGet.cor, "rstudio") <- lotri::lotri(a+b~c(1, 0.1, 1))
     .cor <- .cov
   } else {
     .w <- which(diag(.cov) != 0)
-    .cor2 <- stats::cov2cor(.cov[.w, .w])
+    .cor2 <- stats::cov2cor(.cov[.w, .w, drop = FALSE])
     .d <- dim(.cov)[1]
     .cor <- matrix(rep(NA, .d^2), .d, .d)
     .cor[.w, .w] <- .cor2
@@ -373,8 +345,7 @@ nmObjGet.phiSE <- function(x, ...) {
     suppressWarnings(sqrt(diag(.cov)))
   }, double(.d1), USE.NAMES=FALSE)
   dim(.ret) <- c(.d1, length(.phi))
-  dimnames(.ret) <- list(colnames(.phi[[1]]), names(.phi))
-  names(.ret) <- paste0("se(", names(.ret), ")")
+  dimnames(.ret) <- list(paste0("se(", colnames(.phi[[1]]), ")"), names(.phi))
   .ret <- as.data.frame(t(.ret))
   .id <- seq_along(.phi)
   if (!is.null(names(.phi))) {
@@ -400,9 +371,8 @@ nmObjGet.phiRSE <- function(x, ...) {
     suppressWarnings(sqrt(diag(.cov))/unlist(.eta[i,, drop=FALSE])*100)
   }, double(.d1), USE.NAMES=FALSE)
   dim(.ret) <- c(.d1, length(.phi))
-  dimnames(.ret) <- list(colnames(.phi[[1]]), names(.phi))
+  dimnames(.ret) <- list(paste0("rse(", colnames(.phi[[1]]), ")%"), names(.phi))
   .ret <- as.data.frame(t(.ret))
-  names(.ret) <- paste0("rse(", names(.ret), ")%")
   .id <- seq_along(.phi)
   if (!is.null(names(.phi))) {
     .id <- names(.phi)
@@ -410,6 +380,41 @@ nmObjGet.phiRSE <- function(x, ...) {
   cbind(data.frame(ID=.id), .ret)
 }
 attr(nmObjGet.phiRSE, "desc") <- "relative standard error of each individual's eta (if present)"
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.phiCI <- function(x, ...) {
+  .obj <- x[[1]]
+  .phi <- .obj$phiC
+  if (is.null(.phi)) {
+    if (any(names(x[[1]]) !="CWRES")) warning("this requires 'CWRES' in fit (use `addCwres()`)", call.=FALSE)
+    return(NULL)
+  }
+  .ci <- rxode2::rxGetControl(.obj$ui, "ci", 0.95)
+  .qn <- stats::qnorm(1 - (1 - .ci) / 2)
+  .etaNames <- colnames(.phi[[1]])
+  .eta <- .obj$eta[, .etaNames, drop=FALSE]
+  .low <- (1 - .ci) / 2
+  .hi <- 1 - .low
+  .lowLab <- paste0(format(100 * .low, trim=TRUE, digits=3), "%")
+  .hiLab <- paste0(format(100 * .hi, trim=TRUE, digits=3), "%")
+  .ret <- lapply(seq_along(.phi), function(i) {
+    .cov <- .phi[[i]]
+    .se <- suppressWarnings(sqrt(diag(.cov)))
+    .est <- unlist(.eta[i, , drop=FALSE])
+    .row <- data.frame(t(as.vector(rbind(.est - .qn * .se, .est + .qn * .se))))
+    names(.row) <- as.vector(rbind(paste0(.etaNames, " (", .lowLab, ")"),
+                                   paste0(.etaNames, " (", .hiLab, ")")))
+    .row
+  })
+  .ret <- do.call(rbind, .ret)
+  .id <- seq_along(.phi)
+  if (!is.null(names(.phi))) {
+    .id <- names(.phi)
+  }
+  cbind(data.frame(ID=.id), .ret)
+}
+attr(nmObjGet.phiCI, "desc") <- "confidence interval of each individual's eta (if present)"
 
 
 
@@ -742,7 +747,11 @@ nmObjGet.saemEvtDf <- function(x, ...) {
   .obj <- x[[1]]
   .evt <- nmObjGet.dataSav(x, ...)
   .evt$ID <- .evt$ID - 1
-  .evt
+  # Reproduce the fit's kernel event table: reset episodes are offset so
+  # within-subject solve times increase (issue #455).  Without this the
+  # saemDopred* diagnostics would solve a merged trajectory and disagree with
+  # the fit; a no-op unless the subject has overlapping-time reset episodes.
+  .saemMonotonicResetTime(.evt)
 }
 #attr(nmObjGet.saemEvtDf, "desc") <- "event data frame as seen by saem"
 
@@ -776,7 +785,6 @@ nmObjGet.saem <- function(x, ...) {
   if (!exists("saem0", .obj)) return(NULL)
   .saem <- .obj$saem0
   .saemCfg <- attr(.saem, "saem.cfg")
-  .saemCfg$evtM <- .obj$saemEvtM
   .saemCfg$evt <- .obj$saemEvt
   attr(.saem, "saem.cfg") <- .saemCfg
   .saem
@@ -1091,4 +1099,50 @@ nmObjGet.simulationModel <- function(x, ...) {
 nmObjGet.rxControl <- function(x, ...) {
   nmObjGetRxSolve(.createEstObject(x[[1]]), NULL)
 }
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.mixList <- function(x, ...) {
+  .obj <- x[[1]]
+  .env <- .obj$env
+  if (exists("mixList", envir=.env)) return(get("mixList", envir=.env))
+  NULL
+}
+attr(nmObjGet.mixList, "desc") <- "List of ETAs and posterior probabilities for each mixture component"
+attr(nmObjGet.mixList, "rstudio") <- list(mix1=data.frame(ID=1L, prob=0.8))
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.mixNum <- function(x, ...) {
+  .obj <- x[[1]]
+  .env <- .obj$env
+  if (exists("mixNum", envir=.env)) return(get("mixNum", envir=.env))
+  NULL
+}
+attr(nmObjGet.mixNum, "desc") <- "Data frame with ID and most likely mixture number per subject"
+attr(nmObjGet.mixNum, "rstudio") <- data.frame(ID=1L, mixnum=1L)
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.ranef <- function(x, ...) {
+  .env <- x[[1]]
+  if (!exists("ranef", envir=.env)) return(NULL)
+  .ret <- get("ranef", envir=.env)
+  if (is.null(.ret)) return(NULL)
+  if (exists("mixNum", envir=.env)) {
+    .mn <- get("mixNum", envir=.env)
+    if (!is.null(.mn) && "mixnum" %in% names(.mn)) {
+      .ret <- merge(.ret, .mn[, c("ID", "mixnum"), drop=FALSE],
+                    by="ID", all.x=TRUE, sort=FALSE)
+    }
+  }
+  .ret
+}
+attr(nmObjGet.ranef, "desc") <- "Individual random effects (ETAs); includes mixnum column for mixture models"
+
+#' @rdname nmObjGet
+#' @export
+nmObjGet.eta <- nmObjGet.ranef
+attr(nmObjGet.eta, "desc") <- attr(nmObjGet.ranef, "desc")
+
 attr(nmObjGet.rxControl, "desc") <- "rxode2 solving options"

@@ -52,11 +52,9 @@ and optimal forward difference interval}
 \item{gillRtol}{The relative tolerance used for Gill 1983
 determination of optimal step size.}
 
-\item{gillK}{The total number of possible steps to determine the
-optimal forward/central difference step size per parameter (by
-the Gill 1983 method).  If 0, no optimal step size is
-determined.  Otherwise this is the optimal step size
-determined.}
+\item{gillK}{Max steps to determine the optimal forward/central
+difference step size per parameter (Gill 1983). `0` = no optimal
+step size determined.}
 
 \item{gillStep}{When looking for the optimal forward difference
 step size, this is This is the step size to increase the
@@ -66,15 +64,16 @@ initial estimate by.  So each iteration the new step size =
 \item{gillFtol}{The gillFtol is the gradient error tolerance that
 is acceptable before issuing a warning/error about the gradient estimates.}
 
-\item{useColor}{Boolean indicating if focei can use ASCII color codes}
+\item{useColor}{Logical (or `NULL`) emit ANSI bold/color escapes in the
+iteration print. `NULL` (default) defers to [crayon::has_color()].}
 
-\item{printNcol}{Number of columns to printout before wrapping
-parameter estimates/gradient}
+\item{printNcol}{Integer (or `NULL`) parameter columns per row before
+wrapping. `NULL` (default) uses `floor((getOption("width") - 23) / 12)`.}
 
-\item{print}{Integer representing when the outer step is
-printed. When this is 0 or do not print the iterations.  1 is
-print every function evaluation (default), 5 is print every 5
-evaluations.}
+\item{print}{Either a scalar print-frequency (`0` = suppress, `1`
+(default) = every evaluation, `N` = every Nth), OR a pre-built
+[iterPrintControl()] object. Equivalent to
+`iterPrintControl(every = print, ncol = printNcol, useColor = useColor)`.}
 }
 \value{
 A list with `eval`, `grad`, `hist` and `unscaled`

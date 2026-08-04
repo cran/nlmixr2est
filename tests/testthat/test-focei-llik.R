@@ -25,7 +25,13 @@ if (rxode2hasLlik()) {
         })
       }
 
-      f <- .nlmixr(one.cmt, theo_sd, "focei")
+      # The assertions below only check that the ll() parameterization
+      # reproduces this fit's objective/etas (the ll fits are fed theta1/
+      # omega1/etaMat1 and evaluated at maxOuterIterations=0).  That
+      # equivalence holds at any reference point, so there is no need to
+      # optimize to convergence here -- cap the outer iterations for speed.
+      f <- .nlmixr(one.cmt, theo_sd, "focei",
+                   control=foceiControl(maxOuterIterations=0L))
       expect_true("CWRES" %in% names(f))
 
       of1     <- f$objf
@@ -34,7 +40,8 @@ if (rxode2hasLlik()) {
       omega1  <- f$omega
       etaO1   <- f$etaObf
 
-      f <- .nlmixr(one.cmt, theo_sd, "foce")
+      f <- .nlmixr(one.cmt, theo_sd, "foce",
+                   control=foceiControl(maxOuterIterations=0L))
       expect_true("CWRES" %in% names(f))
 
       of2 <- f$objf
@@ -86,7 +93,9 @@ if (rxode2hasLlik()) {
       expect_equal(f$ll, f$IPRED)
       expect_false("CWRES" %in% names(f))
 
-      expect_equal(f$objf, of1)
+      # the inner FD steps are re-searched at the reported etas, so an optimized
+      # fit and a maxInnerIterations=0 evaluation at its etas agree to solver noise
+      expect_equal(f$objf, of1, tolerance=1e-6)
 
       one.cmt.ll |>
         ini(theta2) |>
@@ -100,7 +109,7 @@ if (rxode2hasLlik()) {
       expect_false(inherits(f, "try-error"))
       expect_equal(f$ll, f$IPRED)
       expect_false("CWRES" %in% names(f))
-      expect_equal(f$objf, of2)
+      expect_equal(f$objf, of2, tolerance=1e-6)
 
       # no etas test
       one.cmt.noeta <- function() {
@@ -122,7 +131,8 @@ if (rxode2hasLlik()) {
         })
       }
 
-      f <- .nlmixr(one.cmt.noeta, theo_sd, "focei")
+      f <- .nlmixr(one.cmt.noeta, theo_sd, "focei",
+                   control=foceiControl(maxOuterIterations=0L))
 
       of1 <-f$objf
       theta1 <- f$theta
@@ -364,7 +374,21 @@ if (rxode2hasLlik()) {
 
 
     test_that("objective values are equal for mixed ll", {
-      expect_equal(f2$objf, of1)
+      # a mixed Gaussian + ll() model and the equivalent all-Gaussian model are the
+      # same likelihood, so at the same thetas/etas the objectives are identical
+      expect_equal(f2$objf, of1, tolerance=1e-6)
+    })
+
+    test_that("the objective does not depend on how the etas were reached", {
+      # same model, same thetas, same etas -- one optimized its way there, the
+      # other was handed the answer.  The inner FD steps are re-searched at the
+      # reported etas, so these must agree.
+      fPin <- .nlmixr(pk.turnover.emax3.n1, nlmixr2data::warfarin, "focei",
+                      control=foceiControl(covMethod = "", etaMat = etaMat1,
+                                           maxInnerIterations = 0,
+                                           maxOuterIterations = 0))
+      expect_equal(as.matrix(fPin$eta[, -1]), etaMat1, tolerance = 1e-10)
+      expect_equal(fPin$objf, of1, tolerance = 1e-6)
     })
 
     fll <- addNpde(f2)

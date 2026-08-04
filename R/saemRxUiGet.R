@@ -60,7 +60,7 @@ attr(rxUiGet.saemCovars, "rstudio") <- "char"
 
 #' @export
 rxUiGet.saemFunctionModPredQuote <- function(x, ...) {
-  .mod <- rxode2::rxode2(rxUiGet.saemModel(x, ...))
+  .mod <- .nlmixr2estRxode2(rxUiGet.saemModel(x, ...), "rxSaem")
   .fnPred <- bquote(function(a, b, c) {
     rxode2::rxLoad(.(.mod))
     rxode2::rxLock(.(.mod))
@@ -136,6 +136,9 @@ rxUiGet.saemFixed <- function(x, ...) {
   .dft <- .df[!is.na(.df$ntheta), ]
   .fixError <- .dft[!is.na(.dft$err), ]
   .dft <- .dft[is.na(.dft$err), ]
+  if (length(.ui$mixProbs) > 0) {
+    .dft <- .dft[!(.dft$name %in%.ui$mixProbs), ]
+  }
   .dft <- setNames(.dft$fix, paste(.dft$name))
   .cov <- rxUiGet.saemMuRefCovariateDataFrame(x, ...)
   if (length(.cov$theta) > 0) {
@@ -215,6 +218,67 @@ rxUiGet.saemOmegaTrans <- function(x, ...) {
 }
 #attr(rxUiGet.saemOmegaTrans, "desc") <- "Get the saem omega to UI omega translation"
 attr(rxUiGet.saemOmegaTrans, "rstudio") <- c(1L, 3L)
+
+
+#' @export
+rxUiGet.saemOmegaShare <- function(x, ...) {
+  .ui <- x[[1]]
+  .etaNames <- rxUiGet.saemEtaNames(x, ...)
+  .ret <- rep(0L, length(.etaNames))
+  if (length(.ui$mixProbs) == 0L) return(.ret)
+  
+  .allEtas <- .ui$iniDf[!is.na(.ui$iniDf$neta1), ]
+  .allEtas <- .allEtas[.allEtas$neta1 == .allEtas$neta2, "name"]
+
+  .mixCalls <- do.call(c, lapply(.ui$lstExpr, .findMixCalls))
+  if (length(.mixCalls) == 0L) return(.ret)
+
+  .groupId <- 1L
+  for (.mc in .mixCalls) {
+    .args <- as.list(.mc)[-1]
+    .comps <- .args[seq(1, length(.args), by = 2)]
+    .grpEtas <- unique(unlist(lapply(.comps, .extractEtas, etas = .allEtas)))
+    if (length(.grpEtas) > 1L) {
+      for (.eta in .grpEtas) {
+        .w <- which(.eta == .etaNames)
+        if (length(.w) == 1L) {
+          .ret[.w] <- .groupId
+        }
+      }
+      .groupId <- .groupId + 1L
+    }
+  }
+  .ret
+}
+
+#' @export
+rxUiGet.saemOmegaShareSubpop <- function(x, ...) {
+  .ui <- x[[1]]
+  .etaNames <- rxUiGet.saemEtaNames(x, ...)
+  .ret <- rep(0L, length(.etaNames))
+  if (length(.ui$mixProbs) == 0L) return(.ret)
+  
+  .allEtas <- .ui$iniDf[!is.na(.ui$iniDf$neta1), ]
+  .allEtas <- .allEtas[.allEtas$neta1 == .allEtas$neta2, "name"]
+
+  .mixCalls <- do.call(c, lapply(.ui$lstExpr, .findMixCalls))
+  if (length(.mixCalls) == 0L) return(.ret)
+
+  for (.mc in .mixCalls) {
+    .args <- as.list(.mc)[-1]
+    .comps <- .args[seq(1, length(.args), by = 2)]
+    for (.j in seq_along(.comps)) {
+      .grpEtas <- .extractEtas(.comps[[.j]], etas = .allEtas)
+      for (.eta in .grpEtas) {
+        .w <- which(.eta == .etaNames)
+        if (length(.w) == 1L) {
+          .ret[.w] <- .j
+        }
+      }
+    }
+  }
+  .ret
+}
 
 
 #' @export
@@ -309,6 +373,9 @@ rxUiGet.saemResMod <- function(x, ...) {
   .predDf <- .ui$predDf
   vapply(seq_along(.predDf$errType),
          function(i) {
+           # general log-likelihood endpoint (ll() ~ expr): no residual error
+           # parameter -- the inner supplies the likelihood (distribution=4 path)
+           if (.predDf$distribution[i] == "LL") return(0L)
            .errType <- as.integer(.predDf$errType[i])
            .hasLambda <- .predDf$transform[i] %in% c("boxCox", "yeoJohnson",
                                                      "logit + yeoJohnson",
@@ -326,9 +393,45 @@ rxUiGet.saemResMod <- function(x, ...) {
 attr(rxUiGet.saemResMod, "rstudio") <- c(1L, 2L)
 
 #' @export
+rxUiGet.saemArActive <- function(x, ...) {
+  .ui <- x[[1]]
+  .predDf <- .ui$predDf
+  .iniDf <- .ui$iniDf
+  # Some rxode2 versions omit the predDf `ar` column entirely, expressing AR
+  # only through iniDf (err == "ar"); index it only when it is actually present
+  # for this condition, otherwise fall back to iniDf.
+  .ar <- .predDf$ar
+  vapply(seq_along(.predDf$cond), function(i) {
+    if (length(.ar) >= i && !is.na(.ar[i])) return(1L)
+    if (isTRUE(any(.iniDf$err == "ar" & .iniDf$condition == .predDf$cond[i]))) return(1L)
+    0L
+  }, integer(1), USE.NAMES=FALSE)
+}
+attr(rxUiGet.saemArActive, "rstudio") <- 0L
+
+#' @export
+rxUiGet.saemArCor <- function(x, ...) {
+  .ui <- x[[1]]
+  .predDf <- .ui$predDf
+  .iniDf <- .ui$iniDf
+  .ar <- .predDf$ar
+  vapply(seq_along(.predDf$cond), function(i) {
+    if (length(.ar) >= i && !is.na(.ar[i])) {
+      .v <- suppressWarnings(as.numeric(.ar[i]))
+      if (!is.na(.v)) return(.v)
+    }
+    .w <- which(.iniDf$err == "ar" & .iniDf$condition == .predDf$cond[i])
+    if (length(.w) == 1L) return(.iniDf$est[.w])
+    0.0
+  }, numeric(1), USE.NAMES=FALSE)
+}
+attr(rxUiGet.saemArCor, "rstudio") <- 0.0
+
+#' @export
 rxUiGet.saemModNumEst <- function(x, ...) {
   .resMod <- rxUiGet.saemResMod(x, ...)
   vapply(.resMod, function(i) {
+    if (i == 0L) return(0L) # general log-likelihood endpoint: no residual params
     switch(i,
            1L, # add = 1
            1L, # prop = 2
@@ -520,14 +623,74 @@ rxUiGet.saemParHistEtaNames <- function(x, ...) {
 #attr(rxUiGet.saemParHistEtaNames, "desc") <- "Get the parameter history eta names"
 attr(rxUiGet.saemParHistEtaNames, "rstudio") <- "V(ka)"
 
+#' Off-diagonal Omega covariances recorded in the SAEM iteration history
+#'
+#' Returns the estimated (non-fixed) off-diagonal Omega elements, mapped to the eta
+#' order used by `Gamma2_phi1` (0-indexed row/col pairs for the C++ layer), and their
+#' `cov.<eta>.<eta>` names (matching the covariance-matrix naming).
+#' @return list(pairs = integer matrix (row, col), names = character)
+#' @noRd
+#' @export
+rxUiGet.saemParHistOmegaOffInfo <- function(x, ...) {
+  .ui <- x[[1]]
+  .idf <- .ui$iniDf
+  .etaN <- rxUiGet.saemEtaNames(x, ...)                 # phi1 / Gamma2_phi1 order
+  .diag <- .idf[!is.na(.idf$neta1) & .idf$neta1 == .idf$neta2, , drop = FALSE]
+  .num2name <- stats::setNames(.diag$name, .diag$neta1)
+  .off <- .idf[!is.na(.idf$neta1) & .idf$neta1 != .idf$neta2 & !.idf$fix, , drop = FALSE]
+  if (nrow(.off) == 0L) {
+    return(list(pairs = matrix(integer(0), ncol = 2L), names = character(0)))
+  }
+  .pi <- match(.num2name[as.character(.off$neta1)], .etaN)
+  .pj <- match(.num2name[as.character(.off$neta2)], .etaN)
+  .hi <- pmax(.pi, .pj); .lo <- pmin(.pi, .pj)
+  .ord <- order(.hi, .lo)
+  .hi <- .hi[.ord]; .lo <- .lo[.ord]
+  list(pairs = cbind(.hi - 1L, .lo - 1L),
+       names = paste0("cov.", .etaN[.hi], ".", .etaN[.lo]))
+}
+attr(rxUiGet.saemParHistOmegaOffInfo, "rstudio") <- "off-diagonal omega history"
+
 #' @export
 rxUiGet.saemParHistNames <- function(x, ...) {
   #join_cols(join_cols(Plambda, Gamma2_phi1.diag()), vcsig2).t();
   .plambda <- rxUiGet.saemParamsToEstimate(x, ...)
   .plambda <- .plambda[!rxUiGet.saemFixed(x, ...)]
-  c(.plambda, rxUiGet.saemParHistEtaNames(x, ...), rxUiGet.saemParHistResNames(x, ...))
+  .ui <- x[[1]]
+  c(.plambda, rxUiGet.saemParHistEtaNames(x, ...),
+    rxUiGet.saemParHistOmegaOffInfo(x, ...)$names,
+    rxUiGet.saemParHistResNames(x, ...), .ui$mixProbs)
 }
 attr(rxUiGet.saemParHistNames, "rstudio") <- c("ka", "add.sd")
+
+#' @export
+rxUiGet.saemMixProb <- function(x, ...) {
+  .ui <- x[[1]]
+  if (length(.ui$mixProbs) > 0) {
+    .probs <- .ui$theta[.ui$mixProbs]
+    # Defense-in-depth: upstream checks (rxode2::mix(), rxUiGet.thetaIniMix)
+    # don't catch an individually out-of-range probability whose sum still
+    # looks valid, so re-validate before deriving the implicit last component.
+    if (any(.probs < 0) || any(.probs > 1) || sum(.probs) > 1) {
+      stop("initial mixture probabilities must each be in [0, 1] and sum to no more than 1 (got: ",
+           paste(signif(.probs, 3), collapse = ", "), ")", call. = FALSE)
+    }
+    # To get the full simplex, we append 1 - sum(probs)
+    return(c(.probs, 1.0 - sum(.probs)))
+  } else {
+    return(numeric(0))
+  }
+}
+
+#' @export
+rxUiGet.saemNMix <- function(x, ...) {
+  .ui <- x[[1]]
+  if (length(.ui$mixProbs) > 0) {
+    return(length(.ui$mixProbs) + 1L)
+  } else {
+    return(1L)
+  }
+}
 
 #' @export
 rxUiGet.saemAres <- function(x, ...) {
@@ -648,6 +811,8 @@ rxUiGet.saemModelList <- function(x, ...) {
     .mod$covars <- .covars
   }
   .mod$res.mod <- rxUiGet.saemResMod(x, ...)
+  .mod$arActive <- rxUiGet.saemArActive(x, ...)
+  .mod$arCor <- rxUiGet.saemArCor(x, ...)
   .mod$log.eta <- rxUiGet.saemLogEta(x, ...)
   .mod$ares    <- rxUiGet.saemAres(x, ...)
   .mod$bres    <- rxUiGet.saemBres(x, ...)
@@ -666,6 +831,9 @@ rxUiGet.saemInitTheta <- function(x, ...) {
                    .iniDf[!is.na(.iniDf$ntheta) & is.na(.iniDf$err), "name"])
   .cov <- rxUiGet.saemMuRefCovariateDataFrame(x, ...)
   .est <- .est[!(names(.est) %in% .cov$covariateParameter)]
+  if (length(.ui$mixProbs) > 0) {
+    .est <- .est[!(names(.est) %in% .ui$mixProbs)]
+  }
   .etaNames <- .iniDf[is.na(.iniDf$ntheta), ]
   .etaNames <- .iniDf[.iniDf$neta1 == .iniDf$neta2, "name"]
   .fixed <- rxUiGet.saemFixed(x, ...)
@@ -677,17 +845,18 @@ rxUiGet.saemInitTheta <- function(x, ...) {
   .ret <- vapply(seq_along(.logEta),
                    function(i) {
                     .isEta <- any(.names[i] %in% .etaNames)
+                    .curName <- .names[i]
                     if (.logEta[i]) {
                       if (.isEta) {
                         return(1)
                       } else {
-                        return(exp(.est[i]))
+                        return(exp(.est[.curName]))
                       }
                     } else {
                       if (.isEta) {
                         return(0)
                       } else {
-                        return(.est[i])
+                        return(.est[.curName])
                       }
                     }
                   }, numeric(1), USE.NAMES=FALSE)

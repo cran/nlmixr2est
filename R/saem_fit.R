@@ -17,6 +17,70 @@
 ## You should have received a copy of the GNU General Public License
 ## along with nlmixr2.  If not, see <http://www.gnu.org/licenses/>.
 
+#' Make within-subject solve times strictly increasing across reset episodes
+#'
+#' The SAEM kernel integrates each subject's records in the ODE solver's internal
+#' time-sorted order.  A subject encoded with overlapping-time reset episodes -- for
+#' example a crossover where an IV arm and a depot arm share the same clock times and
+#' are separated by an `evid=4` reset -- then has its reset record relocated ahead of
+#' the first episode's observations by the time-sort, collapsing the two episodes into
+#' a single merged trajectory (nlmixr2/nlmixr2est#455).  rxode2's `rxSolve()` keeps the
+#' episodes separate because it processes records in input order.
+#'
+#' Offset each reset episode as a block so the solve times become strictly increasing
+#' within a subject; the kernel's time-sort then matches the input order.  Predictions
+#' are unchanged: a reset zeroes the system, so only time-since-reset matters and that
+#' is preserved when an episode's dose and observations are shifted together.  For data
+#' that is already monotonic within subject (including monotonic-time resets) this is a
+#' no-op.
+#'
+#' `dat` is the post-`etTrans` event table (columns ID, TIME, EVID, ...); `evid==3`
+#' marks the reset that starts a new episode.  Columns are resolved by name
+#' (case-insensitive) so this works both on the kernel event table built in
+#' `.configsaem` and on the `dataSav`-derived table used by the `saemDopred*`
+#' diagnostics; positions 1/2/3 are the fallback.
+#' @param dat post-etTrans event data.frame with ID, TIME and EVID columns
+#' @return `dat` with its TIME column offset so each subject's times increase monotonically
+#' @noRd
+.saemMonotonicResetTime <- function(dat) {
+  .nm <- toupper(names(dat))
+  .idCol <- which(.nm == "ID")[1L]; if (is.na(.idCol)) .idCol <- 1L
+  .timeCol <- which(.nm == "TIME")[1L]; if (is.na(.timeCol)) .timeCol <- 2L
+  .evidCol <- which(.nm == "EVID")[1L]; if (is.na(.evidCol)) .evidCol <- 3L
+  .id <- dat[[.idCol]]
+  .time <- dat[[.timeCol]]
+  .evid <- dat[[.evidCol]]
+  .n <- length(.time)
+  if (.n < 2L) return(dat)
+  # gap added past the running maximum when a reset would otherwise overlap; its
+  # value does not affect predictions (the reset zeroes the system) -- it only
+  # guarantees strict ordering regardless of the solver's sort stability.
+  .gap <- 1.0
+  .offset <- 0.0
+  .runMax <- -Inf
+  .prevId <- .id[1L]
+  .changed <- FALSE
+  for (.i in seq_len(.n)) {
+    if (!identical(.id[.i], .prevId)) {
+      .offset <- 0.0
+      .runMax <- -Inf
+      .prevId <- .id[.i]
+    }
+    # A reset (evid==3) whose current adjusted time would not advance past the
+    # running maximum starts an overlapping episode: shift it and the rest of the
+    # subject's records just past the running maximum.
+    if (.evid[.i] == 3 && .time[.i] + .offset <= .runMax) {
+      .offset <- .runMax + .gap - .time[.i]
+      .changed <- TRUE
+    }
+    .adj <- .time[.i] + .offset
+    if (.adj > .runMax) .runMax <- .adj
+    .time[.i] <- .adj
+  }
+  if (.changed) dat[[.timeCol]] <- .time
+  dat
+}
+
 #' Configure an SAEM model
 #'
 #' Configure an SAEM model by generating an input list to the SAEM model function
@@ -100,23 +164,32 @@
 .configsaem <- function(model, data, inits,
                        mcmc = list(niter = c(200, 300), nmc = 3, nu = c(2, 2, 2)),
                        rxControl = list(atol = 1e-6, rtol = 1e-4, method = "lsoda", maxeval = 100000),
-                       distribution = c("normal", "poisson", "binomial"),
+                       distribution = c("normal", "poisson", "binomial", "general"),
                        seed = 99, fixedOmega = NULL, fixedOmegaValues=NULL,
                        parHistThetaKeep=NULL,
                        parHistOmegaKeep=NULL,
+                       parHistOmegaOffPairs=matrix(integer(0), ncol=2L),
                        DEBUG = 0,
-                       tol = 1e-4, itmax = 100L, type = c("nelder-mead", "newuoa"),
+                       tol = 1e-4, itmax = 100L, type = c("newuoa", "nelder-mead"),
                        lambdaRange = 3, powRange = 10,
                        odeRecalcFactor=10^(0.5),
                        maxOdeRecalc=5L,
                        indTolRelax=TRUE,
+                       nSaCov=0L,
                        nres,
                        perSa=0.75,
                        perNoCor=0.75,
                        perFixOmega=0.5,
                        perFixResid=0.75,
                        resFixed,
-                       ue) {
+                       ue,
+                       mixProb = numeric(0),
+                       mixProbMethod = c("regress", "regularized", "annealed"),
+                       mixProbStepExp = 1,
+                       mixProbPriorN = 20,
+                       mixSampleMethod = c("parallel", "msaem"),
+                       omegaShare = integer(0),
+                       omegaShareSubpop = integer(0)) {
   if (is.null(fixedOmega)) stop("requires fixedOmega", call.=FALSE)
   if (is.null(fixedOmegaValues)) stop("requires fixedOmegaValues", call.=FALSE)
   if (is.null(parHistThetaKeep)) stop("requires parHistThetaKeep", call.=FALSE)
@@ -131,8 +204,10 @@
   }
   rxControl <- do.call(rxode2::rxControl, rxControl)
   rxControl$envir <- .env
-  set.seed(seed)
-  distribution.idx <- c("normal" = 1, "poisson" = 2, "binomial" = 3)
+  # All of saem's RNG now draws from the rxode2 threefry engine (the do_mcmc
+  # proposals via setSeedEng1 streams, the phiM init via rxnorm), which the
+  # rxWithSeed() wrapper in .saemFitModel seeds and restores -- no set.seed needed.
+  distribution.idx <- c("normal" = 1, "poisson" = 2, "binomial" = 3, "general" = 4)
   distribution <- match.arg(distribution)
   distribution <- distribution.idx[distribution]
   .data <- data
@@ -208,14 +283,13 @@
     stop(msg)
   }
   s <- subset(data$nmdat, EVID == 0)
-  data$data <- as.matrix(s[, c("ID", "TIME", "DV", c(model$covars, inPars))])
+  # a general-likelihood model lists DV in inPars; DV is already included, so keep
+  # the column set unique to avoid a duplicated DV column (which would make the
+  # observation vector data$data[, "DV"] a matrix).
+  data$data <- as.matrix(s[, unique(c("ID", "TIME", "DV", model$covars, inPars))])
 
-  ###  chk for no obs records
-  wh <- setdiff(unique(data$nmdat$ID), unique(data$data[, "ID"]))
-  if (length(wh)) {
-    msg <- paste0("No data with ID: ", paste(wh, collapse = ", "))
-    stop(msg)
-  }
+  # Subjects without an observation are now dropped upstream, so the previous
+  # "No data with ID" guard here is unreachable and has been removed.
 
   nphi <- model$N.eta
   mcov <- model$cov.mod
@@ -272,7 +346,7 @@
   if (is.null(model$covars)) {
     covariables <- NULL
   } else {
-    covariables <- unlist(stats::aggregate(.as.data.frame(data$data[, model$covars, drop = FALSE]),
+    covariables <- unlist(stats::aggregate(as.data.frame(data$data[, model$covars, drop = FALSE]),
                                            list(id),
                                            unique)[, -1, drop = FALSE])
   }
@@ -293,20 +367,9 @@
   ncov <- data$N.covar + 1
   nmc <- mcmc$nmc
   nM <- mcmc$nmc * N
-  yM <- rep(y, nmc)
   mlen <- max(nb_measures)
   io <- t(sapply(nb_measures, function(x) rep(1:0, c(x, mlen - x))))
-  ix <- rep(1:dim(io)[1], nmc)
-  ioM <- io[ix, ]
-  indioM <- grep(1, t(ioM)) - 1
-  ## mPars <- if (ninputpars == 0) NULL else unlist(stats::aggregate(.as.data.frame(data$data[, inPars]), list(id), unique)[, -1])
-  ## if (!is.null(mPars)) {
-  ##   dim(mPars) <- c(N, ninputpars)
-  ##   opt$mPars <- mPars
-  ##   ix <- rep(1:dim(mPars)[1], nmc)
-  ##   optM$mPars <- mPars[ix, ]
-  ##   dim(optM$mPars) <- c(nmc * N, ninputpars)
-  ## }
+  indio <- grep(1, t(io)) - 1
 
   if (is.null(data$nmdat$CMT)) data$nmdat$CMT <- 1 ## CHECKME
   if (any(is.na(data$nmdat$CMT))) {
@@ -320,6 +383,9 @@
                          ssAtDoseTime = rxControl$ssAtDoseTime)
   .nobs <- attr(class(dat), ".rxode2.lst")$nobs
   dat <- as.data.frame(dat) # convert back evid=3 oddness...
+  # Keep overlapping-time reset episodes (e.g. combined IV + depot crossover with
+  # evid=4) from being collapsed by the kernel's time-sorted solve (issue #455).
+  dat <- .saemMonotonicResetTime(dat)
   ## if(length(dat) !=7) stop("SAEM doesn't support time varying covariates yet.");
   .rx <- attr(model$saem_mod, "rx")
   .pars <- .rx$params
@@ -328,19 +394,32 @@
   opt$.rx <- .rx
   opt$.pars <- .pars
   ## opt$.dat <- dat;
-  dat <- .as.data.frame(dat[, -6])
+  # normally drop 'dv' by name (the kernel gets observations separately as 'y').
+  # A general log-likelihood model, though, references DV in its rx_pred_ (the ll
+  # expression), so DV must be kept as a solve input -- otherwise rxode2 reports
+  # "parameter(s) required for solving: DV".  Detect that from inPars (which lists
+  # DV for such a model) and keep the column, exposed to the solve as "DV".
+  .dvCol <- which(tolower(names(dat)) == "dv")
+  if (length(.dvCol) != 1L || .dvCol != 6L) {
+    stop("internal error: unexpected etTrans column layout in .configsaem (expected 'dv' as column 6)",
+         call. = FALSE)
+  }
+  .dvIsInput <- any(toupper(inPars) == "DV")
+  .dvVals <- if (.dvIsInput) dat[[.dvCol]] else NULL
+  dat <- as.data.frame(dat[, -.dvCol])
   names(dat) <- vapply(names(dat), function(n) {
     if (n %in% inPars) return(n)
     return(toupper(n))
   }, character(1), USE.NAMES = FALSE)
+  # general-likelihood models reference DV in the solve; append it as a named
+  # input at the END so the fixed ID/TIME/EVID/... column layout the kernel reads
+  # positionally is unchanged, while rxode2 still supplies DV to the model by name.
+  if (.dvIsInput) dat[["DV"]] <- .dvVals
 
   dat$ID <- as.integer(dat$ID)
 
   evt <- dat
   evt$ID <- evt$ID - 1
-  ## r
-  evtM <- evt[rep(1:dim(evt)[1], nmc), ]
-  evtM$ID <- cumsum(c(FALSE, diff(evtM$ID) != 0))
 
   # i1:
   i1 <- grep(1, diag(covstruct))
@@ -451,7 +530,10 @@
                           rep(1L, length(ue[, 1]))
                         }))
   dimnames(.ue) <- list(NULL, names(model$log.eta))
-  .mat2 <- matrix(rnorm(phiM), dim(phiM))
+
+  # threefry-engine draw (seeded by the rxWithSeed wrapper), so saem's RNG no
+  # longer depends on R's set.seed -- all deviates come from the rxode2 engine
+  .mat2 <- matrix(rxode2::rxnorm(n = length(phiM)), dim(phiM))
   .ue <- .ue[rep(1:N, nmc),, drop = FALSE] * 1.0
   .mat2 <- .mat2 * .ue
   phiM <- phiM + .mat2 %*% .tmp
@@ -490,7 +572,18 @@
     pas <- c(pas, 1 / ((k1 + 1):(k1 + vna[ia]))^va[ia])
   }
   pash <- c(rep(1, mcmc$burn.in), 1 / (1:niter))
+  # Decaying step-size schedule for the "annealed" mixProbMethod (see
+  # saemControl() docs); decays from iteration 1 instead of pas's
+  # full-replacement step throughout nBurn.
+  mixProbMethod <- match.arg(mixProbMethod)
+  pasMix <- 1 / (1:niter)^mixProbStepExp
+  mixSampleMethod <- match.arg(mixSampleMethod)
   minv <- rep(1e-20, nphi)
+  if (length(mixProb) > 1L) {
+    # Mixture fits: floor population-only phi0 params higher to keep
+    # covariance stable (mixture-weighted Gamma2_phi0 can be near-singular).
+    minv[i0] <- 1.0
+  }
 
   # preserve par order when printing iter history
   mcov[mcov == 1] <- 1:nlambda
@@ -512,6 +605,7 @@
     inits = inits.save,
     nu = mcmc$nu,
     niter = niter,
+    nPhase1 = vna[1],
     nb_sa = nb_sa,
     nb_correl = nb_correl,
     nb_fixOmega=nb_fixOmega,
@@ -523,16 +617,22 @@
     coef_sa = .95,
     pas = pas,
     pash = pash,
+    nSaCov = nSaCov,
+    pasMix = pasMix,
+    mixProbMethod = if (identical(mixProbMethod, "regularized")) 1L else 0L,
+    # resolved string form; the "regress" membership-as-regressor path
+    # dispatches on this (the integer above stays regularized/annealed only).
+    mixProbMethodStr = mixProbMethod,
+    mixProbPriorN = mixProbPriorN,
+    mixSampleMethod = if (identical(mixSampleMethod, "msaem")) 1L else 0L,
     minv = minv,
     N = N,
     ntotal = ntotal,
     y = y,
-    yM = yM,
     phiM = phiM,
     evt = as.matrix(evt),
-    evtM = as.matrix(evtM),
     mlen = mlen,
-    indioM = indioM,
+    indio = indio,
 
     pc1 = pc1,
     covstruct1 = covstruct1,
@@ -557,6 +657,8 @@
     Gamma2_phi1fixed=Gamma2_phi1fixed,
     Gamma2_phi1fixedIx=Gamma2_phi1fixedIx,
     Gamma2_phi1fixedValues=Gamma2_phi1fixedValues,
+    omegaShare = omegaShare,
+    omegaShareSubpop = omegaShareSubpop,
     mprior_phi0 = mprior_phi0,
     mprior_phi1 = mprior_phi1,
     jcov0 = jcov0,
@@ -574,10 +676,10 @@
     lres = inits$lres,
     opt = opt,
     optM = optM,
-    print = mcmc$print,
     distribution = distribution,
     parHistThetaKeep=parHistThetaKeep,
     parHistOmegaKeep=parHistOmegaKeep,
+    parHistOmegaOffPairs=parHistOmegaOffPairs,
     seed = seed,
     fixed.i1 = fixed.i1,
     fixed.i0 = fixed.i0,
@@ -591,18 +693,40 @@
   cfg$opt$cmt_endpnt <- cfg$optM$cmt_endpnt <- sort(unique(s))
   cfg$nendpnt <- length(unique(s))
   if (model$nendpnt != cfg$nendpnt) {
-    msg <- sprintf("mis-match in nbr endpoints in model & in data")
-    stop(msg)
+    msg <- paste0(
+      sprintf("mis-match in number of endpoints between the model (%d) and the data (%d)",
+              model$nendpnt, cfg$nendpnt),
+      sprintf("\nthe data has observations (EVID=0) in %d compartment(s): %s",
+              cfg$nendpnt, paste(cfg$opt$cmt_endpnt, collapse=", ")),
+      "\ncheck that the 'CMT'/'DVID' values in your dataset match the number of",
+      "\nendpoints (model error terms like 'cp ~ add(add.sd)') defined in your model")
+    stop(msg, call.=FALSE)
   }
   t <- unlist(split(1L:length(s), s))
-  cfg$ysM <- rep(cfg$y[t], cfg$nmc)
+  cfg$ys <- cfg$y[t]
   cfg$ix_sorting <- t - 1 # c-index for sorting by endpnt
   cfg$y_offset <- c(0, cumsum(table(s)))
-  s <- cfg$evtM[cfg$evtM[, "EVID"] == 0, "CMT"]
-  cfg$ix_endpnt <- as.integer(as.factor(s)) - 1 # to derive vecares & vecbres
-  s <- cfg$evtM[cfg$evtM[, "EVID"] == 0, "ID"]
-  t <- cumsum(c(0, table(s)))
-  cfg$ix_idM <- cbind(t[-length(t)], t[-1] - 1) # c-index of obs records of each subject
+  .s_cmt <- cfg$evt[cfg$evt[, "EVID"] == 0, "CMT"]
+  cfg$ix_endpnt <- as.integer(as.factor(.s_cmt)) - 1 # to derive vecares & vecbres (N-subject only)
+  .s_id <- cfg$evt[cfg$evt[, "EVID"] == 0, "ID"]
+  .obs_counts <- as.integer(table(.s_id)) # obs per subject in evt (N entries)
+  .t <- cumsum(c(0L, rep(.obs_counts, cfg$nmc))) # N*nmc + 1 entries
+  cfg$ix_idM <- cbind(.t[-length(.t)], .t[-1] - 1L) # c-index of obs records of each subject
+
+  # AR(1) autocorrelated residuals (continuous-time): for each observation (in
+  # the original 1-chain order the E-step uses) find the previous same-subject-
+  # same-endpoint observation (time order = record order for sorted data) and the
+  # time gap to it, so the whitened conditional likelihood can carry the previous
+  # residual.  arActive/arCor default off; the model sets them when it has ar()
+  # (currently gated off by the saem opt-out assert).
+  .arTime <- cfg$evt[cfg$evt[, "EVID"] == 0, "TIME"]
+  .arGrp <- paste0(.s_id, "_", cfg$ix_endpnt)
+  .arPos <- stats::ave(seq_along(.arGrp), .arGrp,
+                FUN = function(.v) c(NA_integer_, utils::head(.v, -1L))) # prev 1-based orig idx
+  cfg$arPrev <- ifelse(is.na(.arPos), -1L, .arPos - 1L)                  # 0-based, -1 = first
+  cfg$arDt <- ifelse(is.na(.arPos), 0, .arTime - .arTime[.arPos])
+  cfg$arActive <- as.integer(if (is.null(model$arActive)) rep(0L, cfg$nendpnt) else model$arActive)
+  cfg$arCor <- as.double(if (is.null(model$arCor)) rep(0, cfg$nendpnt) else model$arCor)
 
   cfg$ares <- rep(10, cfg$nendpnt)
   cfg$bres <- rep(1, cfg$nendpnt)
@@ -616,7 +740,11 @@
   cfg$ares[cfg$res.mod == 2] <- 0
   cfg$bres[cfg$res.mod == 1] <- 0
   cfg$res_offset <- cumsum(c(0L, nres))
-  cfg$par.hist <- matrix(0, cfg$niter, sum(parHistThetaKeep) + sum(parHistOmegaKeep) + sum(1L - resFixed))
+  nMix <- max(1L, length(mixProb))
+  cfg$nMix <- nMix
+  cfg$mixProb <- mixProb
+  cfg$par.hist <- matrix(0, cfg$niter, sum(parHistThetaKeep) + sum(parHistOmegaKeep) +
+                                        nrow(parHistOmegaOffPairs) + sum(1L - resFixed) + (nMix - 1L))
 
   cfg$DEBUG <- cfg$opt$DEBUG <- cfg$optM$DEBUG <- DEBUG
   cfg$phiMFile <- tempfile("phi-", rxode2::rxTempDir(), ".phi")

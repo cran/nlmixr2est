@@ -2,7 +2,7 @@
 #'
 #' The values supplied in the function call replace the defaults and
 #' a list with all possible arguments is returned.  The returned list
-#' is used as the ‘control’ argument to the ‘nlme’ function.
+#' is used as the `control` argument to the `nlme` function.
 #'
 #' @inheritParams nlme::nlmeControl
 #' @inheritParams nlme::nlme
@@ -11,6 +11,18 @@
 #'   of `random`, `fixed`, `sens`, the nlme object is returned
 #' @inheritParams foceiControl
 #' @inheritParams saemControl
+#' @param print Convenience alias for the shared nlmixr `print` control.
+#'   `nlme` prints progress through its own `verbose` option, so `print`
+#'   maps to it: `print=0` runs quietly (`verbose=FALSE`) and any positive
+#'   value is verbose (`verbose=TRUE`).  When `print` is not supplied an
+#'   explicit `verbose` is used as given.
+#' @param covMethod Covariance method: `"analytic"` (default) computes the
+#'   focei observed-information covariance at the converged nlme estimates
+#'   post-fit (falling back to the finite-difference `"r,s"` -> `"r"`/`"s"`
+#'   chain when out of analytic scope); `"r,s"`, `"r"`, `"s"` request the
+#'   finite-difference forms directly; `"nlme"` and `""` skip the recompute
+#'   and keep nlme's own standard errors.  When the recompute fails the
+#'   `"nlme"` covariance is kept.
 #' @return a nlmixr-nlme list
 #' @examples
 #' nlmeControl()
@@ -18,7 +30,7 @@
 #' @family Estimation control
 #' @export
 nlmixr2NlmeControl <- function(maxIter = 100, pnlsMaxIter = 100, msMaxIter = 100, minScale = 0.001,
-    tolerance = 1e-05, niterEM = 25, pnlsTol = 0.001, msTol = 1e-06,
+    tolerance = NULL, niterEM = 25, pnlsTol = NULL, msTol = NULL,
     returnObject = FALSE, msVerbose = FALSE, msWarnNoConv = TRUE,
     gradHess = TRUE, apVar = TRUE, .relStep = .Machine$double.eps^(1/3),
     minAbsParApVar = 0.05, opt = c("nlminb", "nlm"), natural = TRUE,
@@ -27,7 +39,9 @@ nlmixr2NlmeControl <- function(maxIter = 100, pnlsMaxIter = 100, msMaxIter = 100
     method=c("ML", "REML"),
     random=NULL, fixed=NULL, weights=NULL, verbose=TRUE, returnNlme=FALSE,
     addProp = c("combined2", "combined1"), calcTables=TRUE, compress=TRUE,
-    adjObf=TRUE, ci=0.95, sigdig=4, sigdigTable=NULL, muRefCovAlg=TRUE, ...) {
+    adjObf=TRUE, ci=0.95, sigdig=3, sigdigTable=NULL, muRefCovAlg=TRUE,
+    eventSens=c("jump", "fd"), print=NULL,
+    covMethod=c("nlme", "analytic", "r,s", "r", "s", "sa", "imp", ""), ...) {
 
   checkmate::assertLogical(optExpression, len=1, any.missing=FALSE)
   checkmate::assertLogical(literalFix, len=1, any.missing=FALSE)
@@ -48,6 +62,14 @@ nlmixr2NlmeControl <- function(maxIter = 100, pnlsMaxIter = 100, msMaxIter = 100
   checkmate::assertIntegerish(msMaxIter, len=1, any.missing=FALSE, lower=1)
   checkmate::assertIntegerish(niterEM, len=1, any.missing=FALSE, lower=1)
   checkmate::assertNumeric(minScale, len=1, any.missing=FALSE, lower=0)
+  # nlme optimizer tolerances from sigdig: reproduce the tuned values at sigdig=4 and
+  # tighten one order per significant digit; a user value wins, sigdig=NULL keeps
+  # the defaults (sigdig=5 -> tolerance=1e-6, msTol=1e-7, pnlsTol=1e-4).  The
+  # anchor is 4 while the default sigdig is 3, so these run one order looser by
+  # default than they historically did.
+  if (is.null(tolerance)) tolerance <- if (!is.null(sigdig)) .sigdigScale(1e-5, sigdig) else 1e-05
+  if (is.null(msTol)) msTol <- if (!is.null(sigdig)) .sigdigScale(1e-6, sigdig) else 1e-06
+  if (is.null(pnlsTol)) pnlsTol <- if (!is.null(sigdig)) .sigdigScale(1e-3, sigdig) else 0.001
   checkmate::assertNumeric(pnlsTol, len=1, any.missing=FALSE, lower=0)
   checkmate::assertNumeric(msTol, len=1, any.missing=FALSE, lower=0)
   checkmate::assertNumeric(tolerance, len=1, any.missing=FALSE, lower=0)
@@ -58,10 +80,27 @@ nlmixr2NlmeControl <- function(maxIter = 100, pnlsMaxIter = 100, msMaxIter = 100
 
   method <- match.arg(method)
   addProp <- match.arg(addProp)
+  eventSens <- match.arg(eventSens)
+  if (checkmate::testIntegerish(covMethod, len=1, any.missing=FALSE)) {
+    # integer round-trip: 0L means no covariance ("nlme"/"" keep nlme's own)
+    covMethod <- if (identical(as.integer(covMethod), 0L)) "" else "analytic"
+  } else if (length(covMethod) == 1L && !nzchar(covMethod)) {
+    covMethod <- ""
+  } else {
+    covMethod <- match.arg(covMethod)
+  }
+
+  # 'print' is the common nlmixr control alias; nlme prints through 'verbose',
+  # so map it (print=0 means quiet) and let an explicit 'verbose' stand when
+  # 'print' is not supplied.
+  if (!is.null(print)) {
+    checkmate::assertIntegerish(print, len=1, lower=0, any.missing=FALSE)
+    verbose <- print > 0
+  }
 
   .xtra <- list(...)
   .bad <- names(.xtra)
-  .bad <- .bad[!(.bad %in% c("genRxControl", "covMethod"))]
+  .bad <- .bad[!(.bad %in% "genRxControl")]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste
     (paste0("'", .bad, "'", sep=""), collapse=", "),
@@ -73,15 +112,15 @@ nlmixr2NlmeControl <- function(maxIter = 100, pnlsMaxIter = 100, msMaxIter = 100
     .genRxControl <- .xtra$genRxControl
   }
   if (is.null(rxControl)) {
-    if (is.null(sigdig)) {
-      rxControl <- rxode2::rxControl(sigdig=sigdig)
+    if (!is.null(sigdig)) {
+      rxControl <- .rxControlScaleSigdig(rxode2::rxControl(sigdig=sigdig), sigdig)
     } else {
       rxControl <- rxode2::rxControl(atol=1e-4, rtol=1e-4)
     }
     .genRxControl <- TRUE
   } else if (inherits(rxControl, "rxControl")) {
   } else if (is.list(rxControl)) {
-    rxControl <- do.call(rxode2::rxControl, rxControl)
+    rxControl <- .rxControlScaleSigdig(do.call(rxode2::rxControl, rxControl), sigdig, skip = names(rxControl))
   } else {
     stop("solving options 'rxControl' needs to be generated from 'rxode2::rxControl'", call=FALSE)
   }
@@ -113,6 +152,7 @@ nlmixr2NlmeControl <- function(maxIter = 100, pnlsMaxIter = 100, msMaxIter = 100
                returnNlme=returnNlme, addProp=addProp, calcTables=calcTables,
                compress=compress, random=random, fixed=fixed, weights=weights,
                ci=ci, sigdig=sigdig, sigdigTable=sigdigTable, muRefCovAlg=muRefCovAlg,
+               eventSens=eventSens, covMethod=covMethod,
                genRxControl=.genRxControl)
   class(.ret) <- "nlmeControl"
   .ret
@@ -188,7 +228,7 @@ nlmeControl <- nlmixr2NlmeControl
 
 .nlmeFitModel <- function(ui, dataSav, timeVaryingCovariates) {
   .nlmeFitDataSetup(dataSav)
-  nlmixr2global$nlmeFitRxModel <- rxode2::rxode2(ui$nlmeRxModel)
+  nlmixr2global$nlmeFitRxModel <- .nlmixr2estRxode2(ui$nlmeRxModel, "rxNlme")
   nlmixr2global$nlmeFitRxControl <- rxode2::rxGetControl(ui, "rxControl", rxode2::rxControl())
 
   .ctl <- ui$control
@@ -302,7 +342,8 @@ nlmeControl <- nlmixr2NlmeControl
 #' @param ui rxode2 ui
 #' @return non mu referenced names
 #' @author Matthew L. Fidler
-#' @noRd
+#' @export
+#' @keywords internal
 .nlmeGetNonMuRefNames <- function(names, ui) {
   .muRef <- ui$muRefDataFrame
   vapply(names, function(n) {
@@ -405,13 +446,13 @@ nmObjGetControl.nlme <- function(x, ...) {
   stop("cannot find nlme related control object", call.=FALSE)
 }
 
-.nlmeControlToFoceiControl <- function(env, assign=TRUE) {
+.nlmeControlToFoceiControl <- function(env, assign=TRUE, covMethod=0L) {
   .nlmeControl <- env$nlmeControl
   .ui <- env$ui
   .foceiControl <- foceiControl(rxControl=env$nlmeControl$rxControl,
                                 maxOuterIterations=0L,
                                 maxInnerIterations=0L,
-                                covMethod=0L,
+                                covMethod=covMethod,
                                 etaMat=env$etaMat,
                                 sumProd=.nlmeControl$sumProd,
                                 optExpression=.nlmeControl$optExpression,
@@ -425,7 +466,8 @@ nmObjGetControl.nlme <- function(x, ...) {
                                 compress=.nlmeControl$compress,
                                 ci=.nlmeControl$ci,
                                 sigdigTable=.nlmeControl$sigdigTable,
-                                indTolRelax=TRUE)
+                                indTolRelax=TRUE,
+                                eventSens=.nlmeControl$eventSens)
   if (assign) env$control <- .foceiControl
   .foceiControl
 }
@@ -433,7 +475,12 @@ nmObjGetControl.nlme <- function(x, ...) {
 #' @export
 #' @rdname nmObjGetFoceiControl
 nmObjGetFoceiControl.nlme <- function(x, ...) {
-  .nlmeControlToFoceiControl(x[[1]])
+  .env <- x[[1]]
+  # the post-fit recompute (.foceiRecomputeMuCov) reads its covMethod from this
+  # control; "nlme"/"" keep the legacy nlme covariance/no covariance (0L)
+  .cm <- tryCatch(.env$nlmeControl$covMethod, error = function(e) NULL)
+  if (is.null(.cm) || !nzchar(.cm) || identical(.cm, "nlme")) .cm <- 0L
+  .nlmeControlToFoceiControl(.env, covMethod=.cm)
 }
 
 .nlmeFamilyFit <- function(env, ...) {
@@ -441,42 +488,13 @@ nmObjGetFoceiControl.nlme <- function(x, ...) {
   .control <- .ui$control
   .data <- env$data
   .ret <- new.env(parent=emptyenv())
-  # The environment needs:
-  # - table for table options
-  # - $origData -- Original Data
-  # - $dataSav -- Processed data from .foceiPreProcessData
-  # - $idLvl -- Level information for ID factor added
-  # - $covLvl -- Level information for items to convert to factor
-  # - $ui for ui fullTheta Full theta information
-  # - $etaObf data frame with ID, etas and OBJI
-  # - $cov For covariance
-  # - $covMethod for the method of calculating the covariance
-  # - $adjObf Should the objective function value be adjusted
-  # - $objective objective function value
-  # - $extra Extra print information
-  # - $method Estimation method (for printing)
-  # - $omega Omega matrix
-  # - $etaObf Eat objective function data frame
-  # - $theta Is a theta data frame
-  # - $model a list of model information for table generation.  Needs a `predOnly` model
-  # - $message Message for display
-  # - $est estimation method
-  # - $ofvType (optional) tells the type of ofv is currently being used
-  # When running the focei problem to create the nlmixr object, you also need a
-  #  foceiControl object
+  # .ret env fields: table, origData, dataSav, idLvl, covLvl, ui, etaObf, cov,
+  # covMethod, adjObf, objective, extra, method, omega, theta, model, message,
+  # est, ofvType (a foceiControl object is also needed downstream)
   .ret$table <- env$table
   .foceiPreProcessData(.data, .ret, .ui, .control$rxControl)
-  .et <- rxode2::etTrans(.ret$dataSav, .ui$mv0, addCmt=TRUE,
-                         addlKeepsCov = .control$rxControl$addlKeepsCov,
-                         addlDropSs = .control$rxControl$addlDropSs,
-                         ssAtDoseTime = .control$rxControl$ssAtDoseTime)
   # Just like saem, nlme can use mu-referenced covariates
-  .nTv <- attr(class(.et), ".rxode2.lst")$nTv
-  if (is.null(.nTv)) .nTv <- 0
-  .tv <- character(0)
-  if (.nTv != 0) {
-    .tv <- names(.et)[-seq(1, 6)]
-  }
+  .tv <- .nlmixrTimeVaryingCovariates(.ret$dataSav, .ui, .control$rxControl)
   .nlme <- .collectWarn(.nlmeFitModel(.ui, .ret$dataSav, timeVaryingCovariates=.tv), lst = TRUE)
   .ret$nlme <- .nlme[[1]]
   .ret$message <- NULL
@@ -529,7 +547,12 @@ nmObjGetFoceiControl.nlme <- function(x, ...) {
 #' @export
 nlmixr2Est.nlme <- function(env, ...) {
   .ui <- env$ui
-  rxode2::assertRxUiMixedOnly(.ui, " for the estimation routine 'nlme', try 'focei'", .var.name=.ui$modelName)
+  if (length(.ui$mixProbs) > 0) {
+    stop("mix() models are not supported by est=\"nlme\" yet; use est=\"saem\" or est=\"focei\"",
+         call. = FALSE)
+  }
+  rxode2::assertRxUiNoAutoregressive(.ui, " for the estimation routine 'nlme', try 'focei'", .var.name=.ui$modelName)
+  rxode2::assertRxUiMixedOnly(.ui, .noRandomEffectMsg("nlme"), .var.name=.ui$modelName)
   rxode2::assertRxUiNormal(.ui, " for the estimation routine 'nlme'", .var.name=.ui$modelName)
   rxode2::assertRxUiSingleEndpoint(.ui, " for the estimation routine 'nlme'", .var.name=.ui$modelName)
   rxode2::assertRxUiRandomOnIdOnly(.ui, " for the estimation routine 'nlme'", .var.name=.ui$modelName)

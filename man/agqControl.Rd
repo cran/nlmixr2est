@@ -14,29 +14,24 @@ agqControl(
 )
 }
 \arguments{
-\item{sigdig}{Optimization significant digits. This controls:
+\item{sigdig}{Optimization significant digits.  One value drives, with a single
+consistent formula, the inner/outer optimizer convergence tolerance
+(\code{10^-sigdig}), the boundary check tolerance (\code{5*10^(-sigdig+1)}),
+and the ODE solver tolerances: the \code{rtol} exponent IS \code{sigdig} and
+\code{atol} sits three orders below, so \code{rtol = 10^-sigdig},
+\code{atol = 10^(-sigdig-3)} for every solver (stiff, non-stiff or
+auto-switching).  The sensitivity (\code{atolSens}/\code{rtolSens})
+tolerances match the main solve (the outer gradient and covariance are built
+from them); the steady-state (\code{ssAtol}/\code{ssRtol}) tolerances run one
+order looser.
+Keying the optimizer to the same \code{10^-sigdig} means it converges to
+exactly the precision the solve supports.  At the default \code{sigdig = 3}
+this is \code{atol = 1e-6}, \code{rtol = 1e-3}.}
 
-\itemize{
-
- \item The tolerance of the inner and outer optimization is \code{10^-sigdig}
-
- \item The tolerance of the ODE solvers is
- \code{0.5*10^(-sigdig-2)}; For the sensitivity equations and
- steady-state solutions the default is \code{0.5*10^(-sigdig-1.5)}
- (sensitivity changes only applicable for liblsoda)
-
- \item The tolerance of the boundary check is \code{5 * 10 ^ (-sigdig + 1)}
-
-}}
-
-\item{nAGQ}{Number of Gauss-Hermite Adaptive Quadrature points to
-take.  When `nAGQ=0`, the AGQ is not used.  With `nAGQ=1`, this
-is equivalent to the Laplace method. The adaptive quadrature
-expands every node for each of the ETAs, so it can be quite
-expensive with a large amount of ETAs.  Once the EBE is obtained
-for a subject, you will have nAGQ^neta additional function
-evaluations for even nAGQ numbers and (nAGQ^neta)-1 additional
-function evaluations for odd nAGQ numbers.}
+\item{nAGQ}{Number of Gauss-Hermite adaptive quadrature points. `0`
+disables AGQ; `1` is equivalent to Laplace. Cost grows quickly with
+ETAs: once the EBE is found, expect `nAGQ^neta` (even `nAGQ`) or
+`(nAGQ^neta)-1` (odd `nAGQ`) additional evaluations per subject.}
 
 \item{...}{Parameters used in the default `foceiControl()`}
 

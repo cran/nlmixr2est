@@ -1,29 +1,270 @@
-test_that(".updateParFixedGetEtaRow returns correct values", {
-  envPrep <- new.env()
-  expect_equal(
-    .updateParFixedGetEtaRow(
-      .eta = "iivemax",
-      .env = envPrep,
-      .ome = matrix(25, nrow = 1, dimnames = list("iivemax", "iivemax")),
-      .omegaFix = c(iivemax = FALSE),
-      .muRefCurEval = data.frame(parameter = "iivemax", curEval = "", low = NA_real_, hi = NA_real_),
-      .sigdig = 3L
-    ),
-    data.frame(ch = "5.00", v = 5)
-  )
-  expect_false(envPrep$.cvOnly)
+nmTest({
+  test_that(".updateParFixedGetEtaRow returns correct values", {
+    envPrep <- new.env()
+    expect_equal(
+      .updateParFixedGetEtaRow(
+        .eta = "iivemax",
+        .env = envPrep,
+        .ome = matrix(25, nrow = 1, dimnames = list("iivemax", "iivemax")),
+        .omegaFix = c(iivemax = FALSE),
+        .muRefCurEval = data.frame(parameter = "iivemax", curEval = "", low = NA_real_, hi = NA_real_),
+        .sigdig = 3L
+      ),
+      data.frame(ch = "5.00", v = 5)
+    )
+    expect_false(envPrep$.cvOnly)
 
-  envPrep <- new.env()
+    envPrep <- new.env()
+    expect_equal(
+      .updateParFixedGetEtaRow(
+        .eta = "iivemax",
+        .env = envPrep,
+        .ome = matrix(0.4, nrow = 1, dimnames = list("iivemax", "iivemax")),
+        .omegaFix = c(iivemax = FALSE),
+        .muRefCurEval = data.frame(parameter = "iivemax", curEval = "exp", low = NA_real_, hi = NA_real_),
+        .sigdig = 3L
+      ),
+      data.frame(ch = "70.1", v = sqrt(exp(0.4) - 1) * 100)
+    )
+    expect_false(envPrep$.sdOnly)
+  })
+})
+
+test_that("formatMinWidth", {
+  # Special values
   expect_equal(
-    .updateParFixedGetEtaRow(
-      .eta = "iivemax",
-      .env = envPrep,
-      .ome = matrix(0.4, nrow = 1, dimnames = list("iivemax", "iivemax")),
-      .omegaFix = c(iivemax = FALSE),
-      .muRefCurEval = data.frame(parameter = "iivemax", curEval = "exp", low = NA_real_, hi = NA_real_),
-      .sigdig = 3L
-    ),
-    data.frame(ch = "70.1", v = sqrt(exp(0.4) - 1) * 100)
+    formatMinWidth(x = c(NA, 0, Inf, -Inf, NaN)),
+    c("NA", "0", "Inf", "-Inf", "NaN")
   )
-  expect_false(envPrep$.sdOnly)
+  # Rounding occurs to requested significant digits
+  expect_equal(
+    formatMinWidth(x = -123456*10^(-10:10)),
+    c("-1.23e-5", "-1.23e-4", "-0.00123", "-0.0123", "-0.123", "-1.23",
+      "-12.3", "-123", "-1230", "-12300", "-123000", "-1.23e6", "-1.23e7",
+      "-1.23e8", "-1.23e9", "-1.23e10", "-1.23e11", "-1.23e12", "-1.23e13",
+      "-1.23e14", "-1.23e15")
+  )
+  # Rounding up works as expected; scientific notation values drop extraneous
+  # zeros in the exponent
+  expect_equal(
+    formatMinWidth(x = -9999*10^(-10:10)),
+    c("-1.00e-6", "-1.00e-5", "-1.00e-4", "-0.00100", "-0.0100",
+      "-0.100", "-1.00", "-10.0", "-100", "-1000", "-10000", "-100000",
+      "-1.00e6", "-1.00e7", "-1.00e8", "-1.00e9", "-1.00e10", "-1.00e11",
+      "-1.00e12", "-1.00e13", "-1.00e14")
+  )
+  # Planned significant digits are shown, including when digits are added
+  expect_equal(
+    formatMinWidth(x = 12*10^(-10:10)),
+    c("1.20e-9", "1.20e-8", "1.20e-7", "1.20e-6", "1.20e-5", "1.20e-4",
+      "0.00120", "0.0120", "0.120", "1.20", "12.0", "120", "1200",
+      "12000", "120000", "1.20e6", "1.20e7", "1.20e8", "1.20e9", "1.20e10",
+      "1.20e11")
+  )
+  # Negative values
+  expect_equal(
+    formatMinWidth(x = -12*10^(-10:10)),
+    c("-1.20e-9", "-1.20e-8", "-1.20e-7", "-1.20e-6", "-1.20e-5",
+      "-1.20e-4", "-0.00120", "-0.0120", "-0.120", "-1.20", "-12.0",
+      "-120", "-1200", "-12000", "-120000", "-1.20e6", "-1.20e7", "-1.20e8",
+      "-1.20e9", "-1.20e10", "-1.20e11")
+  )
+  # input must be numeric
+  expect_error(
+    formatMinWidth("A"),
+    regexp = "Assertion on 'x' failed: Must be of type 'numeric', not 'character'.",
+    fixed = TRUE
+  )
+})
+
+test_that("formatMinWidth in parFixed", {
+  one.compartment <- function() {
+    ini({
+      tka <- log(1.57)
+      tcl <- log(2.72)
+      bsvCl ~ 0.1
+      tv <- log(31.5)
+      add.sd <- 0.7
+    })
+    model({
+      ka <- exp(tka)
+      cl <- exp(tcl + bsvCl)
+      v <- exp(tv)
+      d/dt(depot) <- -ka * depot
+      d/dt(center) <- ka * depot - cl / v * center
+      cp <- center / v
+      cp ~ add(add.sd)
+    })
+  }
+
+  # Simple ----
+  fit <- .nlmixr(one.compartment, theo_sd, est="focei", control = foceiControlFast)
+  ## $parFixed formats with control$sigdigTable (see .updateParFixedApplySig in
+  ## R/nlmixr2output.R), which defaults to foceiControl(sigdig=).  That default
+  ## moved 4 -> 3 in 7d3c7b62d and this expectation kept its hardcoded 4, so the
+  ## file failed on every run.  Read it off the fit: the point of the test is
+  ## that $parFixed agrees with formatMinWidth at the fit's OWN digits, not that
+  ## the digits take any particular value.
+  .digits <- fit$control$sigdigTable
+  expect_equal(
+    fit$parFixed,
+    structure(
+      list(
+        Est. = formatMinWidth(fit$parFixedDf$Estimate, digits = .digits),
+        SE = formatMinWidth(fit$parFixedDf$SE, digits = .digits, naValue = ""),
+        `%RSE` = formatMinWidth(fit$parFixedDf$`%RSE`, digits = .digits, naValue = ""),
+        `Back-transformed(95%CI)` =
+          c(
+            sprintf(
+              "%s (%s, %s)",
+              formatMinWidth(fit$parFixedDf$`Back-transformed`, digits = .digits),
+              formatMinWidth(fit$parFixedDf$`CI Lower`, digits = .digits),
+              formatMinWidth(fit$parFixedDf$`CI Upper`, digits = .digits)
+            )[!is.na(fit$parFixedDf$`CI Upper`)],
+            formatMinWidth(fit$parFixedDf$`Back-transformed`[is.na(fit$parFixedDf$`CI Upper`)], digits = .digits)
+          ),
+        `BSV(CV%)` = formatMinWidth(fit$parFixedDf$`BSV(CV%)`, digits = .digits, naValue = ""),
+        `Shrink(SD)%` = paste0(formatMinWidth(fit$parFixedDf$`Shrink(SD)%`, digits = .digits, naValue = ""), c("", ">", "", ""))
+      ),
+      class = c("nlmixr2ParFixed", "data.frame"),
+      row.names = c("tka", "tcl", "tv", "add.sd")
+    )
+  )
+
+  # Fixed parameter ----
+  one.compartment.fixed <- function() {
+    ini({
+      tka <- fixed(log(1.57))
+      tcl <- log(2.72)
+      tv <- log(31.5)
+      add.sd <- 0.7
+    })
+    model({
+      ka <- exp(tka)
+      cl <- exp(tcl)
+      v <- exp(tv)
+      d/dt(depot) <- -ka * depot
+      d/dt(center) <- ka * depot - cl / v * center
+      cp <- center / v
+      cp ~ add(add.sd)
+    })
+  }
+
+  fitFixed <- .nlmixr(one.compartment.fixed, theo_sd, est="focei", control = foceiControlFast)
+  expect_equal(
+    fitFixed$parFixed,
+    structure(
+      list(
+        Est. = formatMinWidth(fitFixed$parFixedDf$Estimate, digits = .digits),
+        SE = c("FIXED", formatMinWidth(fitFixed$parFixedDf$SE[2:4], digits = .digits)),
+        `%RSE` = c("FIXED", formatMinWidth(fitFixed$parFixedDf$`%RSE`[2:4], digits = .digits)),
+        `Back-transformed(95%CI)` = c(
+          formatMinWidth(fitFixed$parFixedDf$`Back-transformed`[1], digits = .digits),
+          sprintf(
+            "%s (%s, %s)",
+            formatMinWidth(fitFixed$parFixedDf$`Back-transformed`, digits = .digits),
+            formatMinWidth(fitFixed$parFixedDf$`CI Lower`, digits = .digits),
+            formatMinWidth(fitFixed$parFixedDf$`CI Upper`, digits = .digits)
+          )[2:4]
+        )
+      ),
+      class = c("nlmixr2ParFixed", "data.frame"),
+      row.names = c("tka", "tcl", "tv", "add.sd")
+    )
+  )
+
+  # Fixed parameter, labeled ----
+  one.compartment.labeled <- function() {
+    ini({
+      tka <- fixed(log(1.57)); label("ka")
+      tcl <- log(2.72); label("clearance")
+      tv <- log(31.5)
+      add.sd <- 0.7
+    })
+    model({
+      ka <- exp(tka)
+      cl <- exp(tcl)
+      v <- exp(tv)
+      d/dt(depot) <- -ka * depot
+      d/dt(center) <- ka * depot - cl / v * center
+      cp <- center / v
+      cp ~ add(add.sd)
+    })
+  }
+
+  fitFixedLabel <- .nlmixr(one.compartment.labeled, theo_sd,  est="focei", control = list(print = 0))
+  expect_equal(
+    fitFixedLabel$parFixed,
+    structure(
+      list(
+        Parameter = c("ka", "clearance", "", ""),
+        Est. = formatMinWidth(fitFixedLabel$parFixedDf$Estimate, digits = .digits),
+        SE = c("FIXED", formatMinWidth(fitFixedLabel$parFixedDf$SE[2:4], digits = .digits)),
+        `%RSE` = c("FIXED", formatMinWidth(fitFixedLabel$parFixedDf$`%RSE`[2:4], digits = .digits)),
+        `Back-transformed(95%CI)` = c(
+          formatMinWidth(fitFixedLabel$parFixedDf$`Back-transformed`[1], digits = .digits),
+          sprintf(
+            "%s (%s, %s)",
+            formatMinWidth(fitFixedLabel$parFixedDf$`Back-transformed`, digits = .digits),
+            formatMinWidth(fitFixedLabel$parFixedDf$`CI Lower`, digits = .digits),
+            formatMinWidth(fitFixedLabel$parFixedDf$`CI Upper`, digits = .digits)
+          )[2:4]
+        )
+      ),
+      class = c("nlmixr2ParFixed", "data.frame"),
+      row.names = c("tka", "tcl", "tv", "add.sd")
+    )
+  )
+
+  # Works with .ret$control$ci and .ret$control$sigdig ----
+  fitFixedLabelCI <- .nlmixr(one.compartment.labeled, theo_sd,  est="focei", control = list(print = 0, ci = 0.9, sigdig = 4))
+  # digits from THIS fit, not the one at the top of the file: fitFixedLabelCI is
+  # built with its own sigdig, so formatting the expectation with the other fit's
+  # sigdigTable compares a table rendered at one precision against one checked at
+  # another.  Same principle as the .digits comment above -- read it off the fit.
+  .digitsCI <- fitFixedLabelCI$control$sigdigTable
+  expect_equal(
+    fitFixedLabelCI$parFixed,
+    structure(
+      list(
+        Parameter = c("ka", "clearance", "", ""),
+        Est. = formatMinWidth(fitFixedLabelCI$parFixedDf$Estimate, digits = .digitsCI),
+        SE = c("FIXED", formatMinWidth(fitFixedLabelCI$parFixedDf$SE[2:4], digits = .digitsCI)),
+        `%RSE` = c("FIXED", formatMinWidth(fitFixedLabelCI$parFixedDf$`%RSE`[2:4], digits = .digitsCI)),
+        `Back-transformed(90%CI)` =
+          c(
+            formatMinWidth(fitFixedLabelCI$parFixedDf$`Back-transformed`[1], digits = .digitsCI),
+            sprintf(
+              "%s (%s, %s)",
+              formatMinWidth(fitFixedLabelCI$parFixedDf$`Back-transformed`, digits = .digitsCI),
+              formatMinWidth(fitFixedLabelCI$parFixedDf$`CI Lower`, digits = .digitsCI),
+              formatMinWidth(fitFixedLabelCI$parFixedDf$`CI Upper`, digits = .digitsCI)
+            )[2:4])
+      ),
+      class = c("nlmixr2ParFixed", "data.frame"),
+      row.names = c("tka", "tcl", "tv", "add.sd")
+    )
+  )
+
+  # The FIXED marker must appear even when the fixed parameter is not
+  # literally fixed out of the model (literalFix = FALSE), where the fixed
+  # theta remains in $popDf with an NA standard error.
+  fitNoLiteralFix <-
+    .nlmixr(one.compartment.fixed, theo_sd, est = "focei",
+            control = foceiControl(print = 0, maxInnerIterations = 1,
+                                   maxOuterIterations = 1, eval.max = 1,
+                                   literalFix = FALSE))
+  expect_equal(unname(fitNoLiteralFix$parFixed["tka", "SE"]), "FIXED")
+  expect_equal(unname(fitNoLiteralFix$parFixed["tka", "%RSE"]), "FIXED")
+  expect_equal(unname(fitNoLiteralFix$parFixed["tcl", "SE"]),
+               formatMinWidth(fitNoLiteralFix$parFixedDf["tcl", "SE"], digits = .digits))
+
+  # nlmixr2est#355: without etas the BSV/shrinkage columns are always blank
+  expect_false(any(startsWith(names(fitFixed$parFixed), "BSV(")))
+  expect_false("Shrink(SD)%" %in% names(fitFixed$parFixed))
+  expect_false(any(startsWith(names(fitFixed$parFixedDf), "BSV(")))
+  expect_false("Shrink(SD)%" %in% names(fitFixed$parFixedDf))
+  # ...but a model with etas keeps them
+  expect_true(any(startsWith(names(fit$parFixed), "BSV(")))
+  expect_true("Shrink(SD)%" %in% names(fit$parFixed))
 })

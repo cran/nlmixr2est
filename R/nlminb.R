@@ -1,8 +1,12 @@
 #' nlmixr2 nlminb defaults
 #'
+#' @inheritParams iterPrintParams
 #' @inheritParams stats::nlminb
 #' @inheritParams foceiControl
 #' @inheritParams saemControl
+#' @param covMethod Method for calculating the covariance.  \code{"r"} (the
+#'   default) uses nlmixr2's \code{nlmixr2Hess()} Hessian; \code{"nlminb"} uses
+#'   the optimizer's own Hessian; \code{""} skips the covariance step.
 #' @param returnNlminb logical; when TRUE this will return the nlminb
 #'   result instead of the nlmixr2 fit object
 #' @param eval.max Maximum number of evaluations of the objective
@@ -18,15 +22,17 @@
 #'   to be non-negative, the previous default of `1e-20` would be more
 #'   appropriate
 #'
-#' @param rel.tol Relative tolerance.  Defaults to `1e-10`.
+#' @param rel.tol Relative tolerance.  When `NULL` (default) it is derived from
+#'   `sigdig` the way `foceiControl()` does (`10^(-sigdig)`).
 #'
-#' @param x.tol X tolerance.  Defaults to `1.5e-8`.
+#' @param x.tol X tolerance.  When `NULL` (default) it is derived from `sigdig`
+#'   (`10^(-sigdig)`).
 #'
 #' @param xf.tol false convergence tolerance.  Defaults to `2.2e-14`.
 #'
-#' @param step.min  Minimum step size.  Default to ‘1.’.
+#' @param step.min  Minimum step size.  Default to `1.`.
 #'
-#' @param step.max Maximum step size.  Default to ‘1.’.
+#' @param step.max Maximum step size.  Default to `1.`.
 #'
 #' @param sing.tol singular convergence tolerance; defaults to `rel.tol;.
 #'
@@ -72,8 +78,8 @@ nlminbControl <- function(eval.max=200,
                           iter.max=150,
                           trace=0, # nolint
                           abs.tol=0,
-                          rel.tol=1e-10,
-                          x.tol=1.5e-8,
+                          rel.tol=NULL,
+                          x.tol=NULL,
                           xf.tol=2.2e-14,
                           step.min=1,
                           step.max=1,
@@ -101,8 +107,8 @@ nlminbControl <- function(eval.max=200,
                           hessErr =(.Machine$double.eps)^(1/3),
                           shi21maxHess=20L,
 
-                          useColor = crayon::has_color(),
-                          printNcol = floor((getOption("width") - 23) / 12), #
+                          useColor = NULL,
+                          printNcol = NULL, #
                           print = 1L, #
                           normType = c("rescale2", "mean", "rescale", "std", "len", "constant"), #
                           scaleType = c("nlmixr2", "norm", "mult", "multAdd"), #
@@ -113,12 +119,18 @@ nlminbControl <- function(eval.max=200,
                           gradTo=1.0,
 
                           addProp = c("combined2", "combined1"),
+                          eventSens = c("jump", "fd"),
+                          sensMethod = c("default", "forward"),
                           calcTables=TRUE, compress=TRUE,
                           covMethod=c("r", "nlminb", ""),
-                          adjObf=TRUE, ci=0.95, sigdig=4, sigdigTable=NULL, ...) {
+                          adjObf=TRUE, ci=0.95, sigdig=3, sigdigTable=NULL, ...) {
   checkmate::assertIntegerish(eval.max, len=1, any.missing=FALSE, lower=1)
   checkmate::assertIntegerish(iter.max, len=1, any.missing=FALSE, lower=1)
   checkmate::assertIntegerish(trace, len=1, any.missing=FALSE, lower=0)
+  # nlminb convergence tolerances from sigdig (FOCEi mechanism, matches
+  # foceiControl reltol/x.tol); a user value wins, sigdig=NULL keeps the defaults
+  if (is.null(rel.tol)) rel.tol <- if (!is.null(sigdig)) .sigdigOptTol(sigdig) else 1e-10
+  if (is.null(x.tol)) x.tol <- if (!is.null(sigdig)) .sigdigOptTol(sigdig) else 1.5e-8
   checkmate::assertNumeric(rel.tol, len=1, any.missing=FALSE, lower=0)
   checkmate::assertNumeric(x.tol, len=1, any.missing=FALSE, lower=0)
   checkmate::assertNumeric(xf.tol, len=1, any.missing=FALSE, lower=0)
@@ -179,7 +191,7 @@ nlminbControl <- function(eval.max=200,
 
   .xtra <- list(...)
   .bad <- names(.xtra)
-  .bad <- .bad[!(.bad %in% "genRxControl")]
+  .bad <- .bad[!(.bad %in% c("genRxControl", "iterPrintControl"))]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste
     (paste0("'", .bad, "'", sep=""), collapse=", "),
@@ -192,14 +204,14 @@ nlminbControl <- function(eval.max=200,
   }
   if (is.null(rxControl)) {
     if (!is.null(sigdig)) {
-      rxControl <- rxode2::rxControl(sigdig=sigdig)
+      rxControl <- .rxControlScaleSigdig(rxode2::rxControl(sigdig=sigdig), sigdig)
     } else {
       rxControl <- rxode2::rxControl(atol=1e-4, rtol=1e-4)
     }
     .genRxControl <- TRUE
   } else if (inherits(rxControl, "rxControl")) {
   } else if (is.list(rxControl)) {
-    rxControl <- do.call(rxode2::rxControl, rxControl)
+    rxControl <- .rxControlScaleSigdig(do.call(rxode2::rxControl, rxControl), sigdig, skip = names(rxControl))
   } else {
     stop("solving options 'rxControl' needs to be generated from 'rxode2::rxControl'", call=FALSE)
   }
@@ -215,9 +227,10 @@ nlminbControl <- function(eval.max=200,
   checkmate::assertIntegerish(sigdigTable, lower=1, len=1, any.missing=FALSE)
 
 
-  checkmate::assertLogical(useColor, any.missing=FALSE, len=1)
-  checkmate::assertIntegerish(print, len=1, lower=0, any.missing=FALSE)
-  checkmate::assertIntegerish(printNcol, len=1, lower=1, any.missing=FALSE)
+  .iterPrintControl <- .absorbIterPrintControl(print = print,
+                                               printNcol = printNcol,
+                                               useColor = useColor,
+                                               iterPrintControl = .xtra$iterPrintControl)
   if (checkmate::testIntegerish(scaleType, len=1, lower=1, upper=4, any.missing=FALSE)) {
     scaleType <- as.integer(scaleType)
   } else {
@@ -266,9 +279,7 @@ nlminbControl <- function(eval.max=200,
                hessErr=hessErr,
                shi21maxHess=as.integer(shi21maxHess),
 
-               useColor=useColor,
-               print=print,
-               printNcol=printNcol,
+               iterPrintControl = .iterPrintControl,
                scaleType=scaleType,
                normType=normType,
 
@@ -286,6 +297,8 @@ nlminbControl <- function(eval.max=200,
                rxControl=rxControl,
                returnNlminb=returnNlminb,
                addProp=match.arg(addProp),
+               eventSens=match.arg(eventSens),
+               sensMethod=match.arg(sensMethod),
                calcTables=calcTables,
                compress=compress,
                ci=ci, sigdig=sigdig, sigdigTable=sigdigTable,
@@ -331,15 +344,7 @@ rxUiDeparse.nlminbControl <- function(object, var) {
 #' @author Matthew L. Fidler
 #' @noRd
 .nlminbFamilyControl <- function(env, ...) {
-  .ui <- env$ui
-  .control <- env$control
-  if (is.null(.control)) {
-    .control <- nlmixr2est::nlminbControl()
-  }
-  if (!inherits(.control, "nlminbControl")){
-    .control <- do.call(nlmixr2est::nlminbControl, .control)
-  }
-  assign("control", .control, envir=.ui)
+  .nlmFamilyControlGeneric(env, nlmixr2est::nlminbControl, "nlminbControl")
 }
 
 
@@ -377,17 +382,6 @@ getValidNlmixrCtl.nlminb <- function(control) {
     .ctl <- do.call(nlminbControl, .ctl)
   }
   .ctl
-}
-
-#' Setup the data for nlminb estimation
-#'
-#' @param dataSav Formatted Data
-#' @return Nothing, called for side effects
-#' @author Matthew L. Fidler
-#' @noRd
-.nlminbFitDataSetup <- function(dataSav) {
-  .dsAll <- dataSav[dataSav$EVID != 2, ] # Drop EVID=2 for estimation
-  nlmixr2global$nlmEnv$data <- rxode2::etTrans(.dsAll, nlmixr2global$nlmEnv$model)
 }
 
 .nlminbFitModel <- function(ui, dataSav) {
@@ -490,71 +484,19 @@ getValidNlmixrCtl.nlminb <- function(control) {
                                 compress=.nlminbControl$compress,
                                 ci=.nlminbControl$ci,
                                 sigdigTable=.nlminbControl$sigdigTable,
-                                indTolRelax=.nlminbControl$indTolRelax)
+                                indTolRelax=.nlminbControl$indTolRelax,
+                                eventSens=.nlminbControl$eventSens,
+                                sensMethod=.nlminbControl$sensMethod)
   if (assign) env$control <- .foceiControl
   .foceiControl
 }
 
 .nlminbFamilyFit <- function(env, ...) {
-  .ui <- env$ui
-  .control <- .ui$control
-  .data <- env$data
-  .ret <- new.env(parent=emptyenv())
-  # The environment needs:
-  # - table for table options
-  # - $origData -- Original Data
-  # - $dataSav -- Processed data from .foceiPreProcessData
-  # - $idLvl -- Level information for ID factor added
-  # - $covLvl -- Level information for items to convert to factor
-  # - $ui for ui fullTheta Full theta information
-  # - $etaObf data frame with ID, etas and OBJI
-  # - $cov For covariance
-  # - $covMethod for the method of calculating the covariance
-  # - $adjObf Should the objective function value be adjusted
-  # - $objective objective function value
-  # - $extra Extra print information
-  # - $method Estimation method (for printing)
-  # - $omega Omega matrix
-  # - $theta Is a theta data frame
-  # - $model a list of model information for table generation.  Needs a `predOnly` model
-  # - $message Message for display
-  # - $est estimation method
-  # - $ofvType (optional) tells the type of ofv is currently being used
-  # When running the focei problem to create the nlmixr object, you also need a
-  #  foceiControl object
-  .ret$table <- env$table
-  .foceiPreProcessData(.data, .ret, .ui, .control$rxControl)
-  .nlminb <- .collectWarn(.nlminbFitModel(.ui, .ret$dataSav), lst = TRUE)
-  .ret$nlminb <- .nlminb[[1]]
-  .ret <- .nlmFamilyAdjustOutput(.ret, "nlminb")
-  .ret$message <- .ret$nlminb$message
-  if (rxode2::rxGetControl(.ui, "returnNlminb", FALSE)) {
-    return(.ret$nlminb)
-  }
-  .ret$ui <- .ui
-  .ret$adjObf <- rxode2::rxGetControl(.ui, "adjObf", TRUE)
-  .ret$fullTheta <- .nlminbGetTheta(.ret$nlminb, .ui)
-  #.ret$etaMat <- NULL
-  #.ret$etaObf <- NULL
-  #.ret$omega <- NULL
-  .ret$control <- .control
-  .ret$extra <- ""
-  .nlmixr2FitUpdateParams(.ret)
-  nmObjHandleControlObject(.ret$control, .ret)
-  if (exists("control", .ui)) {
-    rm(list="control", envir=.ui)
-  }
-  .ret$est <- "nlminb"
-  # There is no parameter history for nlme
-  .ret$objective <- 2 * as.numeric(.ret$nlminb$objective)
-  .ret$model <- .ui$ebe
-  .ret$ofvType <- "nlminb"
-  .nlminbControlToFoceiControl(.ret)
-  .ret$theta <- .ret$ui$saemThetaDataFrame
-  .ret <- nlmixr2CreateOutputFromUi(.ret$ui, data=.ret$origData, control=.ret$control, table=.ret$table, env=.ret, est="nlminb")
-  .env <- .ret$env
-  .env$method <- "nlminb"
-  .ret
+  .nlmFamilyFitGeneric(
+    env, "nlminb", .nlminbFitModel, .nlminbGetTheta,
+    objective = function(.fit) 2 * as.numeric(.fit$objective),
+    controlToFocei = .nlminbControlToFoceiControl,
+    returnFlag = "returnNlminb")
 }
 
 #' @rdname nlmixr2Est
