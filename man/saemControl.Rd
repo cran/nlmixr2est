@@ -45,7 +45,9 @@ saemControl(
   muRefCov = TRUE,
   muRefCovAlg = TRUE,
   handleUninformativeEtas = TRUE,
+  revisitUninformativeEtas = FALSE,
   iovXform = c("sd", "var", "logsd", "logvar"),
+  iovMethod = c("twoLevel", "collapsed", "theta"),
   boundedTransform = TRUE,
   eventSens = c("jump", "fd"),
   mixProbMethod = c("regress", "regularized", "annealed"),
@@ -53,12 +55,16 @@ saemControl(
   mixProbPriorN = 20,
   mixSampleMethod = c("parallel", "msaem"),
   nonMuTheta = c("regress", "eta"),
+  nonMuThetaOpt = c("newuoa", "optimize", "nelderMead"),
+  nonMuThetaSweeps = 2L,
+  nonMuThetaMaxEval = 25L,
+  nonMuThetaTol = .Machine$double.eps^0.25,
+  nonMuThetaEvery = 1L,
+  phi1ThetaMaxEval = 50L,
+  phi1ThetaEvery = 1L,
+  phi1Hessian = FALSE,
   residWarmStart = TRUE,
   censOption = c("gauss", "laplace"),
-  lbfgsLmm = 5L,
-  lbfgsFactr = NULL,
-  lbfgsPgtol = NULL,
-  lbfgsMaxIter = 20L,
   ...
 )
 }
@@ -81,7 +87,8 @@ computation.  In Monolix this is equivalent to \code{L}.}
     numbers of transitions of the three different kernels used in
     the Hasting-Metropolis algorithm.  The default value is \code{c(2,2,2)},
     representing 40 for each transition initially (each value is
-    multiplied by 20).
+    multiplied by 20).  When unset, a residual error model that depends on
+    an eta uses \code{c(4,4,4)}, since its chains mix more slowly.
 
     The first value represents the initial number of multi-variate
     Gibbs samples are taken from a normal distribution.
@@ -136,6 +143,12 @@ typical fitting.}
  between-subject variability dominates the residual), so those variance-block standard
  errors are spliced in from the linearized FIM (\code{linFim}).
 
+ Neither is used for a general log-likelihood endpoint (\code{ll()}), which has
+ no residual error to anchor the complete-data correction; such a model goes
+ straight to \code{linFim} with a message.  This includes a residual error with
+ modeled components (\code{a <- add.sd*exp(eta.sd); cp ~ add(a)}), which saem
+ fits as \code{cp ~ add(a) + dnorm()}.
+
  "\code{r,s}" Uses the sandwich matrix to calculate the covariance, that is: \eqn{R^-1 \times S \times R^-1}
 
  "\code{r}" Uses the Hessian matrix to calculate the covariance as \eqn{2\times R^-1}
@@ -171,7 +184,7 @@ calculate by Gaussian quadrature.}
 
 \item{nnodesGq}{number of nodes to use for the Gaussian
 quadrature when computing the likelihood with this method
-(defaults to 1, equivalent to the Laplacian likelihood)}
+(defaults to 3; 1 is the Laplacian likelihood; at most 25)}
 
 \item{nsdGq}{span (in SD) over which to integrate when computing
 the likelihood by Gaussian quadrature. Defaults to 3 (eg 3
@@ -210,9 +223,11 @@ of iterations is itmax*number of parameters}
 
 \item{type}{indicates the type of optimization for the residuals; Can be one of c("nelder-mead", "newuoa")}
 
-\item{powRange}{This indicates the range that powers can take for residual errors;  By default this is 10 indicating the range is c(-10, 10)}
+\item{powRange}{This indicates the range that powers can take for residual errors;
+By default this is 10 indicating the range is c(-10, 10)}
 
-\item{lambdaRange}{This indicates the range that Box-Cox and Yeo-Johnson parameters are constrained to be;  The default is 3 indicating the range c(-3,3)}
+\item{lambdaRange}{This indicates the range that Box-Cox and Yeo-Johnson parameters are
+constrained to be;  The default is 3 indicating the range c(-3,3)}
 
 \item{odeRecalcFactor}{The ODE recalculation factor when ODE
 solving goes bad, this is the factor the rtol/atol is reduced}
@@ -286,8 +301,7 @@ against a default \code{rtol = 1e-6}.  Raise \code{sigdig}, or set
 \code{atol}/\code{rtol} directly, when you want a tighter solve.}
 
 \item{sigdigTable}{Significant digits in the final output table.
-If not specified, then it matches the significant digits in the
-`sigdig` optimization algorithm.  If `sigdig` is NULL, use 3.}
+If not specified (`NULL`), it defaults to `sigdig`.}
 
 \item{ci}{Confidence level for some tables.  By default this is
 0.95 or 95\% confidence.}
@@ -320,8 +334,42 @@ changes the system to a linear compartment model.  Therefore, by default this is
 calculate uninformative etas and handle them specially (default
 is `TRUE`).}
 
+\item{revisitUninformativeEtas}{boolean (default `FALSE`); when
+`TRUE` the uninformative-eta test is run a second time at the end
+of burn-in and that verdict replaces the first.  The test asks
+whether perturbing an eta moves the subject's prediction, and it is
+otherwise only run at the *initial* estimates -- so those decide,
+for the whole fit, which etas `saem` may sample.  Re-running it
+once `theta` has moved decides on the estimates the data supports
+instead.  It reuses the fit's own model evaluation, so it costs a
+few extra solves at a single iteration and leaves the random number
+stream unchanged; where it changes no verdict the fit is identical.
+It is off by default because the two verdicts only disagree when
+`theta` moved a long way during burn-in, which usually means it has
+not settled -- and the second verdict can freeze an eta for the
+rest of the fit.  Skipped for mixture models and when
+`handleUninformativeEtas=FALSE`.}
+
 \item{iovXform}{Transformation used on the diagonal of the IOV: one of
-\code{"sd"}, \code{"var"}, \code{"logsd"}, or \code{"logvar"}.}
+\code{"sd"}, \code{"var"}, \code{"logsd"}, or \code{"logvar"}.
+This parameterizes the magnitude theta of the \code{"theta"}
+\code{iovMethod}; it has no effect under \code{"omega"}, where the
+magnitude is fixed at one and the variability is carried by the
+omega block itself.}
+
+\item{iovMethod}{How inter-occasion variability (`iov.x ~ v | occ`) is
+estimated.  \code{"theta"} uses the shared pre-processing rewrite, which
+carries the magnitude as a population parameter multiplying per-occasion
+unit-variance etas (the form every other estimation method uses).
+\code{"twoLevel"} (the default) keeps the occasion term as a second
+variance component and estimates it with the closed-form updates of Panhard
+and Samson (2009), which is what the SAEM kernel is built around for every
+other variance.  \code{"collapsed"} additionally uses that paper's own
+sampler: one parameter per occasion carrying \code{mu + b_i + c_ik}
+together, with a compound-symmetric prior, instead of sampling \code{b_i}
+and \code{c_ik} separately.  It targets the same estimates and differs only
+in how well the chain mixes.  A model the newer handling does not cover
+falls back to \code{"theta"} on its own.}
 
 \item{boundedTransform}{When `TRUE` (default), bounded parameters are
 transformed for unbounded optimization methods and back-transformed
@@ -332,7 +380,13 @@ skips the final back-transform.}
 \item{eventSens}{Controls how dosing/event-parameter (`alag`, `F`,
 `rate`, `dur`) sensitivities are computed for THETA/ETA gradients:
 `"jump"` (default) uses rxode2's analytic event sensitivities; `"fd"`
-uses the legacy finite-difference behavior.}
+uses the legacy finite-difference behavior.  Also gates the analytic
+moving-boundary correction for a modeled `alag()`/`f()` on a `linCmt()`
+compartment; set `"fd"` if that model infuses a dose into the
+lagged/scaled compartment (rxode2/rxode2#1236), or if the regimen also
+doses an *unlagged/unscaled* compartment alongside the lagged/scaled one
+-- a common design for estimating `f()` from paired IV+oral data
+(rxode2/rxode2#1237).}
 
 \item{mixProbMethod}{For mixture models (`mix()`, more than one
   component), stabilizes the mixing-probability estimate against
@@ -416,6 +470,62 @@ the estimate more and need more `nBurn`/`nEm`. Default 20.}
   * `"eta"`: the historic SAEM treatment (the parameter is carried through
     the stochastic `phi0` block).}
 
+\item{nonMuThetaOpt}{Optimizer for the `nonMuTheta="regress"` refinement.
+`"newuoa"` (default) and `"nelderMead"` each run one clamped multivariate
+optimization over all free `phi0` coordinates under the `nonMuThetaMaxEval`
+evaluation budget; `"optimize"` is the historic coordinate descent with R's
+golden-section `optimize()`.  When the non-mu thetas drive the ODE, every
+objective evaluation is a full re-solve, so this refinement can dominate the
+run time; the multivariate options spend a much smaller fixed budget and
+account for the coupling between coordinates that coordinate descent cannot
+see.}
+
+\item{nonMuThetaSweeps}{Number of coordinate-descent sweeps per refinement
+for `nonMuThetaOpt="optimize"` (default 2).}
+
+\item{nonMuThetaMaxEval}{Objective-evaluation budget of one refinement for
+`nonMuThetaOpt="newuoa"` or `"nelderMead"` (default 25); 0 means ten
+evaluations per free non-mu theta instead.  `"newuoa"` needs `2n+3`
+evaluations to build its first quadratic model, and is raised to that when
+the budget is smaller.}
+
+\item{nonMuThetaTol}{Convergence tolerance of the `nonMuTheta="regress"`
+refinement (`newuoa`'s `rhoend`, the nelder-mead relative objective
+tolerance, or the `optimize()` `tol`).}
+
+\item{nonMuThetaEvery}{Run the `nonMuTheta="regress"` refinement every
+`nonMuThetaEvery` iterations instead of every iteration (default 1).  In
+between, `phi0` keeps its last refined value.}
+
+\item{phi1ThetaMaxEval}{Objective-evaluation budget (bobyqa's `maxfun`) of
+one general-likelihood phi1 (mu-referenced theta) refinement (default
+50). Applies only when the fit has a general-likelihood (`ll()`/`t()`/
+`cauchy()`) endpoint; ignored otherwise. Each evaluation solves the
+FOCEi-style phi1-inner sensitivity model across every chain-replicated
+row, so it is the dominant per-iteration cost while this refinement is
+active -- larger than `nonMuThetaMaxEval`'s default because the
+objective is also more expensive per call.}
+
+\item{phi1ThetaEvery}{Run the general-likelihood phi1 refinement every
+`phi1ThetaEvery` iterations instead of every iteration (default 1).  In
+between, phi1's mu keeps its last refined value (mirrors
+`nonMuThetaEvery`).}
+
+\item{phi1Hessian}{Boolean (default `FALSE`); include the Laplace
+`log|H|` eta-Hessian correction in the general-likelihood phi1
+refinement's objective (`-2*loglik + log|H|` instead of plain
+`-2*loglik`). Opt-in: an ablation check found the correction was not
+what fixed a diverging Gaussian general-likelihood twin -- the direct
+bobyqa optimization of the exact joint log-likelihood was already
+sufficient on its own, replacing the historic noisy Robbins-Monro
+stochastic-approximation recursion over MCMC-sampled phi. For a
+heavy-tailed endpoint (`t()`/`cauchy()`), `log|H|` can instead dominate
+the objective and cause divergence (its own curvature decays far from
+the data, unlike a normal's), so it defaults off. Set `TRUE` only to
+experiment with the Hessian-corrected form; when it builds, the exact
+analytic eta-Hessian is used, else a finite-difference one (e.g. for
+`linCmt()`).}
+
 \item{residWarmStart}{Boolean (default `TRUE`); warm-start the residual-error
 parameters from the observed per-endpoint moments at the initial predictions
 (additive SD from `sqrt(mean(err^2))`, proportional SD from
@@ -431,23 +541,6 @@ proper Laplace inner Hessian and analytic covariance).  Accepted by
 \code{saemControl}/\code{nlmControl} for a uniform interface but inert there --
 SAEM (stochastic EM) has no Laplace inner Hessian, and NLM uses a
 finite-difference Hessian that already reflects censoring exactly.}
-
-\item{lbfgsLmm}{Integer number of BFGS corrections (the L-BFGS-B `lmm`
-memory) used when refining the fixed-effect-only parameters of a general
-log-likelihood model (`ll(name) ~ <expr>`) by direct L-BFGS-B
-optimization of the observation likelihood.  Default 5.}
-
-\item{lbfgsFactr}{Convergence tolerance on the relative reduction in the
-objective for that L-BFGS-B refinement (the `factr` control, in units of
-machine epsilon).  When `NULL` (default) it is derived from `sigdig` the
-same way as `foceiControl()` (`10^(-sigdig) / .Machine$double.eps`).}
-
-\item{lbfgsPgtol}{Convergence tolerance on the projected gradient for that
-L-BFGS-B refinement (the `pgtol` control).  When `NULL` (default) it is
-derived from `sigdig` (`10^(-sigdig)`).}
-
-\item{lbfgsMaxIter}{Integer maximum number of iterations for that L-BFGS-B
-refinement.  Default 20.}
 
 \item{...}{Other arguments to control SAEM.}
 }

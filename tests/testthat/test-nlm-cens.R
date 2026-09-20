@@ -29,7 +29,7 @@ nmTest({
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .dat, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .dat, est = meth, list(print = 0, method = "BFGS"))
       ))
     } else {
       fit <- suppressMessages(suppressWarnings(
@@ -48,7 +48,7 @@ nmTest({
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit0 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .dat0, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .dat0, est = meth, list(print = 0, method = "BFGS"))
       ))
     } else {
       fit0 <- suppressMessages(suppressWarnings(
@@ -72,13 +72,15 @@ nmTest({
   test_that("nls does not support censoring", {
     expect_error(
       suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM3, est = "nls", list(print = 0)))))
+        .nlmixr(one.cmt, .datM3, est = "nls", list(print = 0))
+      ))
+    )
   })
 
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit_m3 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM3, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .datM3, est = meth, list(print = 0, method = "BFGS"))
       ))
     } else {
       fit_m3 <- suppressMessages(suppressWarnings(
@@ -93,21 +95,21 @@ nmTest({
     })
   }
 
-
   test_that("nls does not support censoring", {
     expect_error(
       suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM3, est = "nls", list(print = 0))))
+        .nlmixr(one.cmt, .datM3, est = "nls", list(print = 0))
+      ))
     )
   })
 
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit_base <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .dat, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .dat, est = meth, list(print = 0, method = "BFGS"))
       ))
       fit_m3 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM3, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .datM3, est = meth, list(print = 0, method = "BFGS"))
       ))
       expect_false(isTRUE(all.equal(fit_base$objf, fit_m3$objf)))
     } else {
@@ -126,12 +128,12 @@ nmTest({
   # M2 censoring: CENS=0 with a finite LIMIT
   .datM2 <- .dat
   .datM2$CENS <- 0L
-  .datM2$LIMIT <- 0  # interval censoring: all obs have a lower bound of 0
+  .datM2$LIMIT <- 0 # interval censoring: all obs have a lower bound of 0
 
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit_m2 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM2, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .datM2, est = meth, list(print = 0, method = "BFGS"))
       ))
     } else {
       fit_m2 <- suppressMessages(suppressWarnings(
@@ -147,10 +149,10 @@ nmTest({
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit_base <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .dat, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .dat, est = meth, list(print = 0, method = "BFGS"))
       ))
       fit_m2 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM2, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .datM2, est = meth, list(print = 0, method = "BFGS"))
       ))
     } else {
       fit_base <- suppressMessages(suppressWarnings(
@@ -167,12 +169,12 @@ nmTest({
 
   # M4 censoring: CENS!=0 with a finite LIMIT
   .datM4 <- .datM3
-  .datM4$LIMIT <- 0  # add LIMIT for M4
+  .datM4$LIMIT <- 0 # add LIMIT for M4
 
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit_m4 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM4, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .datM4, est = meth, list(print = 0, method = "BFGS"))
       ))
     } else {
       fit_m4 <- suppressMessages(suppressWarnings(
@@ -188,10 +190,10 @@ nmTest({
   for (meth in c("nlm", "bobyqa", "lbfgsb3c", "n1qn1", "newuoa", "nlminb", "optim")) {
     if (meth == "optim") {
       fit_m3 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM3, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .datM3, est = meth, list(print = 0, method = "BFGS"))
       ))
       fit_m4 <- suppressMessages(suppressWarnings(
-        .nlmixr(one.cmt, .datM4, est = meth, list(print = 0, method="BFGS"))
+        .nlmixr(one.cmt, .datM4, est = meth, list(print = 0, method = "BFGS"))
       ))
     } else {
       fit_m3 <- suppressMessages(suppressWarnings(
@@ -206,4 +208,72 @@ nmTest({
     })
   }
 
+  test_that("nlm-family M3-censored parameter estimates match focei (#976)", {
+    # #976: nlm-family forces every normal endpoint through the log-likelihood
+    # path, which always emitted `rx_r_ ~ 0`; the M2/M3/M4 censoring
+    # correction (doCensNormal1()) then divided by a zero variance, silently
+    # corrupting every censored fit (no ar() needed).  The checks above only
+    # ever assert that a fit "runs" and reports the right censoring text, so
+    # a corrupted objective/parameter set passed them undetected.  Derivative-
+    # free (bobyqa/newuoa/uobyqa) and FD-gradient (nlminb) nlm-family members
+    # should now recover parameters close to focei's on the same censored
+    # data.  The analytic-gradient members (nlm/n1qn1/lbfgsb3c/optim) have a
+    # separate, pre-existing convergence stall on this bounded-tcl model that
+    # reproduces even without censoring -- out of scope here, so they are not
+    # checked for parameter accuracy.
+    f.focei <- .nlmixr(one.cmt, .datM3, est = "focei", control = foceiControl(print = 0))
+    for (meth in c("bobyqa", "newuoa", "uobyqa", "nlminb")) {
+      fit <- .nlmixr(one.cmt, .datM3, est = meth, control = nlmControl(print = 0))
+      expect_equal(as.numeric(fit$theta[["tka"]]), as.numeric(f.focei$theta[["tka"]]), tolerance = 0.1, info = meth)
+      expect_equal(as.numeric(fit$theta[["tcl"]]), as.numeric(f.focei$theta[["tcl"]]), tolerance = 0.1, info = meth)
+      expect_equal(as.numeric(fit$theta[["tv"]]), as.numeric(f.focei$theta[["tv"]]), tolerance = 0.1, info = meth)
+      # add.sd is the parameter the r=0 bug corrupted most (it inflated it
+      # ~9x in the reproduction that motivated #976); give it a bit more room
+      expect_equal(
+        as.numeric(fit$theta[["add.sd"]]),
+        as.numeric(f.focei$theta[["add.sd"]]),
+        tolerance = 0.2,
+        info = meth
+      )
+    }
+  })
+
+  test_that("nlm-family M3-censored propT() parameter estimates match focei (#976 follow-up)", {
+    # #976 follow-up (antigravity review): .fixCensRNuLine() (R/focei.R,
+    # shared by nlm-family and, gated, the t()/cauchy() FOCEi path from
+    # #979) rebuilt rx_r_ by re-inlining rx_rll_'s defining EXPRESSION
+    # (e.g. sqrt((b*rx_pred_)^2) for propT()/powT(), whose F is the
+    # TRANSFORMED prediction, i.e. the symbol rx_pred_ itself -- see
+    # rxode2's .rxGetVarianceForErrorPropOrPowF()).  That expression is
+    # placed at the rx_r_ ~ 0 line's position, which comes AFTER rx_pred_
+    # has already been overwritten with the scalar log-likelihood
+    # (rx_pred_ <- llikNorm(dv, rx_pred_, rx_rll_)).  Re-evaluating the AST
+    # there silently fed the log-likelihood value back in as the propT()
+    # mean, corrupting rx_r_ for any transformed prop()/pow() error model.
+    # The fix instead references the already-computed rx_rll_ VARIABLE
+    # (rx_r_ ~ rx_rll_^2), which still holds its original value at that
+    # point.  A plain add()/prop() (F = rx_pred_f_, a column untouched by
+    # the llik overwrite) would not have caught this -- propT() is
+    # required to exercise the bug.
+    one.cmt.propT <- function() {
+      ini({
+        tka <- 0.45
+        tcl <- log(c(0, 2.7, 100))
+        tv <- 3.45
+        prop.sd <- c(0, 0.3)
+      })
+      model({
+        ka <- exp(tka)
+        cl <- exp(tcl)
+        v <- exp(tv)
+        linCmt() ~ propT(prop.sd)
+      })
+    }
+    f.focei <- .nlmixr(one.cmt.propT, .datM3, est = "focei", control = foceiControl(print = 0))
+    fit <- .nlmixr(one.cmt.propT, .datM3, est = "bobyqa", control = nlmControl(print = 0))
+    expect_equal(as.numeric(fit$theta[["tka"]]), as.numeric(f.focei$theta[["tka"]]), tolerance = 0.15)
+    expect_equal(as.numeric(fit$theta[["tcl"]]), as.numeric(f.focei$theta[["tcl"]]), tolerance = 0.15)
+    expect_equal(as.numeric(fit$theta[["tv"]]), as.numeric(f.focei$theta[["tv"]]), tolerance = 0.15)
+    expect_equal(as.numeric(fit$theta[["prop.sd"]]), as.numeric(f.focei$theta[["prop.sd"]]), tolerance = 0.15)
+  })
 })

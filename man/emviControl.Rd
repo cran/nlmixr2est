@@ -261,6 +261,12 @@ wrapping. `NULL` (default) uses `floor((getOption("width") - 23) / 12)`.}
  between-subject variability dominates the residual), so those variance-block standard
  errors are spliced in from the linearized FIM (\code{linFim}).
 
+ Neither is used for a general log-likelihood endpoint (\code{ll()}), which has
+ no residual error to anchor the complete-data correction; such a model goes
+ straight to \code{linFim} with a message.  This includes a residual error with
+ modeled components (\code{a <- add.sd*exp(eta.sd); cp ~ add(a)}), which saem
+ fits as \code{cp ~ add(a) + dnorm()}.
+
  "\code{r,s}" Uses the sandwich matrix to calculate the covariance, that is: \eqn{R^-1 \times S \times R^-1}
 
  "\code{r}" Uses the Hessian matrix to calculate the covariance as \eqn{2\times R^-1}
@@ -343,8 +349,7 @@ against a default \code{rtol = 1e-6}.  Raise \code{sigdig}, or set
 \code{atol}/\code{rtol} directly, when you want a tighter solve.}
 
 \item{sigdigTable}{Significant digits in the final output table.
-If not specified, then it matches the significant digits in the
-`sigdig` optimization algorithm.  If `sigdig` is NULL, use 3.}
+If not specified (`NULL`), it defaults to `sigdig`.}
 
 \item{stickyRecalcN}{The number of bad ODE solves before reducing
 the atol/rtol for the rest of the problem.}
@@ -365,7 +370,13 @@ each retry and tolerances are reset afterward.}
 \item{eventSens}{Controls how dosing/event-parameter (`alag`, `F`,
 `rate`, `dur`) sensitivities are computed for THETA/ETA gradients:
 `"jump"` (default) uses rxode2's analytic event sensitivities; `"fd"`
-uses the legacy finite-difference behavior.}
+uses the legacy finite-difference behavior.  Also gates the analytic
+moving-boundary correction for a modeled `alag()`/`f()` on a `linCmt()`
+compartment; set `"fd"` if that model infuses a dose into the
+lagged/scaled compartment (rxode2/rxode2#1236), or if the regimen also
+doses an *unlagged/unscaled* compartment alongside the lagged/scaled one
+-- a common design for estimating `f()` from paired IV+oral data
+(rxode2/rxode2#1237).}
 
 \item{rxControl}{`rxode2` ODE solving options during fitting, created with `rxControl()`}
 

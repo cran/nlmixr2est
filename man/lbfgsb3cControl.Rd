@@ -165,7 +165,13 @@ sd, c = power exponent (1 in the proportional case).}
 \item{eventSens}{Controls how dosing/event-parameter (`alag`, `F`,
 `rate`, `dur`) sensitivities are computed for THETA/ETA gradients:
 `"jump"` (default) uses rxode2's analytic event sensitivities; `"fd"`
-uses the legacy finite-difference behavior.}
+uses the legacy finite-difference behavior.  Also gates the analytic
+moving-boundary correction for a modeled `alag()`/`f()` on a `linCmt()`
+compartment; set `"fd"` if that model infuses a dose into the
+lagged/scaled compartment (rxode2/rxode2#1236), or if the regimen also
+doses an *unlagged/unscaled* compartment alongside the lagged/scaled one
+-- a common design for estimating `f()` from paired IV+oral data
+(rxode2/rxode2#1237).}
 
 \item{sensMethod}{Method used to compute the ODE parameter sensitivities.
 `"forward"` uses the classic variational (forward) sensitivity ODEs;
@@ -202,8 +208,7 @@ exactly the precision the solve supports.  At the default \code{sigdig = 3}
 this is \code{atol = 1e-6}, \code{rtol = 1e-3}.}
 
 \item{sigdigTable}{Significant digits in the final output table.
-If not specified, then it matches the significant digits in the
-`sigdig` optimization algorithm.  If `sigdig` is NULL, use 3.}
+If not specified (`NULL`), it defaults to `sigdig`.}
 
 \item{...}{Ignored parameters}
 }

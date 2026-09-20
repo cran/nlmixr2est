@@ -36,6 +36,9 @@ std::string impDiagXform();
 
 // Convergence controller / proposal-scale adaptation controls (from impmapControl):
 double impIaccept();      // target effective-sample fraction that gamma adapts toward
+int impMapIter();         // MAP-assist period in EM iterations; 0 = never re-center
+int impNburn();           // burn-in EM iterations run before the nIter budget
+bool impBurnFreezeOmega();// hold Omega at its starting value during burn-in
 double impDf();           // proposal degrees of freedom (NONMEM DF); 0 = Gaussian
 void impNsampleVecGet(std::vector<int>& out); // per-subject ISAMPLE (empty = use the scalar)
 int impNobs(int id);      // observation count for subject id (AUTO's sparsity test)
@@ -104,8 +107,17 @@ struct impThetaSensData {
   std::vector<arma::vec> fvec, Vvec;    // [nsamp], each length nobs
   std::vector<arma::mat> dfmat, dVmat;  // [nsamp], each nobs x nSens
   std::vector<char> sampleOk;           // [nsamp], 0 = drop this sample
+  // d(transformed DV)/d(theta) and d(transformed LIMIT)/d(theta), nobs x nSens.
+  // Empty unless the transform-both-sides lambda is itself estimated (#949): then
+  // the residual err = h(y; lambda) - h(f; lambda) moves on BOTH sides, and the
+  // DV side is applied here because the sensitivity model never sees the DV.
+  arma::mat ddvmat, dlimmat;
 };
-void impThetaSensCollect(int id, const arma::mat& S, impThetaSensData& out);
+// reuseSolve (#958): the caller has JUST solved the combined inner model at
+// this exact (theta, eta) point on this thread (single-sample case), so the
+// read pass consumes that solution instead of re-solving.
+void impThetaSensCollect(int id, const arma::mat& S, impThetaSensData& out,
+                         bool reuseSolve = false);
 void impThetaAccumOne(const impThetaSensData& c, const arma::vec& zk,
                       arma::vec& g, arma::mat& H);
 
@@ -119,6 +131,34 @@ void impInnerParallelOff();
 
 // Number of non-mu structural thetas (the length of impThetaSensIdx).
 int impThetaSensN();
+
+// One-step MAP (Newton/Fisher-scoring) correction: folds the ini({}) prior's
+// score/curvature for the non-mu structural thetas into the data-only score
+// `g`/information `H` impThetaAccumOne() already accumulated (post-/nsub),
+// before the caller's arma::solve(step, H, g).  No-op when there is no
+// prior.  See src/inner.cpp for the sign convention and derivation.
+void impPriorStructThetaCorrect(int nsub, arma::vec& g, arma::mat& H);
+
+// MAP correction for the Omega EM moment-average update: `Omega` on entry
+// is the plain ML moment average (mean_i(eta_i*eta_i' + condVar_i), BEFORE
+// the caller's structure mask/fixed-row restore); corrected toward the
+// prior in place (exact conjugate update for an invWishart term, a one-step
+// Fisher-scoring correction otherwise).  No-op when there is no prior
+// touching omega.  See src/inner.cpp for the derivation.
+void impPriorOmegaCorrect(arma::mat& Omega, int nsub);
+
+// Whether the combined eta+theta sensitivity build (#958) is loaded -- the
+// INNER model carries the theta columns, so impEStep's harvest path applies.
+bool impCombSensEnabled();
+
+// Whether subject id's last impEvalJointLik() call solved the INNER model
+// itself (TRUE) rather than falling back to the pred-model FD path (FALSE, in
+// which case ind->solve does not hold the inner model's trajectory and a
+// combSens harvest must not reuse it).
+bool impLastInnerSolveUsable(int id);
+
+// Count a successful impEStep harvest read (odeSwapInfo_()$impThetaSensHarvestN).
+void impThetaSensHarvestTick();
 
 // 0-based eta indices whose Omega diagonal is fixed (held across the EM update).
 void impGetOmegaFixedEta(std::vector<int>& idx);
@@ -134,7 +174,8 @@ double impMixProb(int j);                          // population proportion of c
 void impUpdateMixProbs();                          // recompute mixProb from the mix() proportion thetas (npag/npb setup)
 void impSetMixThetas(const arma::vec& theta);      // install absolute mixture-proportion thetas (EM) + recompute proportions
 void npMixEMUpdate(const arma::mat& etaPoints, const arma::vec& lam, int cores); // EM update of the mixture proportions (support/weights fixed)
-void npbSampleMixProbs(const arma::mat& subEta, double alpha0);     // npb Gibbs: Dirichlet draw of the mixture proportions
+void npbSampleMixProbs(const arma::mat& subEta, double alpha0, uint32_t seed);     // npb Gibbs: Dirichlet draw of the mixture proportions
+double impMixLogSumExp(const std::vector<double>& ll);  // log(sum_m p_m exp(ll[m])); R_NegInf if nothing finite
 
 // ---- Monte-Carlo covariance support (implemented in inner.cpp) ----
 int impNtheta();                                   // number of thetas
@@ -144,6 +185,9 @@ bool impCovEnabled();                              // whether impCov=TRUE was re
 bool impQrEnabled();                               // qr=TRUE: Sobol importance samples
 bool impQrShiftEnabled();                          // Cranley-Patterson shift randomization
 bool impQrRefreshEnabled();                        // redraw the shift each iteration
+int impQrScramble();                               // 0 none, 1 Owen, 2 linear matrix
+int impProposalType();                             // 0 auto, 1 normal, 2 t, 3 laplace, 4 mixture
+void impPropMixGet(std::vector<double>& c, std::vector<double>& w); // mixture scales/weights
 bool impSirEnabled();                              // sir=TRUE: SIR-accelerated theta M-step
 int impSirN();                                     // SIR resampled points per subject
 int impBaseSeed();                                 // base seed for the per-(iter,subject) streams
@@ -162,14 +206,15 @@ void impClearInnerNeqOverride();
 // Apply a Newton step: add `step` (length nSens) to the non-mu structural thetas
 // and propagate to the full parameter vector.
 void impUpdateStructThetas(const arma::vec& step);
+double impStructStepRel(const arma::vec& step);
 
 // ---- implemented in imp.cpp ----
 
 // Monte-Carlo observed-information covariance for the estimated thetas: FD
 // Hessian of the importance-sampling -2LL over fixed (common-random-number)
 // samples.  Stashes impCovTheta / impSeTheta / impCovThetaIdx on `e`.
-void impComputeCov(Rcpp::Environment e, const arma::vec& gammaVec,
-                   const arma::vec& dfVec);
+// (declared in imp.cpp, which owns the impProp proposal type; not called
+// outside that translation unit)
 bool impCovProgress();                             // draw the cov-step progress bar?
 
 // Importance-sampling EM driver; called from foceiFitCpp_ when est=="impmap"

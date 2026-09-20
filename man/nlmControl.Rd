@@ -28,6 +28,7 @@ nlmControl(
   shi21maxHess = 20L,
   censOption = c("gauss", "laplace"),
   eventSens = c("jump", "fd"),
+  linCmtSensCarry = c("auto", "none"),
   sensMethod = c("default", "forward"),
   useColor = NULL,
   printNcol = NULL,
@@ -154,7 +155,18 @@ finite-difference Hessian that already reflects censoring exactly.}
 \item{eventSens}{Controls how dosing/event-parameter (`alag`, `F`,
 `rate`, `dur`) sensitivities are computed for THETA/ETA gradients:
 `"jump"` (default) uses rxode2's analytic event sensitivities; `"fd"`
-uses the legacy finite-difference behavior.}
+uses the legacy finite-difference behavior.  Also gates the analytic
+moving-boundary correction for a modeled `alag()`/`f()` on a `linCmt()`
+compartment; set `"fd"` if that model infuses a dose into the
+lagged/scaled compartment (rxode2/rxode2#1236), or if the regimen also
+doses an *unlagged/unscaled* compartment alongside the lagged/scaled one
+-- a common design for estimating `f()` from paired IV+oral data
+(rxode2/rxode2#1237).}
+
+\item{linCmtSensCarry}{use the linCmt() sensitivity carry for a theta on
+a covariate-driven linCmt() parameter ("auto", the default) or keep the
+standard gradient ("none"); see `foceiControl()`'s argument of the same
+name.}
 
 \item{sensMethod}{Method used to compute the ODE parameter sensitivities.
 `"forward"` uses the classic variational (forward) sensitivity ODEs;
@@ -268,8 +280,7 @@ exactly the precision the solve supports.  At the default \code{sigdig = 3}
 this is \code{atol = 1e-6}, \code{rtol = 1e-3}.}
 
 \item{sigdigTable}{Significant digits in the final output table.
-If not specified, then it matches the significant digits in the
-`sigdig` optimization algorithm.  If `sigdig` is NULL, use 3.}
+If not specified (`NULL`), it defaults to `sigdig`.}
 
 \item{boundedTransform}{When `TRUE` (default), bounded parameters are
 transformed for unbounded optimization methods and back-transformed
@@ -286,28 +297,27 @@ nlm control object
 nlmixr2 defaults controls for nlm
 }
 \examples{
-
 \donttest{
 # A logit regression example with emax model
 
-dsn <- data.frame(i=1:1000)
+dsn <- data.frame(i = 1:1000)
 dsn$time <- exp(rnorm(1000))
-dsn$DV=rbinom(1000,1,exp(-1+dsn$time)/(1+exp(-1+dsn$time)))
+dsn$DV <- rbinom(1000, 1, exp(-1 + dsn$time) / (1 + exp(-1 + dsn$time)))
 
 mod <- function() {
- ini({
-   E0 <- 0.5
-   Em <- 0.5
-   E50 <- 2
-   g <- fix(2)
- })
- model({
-   v <- E0+Em*time^g/(E50^g+time^g)
-   ll(bin) ~ DV * v - log(1 + exp(v))
- })
+  ini({
+    E0 <- 0.5
+    Em <- 0.5
+    E50 <- 2
+    g <- fix(2)
+  })
+  model({
+    v <- E0 + Em * time^g / (E50^g + time^g)
+    ll(bin) ~ DV * v - log(1 + exp(v))
+  })
 }
 
-fit2 <- nlmixr(mod, dsn, est="nlm")
+fit2 <- nlmixr(mod, dsn, est = "nlm")
 
 print(fit2)
 

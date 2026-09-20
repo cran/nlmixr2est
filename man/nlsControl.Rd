@@ -47,6 +47,7 @@ nlsControl(
   returnNls = FALSE,
   addProp = c("combined2", "combined1"),
   eventSens = c("jump", "fd"),
+  linCmtSensCarry = c("auto", "none"),
   calcTables = TRUE,
   compress = TRUE,
   adjObf = TRUE,
@@ -272,7 +273,19 @@ sd, c = power exponent (1 in the proportional case).}
 \item{eventSens}{Controls how dosing/event-parameter (`alag`, `F`,
 `rate`, `dur`) sensitivities are computed for THETA/ETA gradients:
 `"jump"` (default) uses rxode2's analytic event sensitivities; `"fd"`
-uses the legacy finite-difference behavior.}
+uses the legacy finite-difference behavior.  Also gates the analytic
+moving-boundary correction for a modeled `alag()`/`f()` on a `linCmt()`
+compartment; set `"fd"` if that model infuses a dose into the
+lagged/scaled compartment (rxode2/rxode2#1236), or if the regimen also
+doses an *unlagged/unscaled* compartment alongside the lagged/scaled one
+-- a common design for estimating `f()` from paired IV+oral data
+(rxode2/rxode2#1237).}
+
+\item{linCmtSensCarry}{`"auto"` (default) substitutes the exact
+sensitivity-carry gradient for a `linCmt()` parameter driven by both an
+eta and a time-varying covariate (needs an rxode2 with the carry
+sentinels; silently keeps the standard gradient otherwise); `"none"`
+always keeps the standard gradient.}
 
 \item{calcTables}{This boolean is to determine if the foceiFit
 will calculate tables. By default this is \code{TRUE}}
@@ -301,8 +314,7 @@ exactly the precision the solve supports.  At the default \code{sigdig = 3}
 this is \code{atol = 1e-6}, \code{rtol = 1e-3}.}
 
 \item{sigdigTable}{Significant digits in the final output table.
-If not specified, then it matches the significant digits in the
-`sigdig` optimization algorithm.  If `sigdig` is NULL, use 3.}
+If not specified (`NULL`), it defaults to `sigdig`.}
 
 \item{boundedTransform}{When `TRUE` (default), bounded parameters are
 transformed for unbounded optimization methods and back-transformed
@@ -318,34 +330,59 @@ nls control object
 \description{
 nlmixr2 defaults controls for nls
 }
+\section{Pooled (population-only) estimation}{
+
+
+`est="nls"` is a *pooled* estimation method.  It estimates population
+parameters only; there is no eta-conditional inner problem, and
+sensitivities are taken with respect to the population parameters alone.
+
+A model carrying any random effect is therefore refused before fitting
+rather than being fit to something other than what it says -- it stops
+with `can only have population estimates for the estimation routine
+'nls', try 'focei'`.
+
+A successful `nls` fit consequently has no `$omega`, no empirical Bayes
+estimates and no shrinkage, and its objective function table carries a
+single `Pop` row.  Use a mixed effects routine -- `est="focei"`,
+`est="saem"` and so on -- for any model with between-subject variability.
+
+Note that this help page inherits its parameter list from
+`foceiControl()`, `saemControl()` and `nlmControl()`, because `nls`
+shares many options with them.  Inherited options that only have meaning
+for random effects do not apply to `nls`.
+}
+
 \examples{
 \donttest{
 
 one.cmt <- function() {
   ini({
-   tka <- 0.45
-   tcl <- log(c(0, 2.7, 100))
-   tv <- 3.45
-   add.sd <- 0.7
- })
- model({
-   ka <- exp(tka)
-   cl <- exp(tcl)
-   v <- exp(tv)
-   linCmt() ~ add(add.sd)
- })
+    tka <- 0.45
+    tcl <- log(c(0, 2.7, 100))
+    tv <- 3.45
+    add.sd <- 0.7
+  })
+  model({
+    ka <- exp(tka)
+    cl <- exp(tcl)
+    v <- exp(tv)
+    linCmt() ~ add(add.sd)
+  })
 }
+
+# Note that `one.cmt` declares no random effects: `nls` is a pooled
+# method and refuses a model that has any.
 
 # Uses nlsLM from minpack.lm if available
 
-fit1 <- nlmixr(one.cmt, nlmixr2data::theo_sd, est="nls", nlsControl(algorithm="LM"))
+fit1 <- nlmixr(one.cmt, nlmixr2data::theo_sd, est = "nls", nlsControl(algorithm = "LM"))
 
 # Uses port and respect parameter boundaries
-fit2 <- nlmixr(one.cmt, nlmixr2data::theo_sd, est="nls", nlsControl(algorithm="port"))
+fit2 <- nlmixr(one.cmt, nlmixr2data::theo_sd, est = "nls", nlsControl(algorithm = "port"))
 
 # You can access the underlying nls object with `$nls`
 fit2$nls
-
 }
 }
 \author{

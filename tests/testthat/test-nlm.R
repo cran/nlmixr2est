@@ -1,6 +1,5 @@
 nmTest({
   test_that("nlm models convert strings to numbers", {
-
     mod <- function() {
       ini({
         E0 <- 0.5
@@ -23,11 +22,9 @@ nmTest({
     m <- mod()
 
     expect_error(suppressMessages(rxode2::rxNorm(m$nlmRxModel$predOnly)), NA)
-
   })
 
   test_that("nlm models add interp", {
-
     mod <- function() {
       ini({
         E0 <- 0.5
@@ -44,8 +41,7 @@ nmTest({
 
     m <- suppressMessages(mod())
 
-    expect_false(grepl("linear\\(wt\\)",
-                       suppressMessages(rxode2::rxNorm(m$nlmRxModel$predOnly))))
+    expect_false(grepl("linear\\(wt\\)", suppressMessages(rxode2::rxNorm(m$nlmRxModel$predOnly))))
 
     mod <- function() {
       ini({
@@ -64,15 +60,13 @@ nmTest({
 
     m <- suppressMessages(mod())
 
-    expect_true(grepl("linear\\(wt\\)",
-                      suppressMessages(rxode2::rxNorm(m$nlmRxModel$predOnly))))
+    expect_true(grepl("linear\\(wt\\)", suppressMessages(rxode2::rxNorm(m$nlmRxModel$predOnly))))
   })
 
   test_that("nlm makes sense", {
-
-    dsn <- data.frame(i=1:1000)
+    dsn <- data.frame(i = 1:1000)
     dsn$time <- exp(rnorm(1000))
-    dsn$DV <- rbinom(1000,1,exp(-1+dsn$time)/(1+exp(-1+dsn$time)))
+    dsn$DV <- rbinom(1000, 1, exp(-1 + dsn$time) / (1 + exp(-1 + dsn$time)))
 
     mod <- function() {
       ini({
@@ -88,34 +82,34 @@ nmTest({
       })
     }
 
-    fit2 <- .nlmixr(mod, dsn, est="nlm", nlmControl(print=0))
+    fit2 <- .nlmixr(mod, dsn, est = "nlm", nlmControl(print = 0))
 
     expect_s3_class(fit2, "nlmixr2.nlm")
 
-    fit2 <- .nlmixr(mod, dsn, est="bobyqa", bobyqaControl(print=0))
+    fit2 <- .nlmixr(mod, dsn, est = "bobyqa", bobyqaControl(print = 0))
 
     expect_s3_class(fit2, "nlmixr2.bobyqa")
 
-    fit2 <- .nlmixr(mod, dsn, est="uobyqa", uobyqaControl(print=0))
+    fit2 <- .nlmixr(mod, dsn, est = "uobyqa", uobyqaControl(print = 0))
 
     expect_s3_class(fit2, "nlmixr2.uobyqa")
 
-    fit2 <- .nlmixr(mod, dsn, est="newuoa", newuoaControl(print=0))
+    fit2 <- .nlmixr(mod, dsn, est = "newuoa", newuoaControl(print = 0))
 
     expect_s3_class(fit2, "nlmixr2.newuoa")
 
-    fit2 <- .nlmixr(mod, dsn, est="n1qn1", n1qn1Control(print=0))
+    fit2 <- .nlmixr(mod, dsn, est = "n1qn1", n1qn1Control(print = 0))
 
     expect_s3_class(fit2, "nlmixr2.n1qn1")
 
-    fit2 <- .nlmixr(mod, dsn, est="lbfgsb3c", lbfgsb3cControl(print=0))
+    fit2 <- .nlmixr(mod, dsn, est = "lbfgsb3c", lbfgsb3cControl(print = 0))
 
     expect_s3_class(fit2, "nlmixr2.lbfgsb3c")
 
     fit3 <- suppressMessages({
       fit2 |>
         ini(g=unfix) |>
-        .nlmixr(dsn, "nlm", nlmControl(solveType="grad", print=0))
+        .nlmixr(dsn, "nlm", nlmControl(solveType = "grad", print = 0))
     })
 
     expect_s3_class(fit3, "nlmixr2.nlm")
@@ -123,7 +117,7 @@ nmTest({
     fit4 <- suppressMessages({
       fit2 |>
         ini(g=unfix) |>
-        .nlmixr(dsn, "nlm", nlmControl(solveType="fun", print=0))
+        .nlmixr(dsn, "nlm", nlmControl(solveType = "fun", print = 0))
     })
 
     expect_s3_class(fit4, "nlmixr2.nlm")
@@ -143,10 +137,14 @@ nmTest({
       })
     }
 
-    fit2 <- .nlmixr(one.cmt, nlmixr2data::theo_sd, est="nlm", list(print=0))
+    fit2 <- .nlmixr(one.cmt, nlmixr2data::theo_sd, est = "nlm", list(print = 0))
 
-    fit1 <- .nlmixr(one.cmt, nlmixr2data::theo_sd, est="nlm",
-                   nlmControl(scaleTo=0.0, scaleType="multAdd", print=0))
+    fit1 <- .nlmixr(
+      one.cmt,
+      nlmixr2data::theo_sd,
+      est = "nlm",
+      nlmControl(scaleTo = 0.0, scaleType = "multAdd", print = 0)
+    )
 
     expect_s3_class(fit1, "nlmixr2.nlm")
   })
@@ -168,8 +166,12 @@ nmTest({
       })
     }
 
+    # A pure-linear matExp() model takes the native matrix-exponential
+    # sensitivity path (#860, .sensMatExpNative()) instead of the ODE
+    # flatten -- see the matching comment in test-focei-1.R.
     s <- rxUiGet.nlmThetaS(list(rxode2::rxode2(mod)))
-    expect_true(exists("..jacobian", envir = s, inherits = FALSE))
+    expect_true(isTRUE(s$..matExpNative))
+    expect_false(exists("..jacobian", envir = s, inherits = FALSE))
     expect_true(exists("..sens", envir = s, inherits = FALSE))
   })
 
@@ -220,7 +222,6 @@ nmTest({
   })
 
   test_that("nlm multi-subject parallel solving works", {
-
     one.cmt <- function() {
       ini({
         tka <- 0.45
@@ -238,7 +239,7 @@ nmTest({
 
     .dat <- nlmixr2data::theo_md
     .nSubjects <- length(unique(.dat$ID))
-    fit <- .nlmixr(one.cmt, .dat, est="nlm", list(print=0))
+    fit <- .nlmixr(one.cmt, .dat, est = "nlm", list(print = 0))
 
     expect_s3_class(fit, "nlmixr2.nlm")
     expect_true(.nSubjects > 1)
@@ -287,9 +288,7 @@ nmTest({
 
     .testSeed(123)
     .ev <- et(amt = 320, cmt = "depot", id = 1:6) |> et(seq(0.5, 24, by = 1.5))
-    .sim <- rxode2::rxSolve(odeMM, .ev,
-                            params = c(tka = 0.5, tvmax = log(60),
-                                       tkm = log(40), tv = 3.45))
+    .sim <- rxode2::rxSolve(odeMM, .ev, params = c(tka = 0.5, tvmax = log(60), tkm = log(40), tv = 3.45))
     .dat <- as.data.frame(.sim)[, c("id", "time", "cp")]
     .dat$cp <- .dat$cp + stats::rnorm(nrow(.dat), 0, 0.3)
     names(.dat) <- c("ID", "TIME", "DV")
@@ -307,5 +306,46 @@ nmTest({
     # so the objective function and fixed effects must agree.
     expect_equal(.fMat$objf, .fOde$objf, tolerance = 1e-3)
     expect_equal(unname(fixef(.fMat)), unname(fixef(.fOde)), tolerance = 1e-3)
+  })
+
+  test_that("nlm-family covariance from a ll() model matches the Poisson GLM (#issue not doubled)", {
+    # A constant-hazard RTTE ll() model is, up to a constant, the same
+    # likelihood as a Poisson GLM with a log-time offset -- so their SEs
+    # should agree.  Before the fix, nlm-family covariances (bobyqa/nlm/...)
+    # were 4x too large (SE 2x too large) because the objective is built as
+    # a plain -1*LL (not -2*LL like FOCEI/SAEM), while the Hessian->cov step
+    # in `.nlmFinalizeList()` assumed a -2*LL scale.
+    set.seed(1099)
+    .n <- 60L
+    .trt <- rep(0:1, each = .n)
+    .h <- exp(-2 + -0.4 * .trt)
+    .time <- pmin(stats::rexp(length(.trt), rate = .h), 5)
+    .event <- as.integer(.time < 5)
+    .dat <- data.frame(id = seq_along(.trt), time = .time, event = .event, trt = .trt, dv = .time, evid = 0L)
+
+    .mod <- function() {
+      ini({
+        log_h0 <- log(0.2)
+        log_hr <- -0.1
+      })
+      model({
+        log_h <- log_h0 + log_hr * trt
+        h <- exp(log_h)
+        H <- h * time
+        tte_ll <- event * log_h - H
+        ll(tte) ~ tte_ll
+      })
+    }
+
+    .fit <- suppressMessages(
+      .nlmixr(.mod, .dat, est = "bobyqa", bobyqaControl(print = 0))
+    )
+
+    .glm <- glm(event ~ trt, offset = log(time), family = poisson(), data = .dat)
+
+    .seNlmixr <- .fit$parFixedDf[c("log_h0", "log_hr"), "SE"]
+    .seGlm <- summary(.glm)$coefficients[, "Std. Error"]
+
+    expect_equal(unname(.seNlmixr), unname(.seGlm), tolerance = 0.1)
   })
 })

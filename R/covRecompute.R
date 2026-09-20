@@ -17,9 +17,10 @@
 #' @return list(ui, data, etaMat) or NULL on failure
 #' @noRd
 .covPinnedRefitArgs <- function(fit) {
-  .ui <- tryCatch(rxode2::rxUiDecompress(unserialize(serialize(fit$ui, NULL))),
-                  error = function(e) NULL)
-  if (is.null(.ui)) return(NULL)
+  .ui <- tryCatch(rxode2::rxUiDecompress(unserialize(serialize(fit$ui, NULL))), error = function(e) NULL)
+  if (is.null(.ui)) {
+    return(NULL)
+  }
   .th <- tryCatch(fit$theta, error = function(e) NULL)
   if (!is.null(.th)) {
     .w <- match(names(.th), .ui$iniDf$name)
@@ -29,9 +30,9 @@
   .eta <- tryCatch(fit$eta, error = function(e) NULL)
   .etaMat <- NULL
   if (!is.null(.eta)) {
-    .etaCols <- setdiff(names(.eta), "ID")
-    if (length(.etaCols) > 0L) {
-      .etaMat <- as.matrix(.eta[, .etaCols, drop = FALSE])
+    .eta <- .nmDropNonEtaCols(.eta)
+    if (ncol(.eta) > 0L) {
+      .etaMat <- as.matrix(.eta)
     }
   }
   list(ui = .ui, data = getData(fit), etaMat = .etaMat)
@@ -47,17 +48,44 @@
 #' @noRd
 .covRecomputeNative <- function(fit, est, control, useEtaMat = TRUE) {
   .a <- .covPinnedRefitArgs(fit)
-  if (is.null(.a)) return(NULL)
-  if (useEtaMat && !is.null(.a$etaMat)) control$etaMat <- .a$etaMat
+  if (is.null(.a)) {
+    return(NULL)
+  }
+  if (useEtaMat && !is.null(.a$etaMat)) {
+    control$etaMat <- .a$etaMat
+  }
+  # This re-fit is pinned at the converged estimates but still takes a frozen EM / SA
+  # step, so it CAN move a theta.  For a hand-written likelihood that means it can step a
+  # scale out of its domain, where rxode2's default safeLog hands back a large finite
+  # reward instead of a rejection -- and the covariance would then be formed around a
+  # point the likelihood cannot evaluate (nlmixr2/nlmixr2est#850).  Ask for the
+  # log-domain mode here too; a no-op while every parameter stays valid.
+  control$rxControl <- .npSafeLogDomain(control$rxControl, .a$ui)
   # the nested re-fit resets mu-referencing global state; save + restore
   .savedMuRef <- .muRefTrans$cur
   on.exit(.muRefTrans$cur <- .savedMuRef, add = TRUE)
-  .fit2 <- try(suppressMessages(suppressWarnings(
-    nlmixr2(.a$ui, data = .a$data, est = est, control = control))), silent = TRUE)
-  if (inherits(.fit2, "try-error")) return(NULL)
+  # fixed-parameter re-fit of an already-accepted model: bypass the prior gate
+  # (#938) -- .covRecomputeFo forces est="focei", which declares no prior
+  # support, and the try() below would otherwise silently return NULL for a
+  # prior-carrying fit
+  .fit2 <- try(
+    suppressMessages(suppressWarnings(
+      .nlmixr2PriorGateBypass(
+        nlmixr2(.a$ui, data = .a$data, est = est, control = control)
+      )
+    )),
+    silent = TRUE
+  )
+  if (inherits(.fit2, "try-error")) {
+    return(NULL)
+  }
   .cov <- tryCatch(.fit2$cov, error = function(e) NULL)
-  if (is.null(.cov) || !is.matrix(.cov)) return(NULL)
-  list(cov = .cov, covMethod = .fit2$covMethod)
+  if (is.null(.cov) || !is.matrix(.cov)) {
+    return(NULL)
+  }
+  # .fit2 is a full re-fit, so its $cov has already been through
+  # .mixInstallProbScaleCov(); say so, or .covInstallResult() rotates it twice.
+  list(cov = .cov, covMethod = .fit2$covMethod, mixRotated = TRUE)
 }
 
 #' Recompute the SAEM Louis SA-FIM ("sa") at any fit's converged estimates.
@@ -68,43 +96,78 @@
 #' produces a non-finite FIM), then the dedicated `nSaCov` phase accumulates the
 #' Louis observed-information at the (essentially unchanged) converged point.
 #' @param fit completed nlmixr2 fit
-#' @param nBurn,nEm short warm-up iteration counts (default 100 each)
+#' @param control `saControl()` options, or `NULL` for the defaults
 #' @return list(cov, covMethod, extras) or NULL
 #' @noRd
-.covRecomputeSa <- function(fit, nBurn = 100L, nEm = 100L) {
+.covRecomputeSa <- function(fit, control = NULL) {
   # SAEM derives its own etaMat from the MCMC; no external eta seed
-  .covRecomputeNative(fit, "saem",
-                      saemControl(nBurn = as.integer(nBurn), nEm = as.integer(nEm),
-                                  covMethod = "sa", calcTables = FALSE),
-                      useEtaMat = FALSE)
+  .covRecomputeNative(fit, "saem", .covEngineControl("sa", control), useEtaMat = FALSE)
 }
 
 #' Recompute the importance-sampling Monte-Carlo covariance ("imp") at any fit's
 #' converged estimates.
 #'
 #' Runs the impmap kernel (already `maxOuterIterations=0`) with a single frozen
-#' EM step (`nIter=1, mapIter=0`; the kernel requires >=1 iteration) at the
+#' EM step (`nIter=1, mapIter=0`) at the
 #' pinned converged estimates, so the MAP pass + `impComputeCov` evaluate the
 #' Monte-Carlo observed information essentially at the converged point.
 #' @param fit completed nlmixr2 fit
-#' @param nIter frozen EM iterations (default 1; kernel segfaults at 0)
+#' @param control `impCovControl()` options, or `NULL` for the defaults
 #' @return list(cov, covMethod, extras) or NULL
 #' @noRd
-.covRecomputeImp <- function(fit, nIter = 1L) {
-  .covRecomputeNative(fit, "imp",
-                      impmapControl(nIter = as.integer(nIter), mapIter = 0L,
-                                    covMethod = "imp", calcTables = FALSE),
-                      useEtaMat = TRUE)
+.covRecomputeImp <- function(fit, control = NULL) {
+  .covRecomputeNative(fit, "imp", .covEngineControl("imp", control), useEtaMat = TRUE)
+}
+
+#' Engine control for a decoupled covariance recompute
+#' @param method "sa" or "imp"
+#' @param control `saControl()`/`impCovControl()` options, or `NULL` for the
+#'   defaults
+#' @return `saemControl()` or `impmapControl()` object
+#' @noRd
+.covEngineControl <- function(method, control = NULL) {
+  if (identical(method, "sa")) {
+    if (is.null(control)) {
+      control <- saControl()
+    }
+    return(saemControl(
+      nBurn = control$nBurn,
+      nEm = control$nEm,
+      nSaCov = control$nSaCov,
+      seed = control$seed,
+      covMethod = "sa",
+      calcTables = FALSE
+    ))
+  }
+  if (is.null(control)) {
+    control <- impCovControl()
+  }
+  # impmap's default SIR sample (at least 25) cannot exceed a small isample
+  .sir <- min(max(25L, as.integer(ceiling(max(control$isample) / 10))), min(control$isample))
+  impmapControl(
+    nIter = control$nIter,
+    mapIter = 0L,
+    isample = control$isample,
+    impSeed = control$impSeed,
+    sirSample = .sir,
+    covMethod = "imp",
+    calcTables = FALSE
+  )
 }
 
 #' Dispatcher: recompute a decoupled covariance ("sa"/"imp") on a completed fit.
 #' @param fit completed nlmixr2 fit
 #' @param method "sa" or "imp"
+#' @param control covariance control, or `NULL` for the defaults
 #' @return list(cov, covMethod, extras) or NULL
 #' @noRd
-.covRecompute <- function(fit, method) {
-  if (identical(method, "sa")) return(.covRecomputeSa(fit))
-  if (identical(method, "imp")) return(.covRecomputeImp(fit))
+.covRecompute <- function(fit, method, control = NULL) {
+  if (identical(method, "sa")) {
+    return(.covRecomputeSa(fit, control = control))
+  }
+  if (identical(method, "imp")) {
+    return(.covRecomputeImp(fit, control = control))
+  }
   NULL
 }
 
@@ -120,19 +183,35 @@
 #' @return invisibly TRUE if a new covariance was installed
 #' @noRd
 .covInstallResult <- function(env, r) {
-  if (is.null(r) || is.null(r$cov) || !is.matrix(r$cov)) return(invisible(FALSE))
-  .cov <- 0.5 * (r$cov + t(r$cov))                         # exact symmetry
+  if (is.null(r) || is.null(r$cov) || !is.matrix(r$cov)) {
+    return(invisible(FALSE))
+  }
+  .cov <- 0.5 * (r$cov + t(r$cov)) # exact symmetry
+  # A covariance computed directly (analytic) is on the mlogit estimation scale
+  # and needs the mixture block rotated onto the probability scale; one that came
+  # back from a re-fit (sa/imp, via .covRecompute) was already rotated there.
+  # Key the rotation on the THETA slot, like every other consumer -- ui$mixProbs
+  # is in mix()-call order and would scramble the rows.
+  if (!isTRUE(r$mixRotated)) {
+    .mix <- .mixEnvPieces(env)
+    if (!is.null(.mix)) {
+      .cov <- tryCatch(.mixCovToProbScale(.cov, .mix$names, .mix$p), error = function(e) .cov)
+    }
+  }
   .ev <- suppressWarnings(eigen(.cov, symmetric = TRUE, only.values = TRUE)$values)
-  if (any(!is.finite(diag(.cov))) || any(diag(.cov) <= 0) ||
-        !all(is.finite(.ev)) || min(.ev) <= 0) {
-    return(invisible(FALSE))                               # keep the existing cov
+  if (any(!is.finite(diag(.cov))) || any(diag(.cov) <= 0) || !all(is.finite(.ev)) || min(.ev) <= 0) {
+    return(invisible(FALSE)) # keep the existing cov
   }
   # keep the prior covariance recoverable via setCov()
   if (exists("cov", envir = env, inherits = FALSE) && is.matrix(env$cov)) {
     .stash <- list(env$cov)
-    names(.stash) <- as.character(if (exists("covMethod", envir = env, inherits = FALSE)) {
-      env$covMethod
-    } else "prev")
+    names(.stash) <- as.character(
+      if (exists("covMethod", envir = env, inherits = FALSE)) {
+        env$covMethod
+      } else {
+        "prev"
+      }
+    )
     .cl <- if (exists("covList", envir = env, inherits = FALSE)) env$covList else NULL
     if (is.null(.cl[[names(.stash)]]) && !identical(names(.stash), r$covMethod)) {
       .cl <- c(.cl, .stash)
@@ -141,6 +220,11 @@
   }
   assign("cov", .cov, envir = env)
   assign("covMethod", r$covMethod, envir = env)
+  # An engine whose covariance carries no mixture rows at all (saem) needs the
+  # (7.51) block appended again -- the recomputed matrix REPLACED the one that
+  # had it, so without this a setCov() drops the proportion back to SE = NA.
+  .mixCovAppendBlock(env)
+  .cov <- tryCatch(get("cov", envir = env, inherits = FALSE), error = function(e) .cov)
   # refresh SE/%RSE/CI on the fit's own parameter table from the new covariance
   .updateParFixedRefreshSeFromCov(env, .cov)
   .nlmixr2CovConditionUpdate(env)

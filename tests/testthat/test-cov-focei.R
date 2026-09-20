@@ -1,7 +1,5 @@
 nmTest({
-
   test_that("cov-focei", {
-
     dat <-
       warfarin |>
       dplyr::filter(dvid == "cp")
@@ -30,13 +28,13 @@ nmTest({
         ktr <- 6 / mtt
 
         ## ODE example
-        d / dt(depot) <- -ktr * depot
-        d / dt(central) <- ktr * trans5 - (cl / v) * central
-        d / dt(trans1) <- ktr * depot - ktr * trans1
-        d / dt(trans2) <- ktr * trans1 - ktr * trans2
-        d / dt(trans3) <- ktr * trans2 - ktr * trans3
-        d / dt(trans4) <- ktr * trans3 - ktr * trans4
-        d / dt(trans5) <- ktr * trans4 - ktr * trans5
+        d/dt(depot) <- -ktr * depot
+        d/dt(central) <- ktr * trans5 - (cl / v) * central
+        d/dt(trans1) <- ktr * depot - ktr * trans1
+        d/dt(trans2) <- ktr * trans1 - ktr * trans2
+        d/dt(trans3) <- ktr * trans2 - ktr * trans3
+        d/dt(trans4) <- ktr * trans3 - ktr * trans4
+        d/dt(trans5) <- ktr * trans4 - ktr * trans5
 
         ## Concentration is calculated
         cp <- central / v
@@ -62,25 +60,68 @@ nmTest({
         linCmt() ~ add(add.sd)
       })
     }
-    fit_r  <- .nlmixr(one.cmt, theo_sd, "focei", foceiControl(covMethod = "r",   print = 0))
-    fit_s  <- .nlmixr(one.cmt, theo_sd, "focei", foceiControl(covMethod = "s",   print = 0))
-    fit_rs <- .nlmixr(one.cmt, theo_sd, "focei", foceiControl(covMethod = "r,s", print = 0))
+    # covFull = FALSE pins this to the NATIVE theta-only covariance, which is the
+    # thing the ratios below are about.  With the FD-full covariance installed the
+    # theta SEs come from inverting the JOINT theta+omega matrix instead, a
+    # different quantity (it carries the omega estimation uncertainty), and
+    # se_s/se_rs runs ~5 -- into the range this test reads as the old constant
+    # factor returning.  Keep the guard on the estimator it was written for; the
+    # SE/cov invariant under covFull is asserted separately below.
+    fit_r <- .nlmixr(one.cmt, theo_sd, "focei", foceiControl(covMethod = "r", print = 0, covFull = FALSE))
+    fit_s <- .nlmixr(one.cmt, theo_sd, "focei", foceiControl(covMethod = "s", print = 0, covFull = FALSE))
+    fit_rs <- .nlmixr(one.cmt, theo_sd, "focei", foceiControl(covMethod = "r,s", print = 0, covFull = FALSE))
 
     p <- c("tka", "tcl", "tv")
-    se_r  <- fit_r$parFixedDf[p,  "SE"]
-    se_s  <- fit_s$parFixedDf[p,  "SE"]
+    se_r <- fit_r$parFixedDf[p, "SE"]
+    se_s <- fit_s$parFixedDf[p, "SE"]
     se_rs <- fit_rs$parFixedDf[p, "SE"]
 
     # Before the #666 fix: SE_r was ~sqrt(2)*SE_rs (covR was 2*Rinv) and SE_s was ~2x that again
     # (covS was 4*Sinv).  covMethod="r" (observed information) and the "r,s" sandwich obey the
     # information equality, so r/rs stays ~1 and a return of the sqrt(2) scaling would push it >1.41.
-    expect_true(all(se_r  / se_rs < 1.3), label = "covMethod='r' SE not inflated vs sandwich")
+    expect_true(all(se_r / se_rs < 1.3), label = "covMethod='r' SE not inflated vs sandwich")
     # covMethod="s" is the OPG (score cross-product) estimator.  On this 12-subject dataset it
     # legitimately disagrees with the Hessian in its off-diagonals (S corr(tcl,tv) ~0.85 vs R's
     # ~0.12), so s/rs runs ~2 for cl/v -- finite-sample OPG behaviour that collapses toward 1 on
     # larger / well-specified data, NOT a scaling error.  This leg guards against the old constant
     # factor (covS = 4*Sinv), which would DOUBLE these ratios to ~4.5.
-    expect_true(all(se_s  / se_rs < 3), label = "covMethod='s' SE not inflated by the old 2x constant factor")
+    #
+    # Bound recalibrated from 3 to 3.5 when trustFterm/trustMterm's default was
+    # tightened to 10^(-sigdig-2): tcl's ratio moved from 1.00 to 3.09.  The
+    # looser inner solve was the reason the old numbers looked tame -- it also
+    # put se_r/se_rs at 0.30-0.50, which CONTRADICTS the information equality
+    # the r leg above asserts; tightening moves that to 0.88-1.26, i.e. onto the
+    # ~1 this test says to expect.  3.5 still leaves clear room under the ~4.5 a
+    # return of the constant factor would produce, which is what this guards.
+    expect_true(all(se_s / se_rs < 3.5), label = "covMethod='s' SE not inflated by the old 2x constant factor")
+  })
+
+  test_that("reported SE matches sqrt(diag(fit$cov)) (nlmixr2extra#125)", {
+    # .foceiInstallFdFullCov() replaces $cov after the C++ step has already
+    # derived popDf$SE from the covariance it discards.  Without a refresh the
+    # fit reports SEs describing a matrix it no longer holds, and a setCov()
+    # round trip silently changes them.
+    one.cmt <- function() {
+      ini({
+        tka <- log(1.5); tcl <- log(2.7); tv <- log(31.5)
+        eta.ka ~ 0.6; eta.cl ~ 0.3; eta.v ~ 0.1
+        add.sd <- 0.7
+      })
+      model({
+        ka <- exp(tka + eta.ka); cl <- exp(tcl + eta.cl); v <- exp(tv + eta.v)
+        linCmt() ~ add(add.sd)
+      })
+    }
+    for (.full in c(TRUE, FALSE)) {
+      .fit <- .nlmixr(one.cmt, theo_sd, "focei", foceiControl(print = 0, covFull = .full))
+      .p <- intersect(rownames(.fit$parFixedDf), rownames(.fit$cov))
+      expect_true(length(.p) > 0)
+      expect_equal(
+        unname(.fit$parFixedDf[.p, "SE"]),
+        unname(sqrt(diag(.fit$cov))[.p]),
+        label = paste0("covFull=", .full, " SE == sqrt(diag(cov))")
+      )
+    }
   })
 
   test_that("covariance with many omegas fixed will not crash focei", {
@@ -104,8 +145,7 @@ nmTest({
         cp ~ add(add.sd)
       })
     }
-    fit <- .nlmixr(one.compartment, theo_sd, est = "focei",
-                   control=foceiControl(print=0, maxOuterIterations=0L))
+    fit <- .nlmixr(one.compartment, theo_sd, est = "focei", control = foceiControl(print = 0, maxOuterIterations = 0L))
     expect_s3_class(fit, "nlmixr2FitCore")
   })
 })
