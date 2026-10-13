@@ -405,7 +405,9 @@
 #'   the linearization and importance-sampling -2LL are always computed and
 #'   stored; this selects the default active one.
 #' @param covMethod Method for calculating the covariance at the VAE estimates,
-#'   run through the FOCEi covariance step; the same choices as
+#'   run through the FOCEi covariance step with the interaction of
+#'   \code{likelihood}; its finite-difference legs optimize the ETAs again,
+#'   starting from the encoder's.  The same choices as
 #'   \code{\link{foceiControl}()}: \code{"analytic"} (default), \code{"r,s"},
 #'   \code{"r"}, \code{"s"}, or \code{""} to skip.
 #' @param nIsSample Number of importance-sampling draws for the IS -2LL.
@@ -615,12 +617,7 @@ vaeControl <- function(
   checkmate::assertLogical(indTolRelax, len = 1, any.missing = FALSE)
   likelihood <- match.arg(likelihood)
   objf <- match.arg(objf)
-  # match.arg cannot match ""; treat it (skip covariance) like foceiControl does
-  if (length(covMethod) == 1L && covMethod == "") {
-    covMethod <- ""
-  } else {
-    covMethod <- match.arg(covMethod)
-  }
+  covMethod <- .covMethodArg(covMethod, match.arg(covMethod))
   addProp <- match.arg(addProp)
   eventSens <- match.arg(eventSens)
 
@@ -758,51 +755,19 @@ vaeControl <- function(
 }
 
 #' @export
-rxUiDeparse.vaeControl <- function(object, var) {
-  .default <- vaeControl()
-  .w <- .deparseDifferent(.default, object, "genRxControl")
-  .deparseFinal(.default, object, .w, var)
-}
+rxUiDeparse.vaeControl <- function(object, var) .deparseControl(object, var, vaeControl())
 
 #' @rdname nmObjHandleControlObject
 #' @export
-nmObjHandleControlObject.vaeControl <- function(control, env) {
-  assign("vaeControl", control, envir = env)
-}
+nmObjHandleControlObject.vaeControl <- function(control, env) assign("vaeControl", control, envir = env)
 
 #' @rdname nmObjGetControl
 #' @export
-nmObjGetControl.vae <- function(x, ...) {
-  .env <- x[[1]]
-  if (exists("vaeControl", .env, inherits = FALSE)) {
-    .control <- get("vaeControl", .env, inherits = FALSE)
-    if (inherits(.control, "vaeControl")) return(.control)
-  }
-  if (exists("control", .env, inherits = FALSE)) {
-    .control <- get("control", .env, inherits = FALSE)
-    if (inherits(.control, "vaeControl")) return(.control)
-  }
-  stop("cannot find vae related control object", call. = FALSE)
-}
+nmObjGetControl.vae <- function(x, ...) .nmObjGetControlByClass(x, "vaeControl")
 
 #' @rdname getValidNlmixrControl
 #' @export
-getValidNlmixrCtl.vae <- function(control) {
-  .ctl <- control[[1]]
-  if (is.null(.ctl)) {
-    .ctl <- vaeControl()
-  }
-  if (is.null(attr(.ctl, "class")) && is(.ctl, "list")) {
-    .ctl <- do.call("vaeControl", .ctl)
-  }
-  if (!inherits(.ctl, "vaeControl")) {
-    .minfo("invalid control for `est=\"vae\"`, using default")
-    .ctl <- vaeControl()
-  } else {
-    .ctl <- do.call(vaeControl, .ctl)
-  }
-  .ctl
-}
+getValidNlmixrCtl.vae <- function(control) .getValidCtl(control, "vaeControl", "vae")
 
 #' @rdname nlmixr2Est
 #' @export

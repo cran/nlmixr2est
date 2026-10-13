@@ -100,10 +100,11 @@
 #' @param returnTrust return the raw `nlmTrustFit()` output list instead of
 #'   the nlmixr2 fit.
 #' @param covMethod Method for calculating the covariance. `"r"` (the
-#'   default) reuses the LAST outer iteration's already-computed Hessian
-#'   (skipping `nlmixr2est`'s own post-fit finite-difference Hessian
-#'   recompute, since `trust` already has one in hand); `""` skips the
-#'   covariance step.
+#'   default) uses a finite-difference Hessian at the estimates: with
+#'   `hessianMethod = "fd"`, central differences of the analytical gradient
+#'   over `nlmixr2Gill83()` steps, otherwise `nlmixr2Hess()`'s.  `"trust"` uses
+#'   the last outer iteration's Hessian whatever `hessianMethod` built it (a
+#'   quasi-Newton one by default); `""` skips the covariance step.
 #' @return trust control structure
 #' @export
 #' @author Matthew L. Fidler
@@ -175,7 +176,7 @@ trustControl <- function(
   eventSens = c("jump", "fd"),
   calcTables = TRUE,
   compress = FALSE,
-  covMethod = c("r", ""),
+  covMethod = c("r", "trust", ""),
   adjObf = TRUE,
   ci = 0.95,
   sigdig = 3,
@@ -222,7 +223,7 @@ trustControl <- function(
   if (is.null(hessErr)) {
     hessErr <- (.Machine$double.eps)^(1 / 3)
   }
-  checkmate::assertNumeric(hessErr, len = 1, any.missing = FALSE, lower = 0)
+  .assertPositiveEps(hessErr)
   checkmate::assertIntegerish(optimHessType, len = 1, any.missing = FALSE, lower = 1, upper = 2)
   checkmate::assertIntegerish(shi21maxHess, len = 1, any.missing = FALSE, lower = 1)
 
@@ -288,19 +289,9 @@ trustControl <- function(
     useColor = useColor,
     iterPrintControl = .xtra$iterPrintControl
   )
-  if (checkmate::testIntegerish(scaleType, len = 1, lower = 1, upper = 4, any.missing = FALSE)) {
-    scaleType <- as.integer(scaleType)
-  } else {
-    .scaleTypeIdx <- c("norm" = 1L, "nlmixr2" = 2L, "mult" = 3L, "multAdd" = 4L)
-    scaleType <- setNames(.scaleTypeIdx[match.arg(scaleType)], NULL)
-  }
+  scaleType <- .ctlIdx(scaleType, .scaleTypeIdx, match.arg(scaleType))
 
-  .normTypeIdx <- c("rescale2" = 1L, "rescale" = 2L, "mean" = 3L, "std" = 4L, "len" = 5L, "constant" = 6L)
-  if (checkmate::testIntegerish(normType, len = 1, lower = 1, upper = 6, any.missing = FALSE)) {
-    normType <- as.integer(normType)
-  } else {
-    normType <- setNames(.normTypeIdx[match.arg(normType)], NULL)
-  }
+  normType <- .ctlIdx(normType, .normTypeIdx, match.arg(normType))
   checkmate::assertNumeric(scaleCmax, lower = 0, any.missing = FALSE, len = 1)
   checkmate::assertNumeric(scaleCmin, lower = 0, any.missing = FALSE, len = 1)
   if (!is.null(scaleC)) {
@@ -321,7 +312,7 @@ trustControl <- function(
     hessianMethod = hessianMethod,
 
     returnTrust = returnTrust,
-    covMethod = match.arg(covMethod),
+    covMethod = .nlmCtlCovMethod(covMethod, match.arg(covMethod)),
     optExpression = optExpression,
     literalFix = literalFix,
     literalFixRes = literalFixRes,
@@ -358,11 +349,7 @@ trustControl <- function(
 }
 
 #' @export
-rxUiDeparse.trustControl <- function(object, var) {
-  .default <- trustControl()
-  .w <- .deparseDifferent(.default, object, "genRxControl")
-  .deparseFinal(.default, object, .w, var)
-}
+rxUiDeparse.trustControl <- function(object, var) .deparseControl(object, var, trustControl())
 
 #' Get the trust family control
 #'
@@ -377,69 +364,18 @@ rxUiDeparse.trustControl <- function(object, var) {
 
 #' @rdname nmObjHandleControlObject
 #' @export
-nmObjHandleControlObject.trustControl <- function(control, env) {
-  assign("trustControl", control, envir = env)
-}
+nmObjHandleControlObject.trustControl <- function(control, env) assign("trustControl", control, envir = env)
 
 #' @rdname nmObjGetControl
 #' @export
-nmObjGetControl.trust <- function(x, ...) {
-  .env <- x[[1]]
-  if (exists("trustControl", .env, inherits = FALSE)) {
-    .control <- get("trustControl", .env, inherits = FALSE)
-    if (inherits(.control, "trustControl")) return(.control)
-  }
-  if (exists("control", .env, inherits = FALSE)) {
-    .control <- get("control", .env, inherits = FALSE)
-    if (inherits(.control, "trustControl")) return(.control)
-  }
-  stop("cannot find trust related control object", call. = FALSE)
-}
+nmObjGetControl.trust <- function(x, ...) .nmObjGetControlByClass(x, "trustControl")
 
 #' @rdname getValidNlmixrControl
 #' @export
-getValidNlmixrCtl.trust <- function(control) {
-  .ctl <- control[[1]]
-  if (is.null(.ctl)) {
-    .ctl <- trustControl()
-  }
-  if (is.null(attr(.ctl, "class")) && is(.ctl, "list")) {
-    .ctl <- do.call("trustControl", .ctl)
-  }
-  if (!inherits(.ctl, "trustControl")) {
-    .minfo("invalid control for `est=\"trust\"`, using default")
-    .ctl <- trustControl()
-  } else {
-    .ctl <- do.call(trustControl, .ctl)
-  }
-  .ctl
-}
+getValidNlmixrCtl.trust <- function(control) .getValidCtl(control, "trustControl", "trust")
 
 .trustControlToFoceiControl <- function(env, assign = TRUE) {
-  .trustControl <- env$trustControl
-  .foceiControl <- foceiControl(
-    rxControl = .trustControl$rxControl,
-    maxOuterIterations = 0L,
-    maxInnerIterations = 0L,
-    covMethod = 0L,
-    sumProd = .trustControl$sumProd,
-    optExpression = .trustControl$optExpression,
-    literalFix = .trustControl$literalFix,
-    literalFixRes = .trustControl$literalFixRes,
-    scaleTo = 0,
-    calcTables = .trustControl$calcTables,
-    addProp = .trustControl$addProp,
-    interaction = 0L,
-    compress = .trustControl$compress,
-    ci = .trustControl$ci,
-    sigdigTable = .trustControl$sigdigTable,
-    indTolRelax = .trustControl$indTolRelax,
-    eventSens = .trustControl$eventSens
-  )
-  if (assign) {
-    env$control <- .foceiControl
-  }
-  .foceiControl
+  .nlmFamilyControlToFoceiControl(env, "trustControl", assign)
 }
 
 #' Warn when a trust result's Newton decrement contradicts trust_solve_c()'s
@@ -504,38 +440,24 @@ getValidNlmixrCtl.trust <- function(control) {
   .ret <- list(
     par = setNames(.tres$par, NULL),
     fval = .tres$value,
-    hessian = matrix(.tres$hessian, nrow = length(.p), ncol = length(.p)),
     convergence = if (isTRUE(.tres$converged)) 0L else 1L,
     iterations = .tres$iterations,
     message = if (isTRUE(.tres$converged)) "converged" else "did not fully converge"
   )
+  # "r" with hessianMethod = "fd" differences the gradient at the estimates
+  # (.nlmGradHessian()): the last iteration's Hessian searches its steps afresh
+  # at every iteration.  Otherwise "r" is nlmixr2Hess()'s (.nlmFinalizeList())
+  if (.ctl$covMethod == "r" && .ctl$hessianMethod == 1L) {
+    .ret$hessian <- .nlmGradHessian(.ret$par)
+  } else if (.ctl$covMethod == "trust") {
+    # a solver error leaves the Hessian zero-filled, not computed
+    .ret$hessian <- matrix(
+      if (isTRUE(.tres$error < 0)) NA_real_ else .tres$hessian,
+      nrow = length(.p),
+      ncol = length(.p)
+    )
+  }
   .nlmFinalizeList(.env, .ret, par = "par", printLine = TRUE, hessianCov = TRUE)
-}
-
-#' Get the full theta for the trust method
-#'
-#' @param nlm enhanced trust return
-#' @param ui ui object
-#' @return named theta matrix
-#' @author Matthew L. Fidler
-#' @noRd
-.trustGetTheta <- function(nlm, ui) {
-  .iniDf <- ui$iniDf
-  setNames(
-    vapply(
-      seq_along(.iniDf$name),
-      function(i) {
-        if (.iniDf$fix[i]) {
-          .iniDf$est[i]
-        } else {
-          nlm$par[.iniDf$name[i]]
-        }
-      },
-      double(1),
-      USE.NAMES = FALSE
-    ),
-    .iniDf$name
-  )
 }
 
 .trustFamilyFit <- function(env, ...) {
@@ -543,8 +465,8 @@ getValidNlmixrCtl.trust <- function(control) {
     env,
     "trust",
     .trustFitModel,
-    .trustGetTheta,
-    objective = function(.fit) 2 * as.numeric(.fit$fval),
+    "par",
+    objective = "fval",
     controlToFocei = .trustControlToFoceiControl,
     returnFlag = "returnTrust"
   )

@@ -5,7 +5,7 @@ nlmixr2Est.ifoce <- function(env, ...) {
   rxode2::assertRxUiIovNoCor(.ui, " for the estimation routine 'ifoce'", .var.name = .ui$modelName)
   .control <- env$control
   .foceiFamilyControl(env, ..., type = "ifoceControl")
-  .ifoceControlToFoceiControl(env)
+  .foceiFamilyControlToFoceiControl(env, "ifoceControl")
   on.exit({
     if (exists("control", envir = .ui)) {
       rm("control", envir = .ui)
@@ -25,3 +25,6 @@ attr(nlmixr2Est.ifoce, "unbounded") <- .foUnbounded
 attr(nlmixr2Est.ifoce, "mu") <- function(control) {
   isTRUE(!identical(control$muModel, "none")) && isTRUE(control$muRefCovAlg)
 }
+
+#' @export
+rxUiDeparse.ifoceControl <- function(object, var) .rxUiDeparseFoceiControl(object, var, type = "ifoceControl")

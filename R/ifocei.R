@@ -4,7 +4,7 @@ nlmixr2Est.ifocei <- function(env, ...) {
   .ui <- env$ui
   .control <- env$control
   .foceiFamilyControl(env, ..., type = "ifoceiControl")
-  .ifoceiControlToFoceiControl(env)
+  .foceiFamilyControlToFoceiControl(env, "ifoceiControl")
   on.exit({
     if (exists("control", envir = .ui)) {
       rm("control", envir = .ui)
@@ -24,3 +24,6 @@ attr(nlmixr2Est.ifocei, "iov") <- TRUE
 attr(nlmixr2Est.ifocei, "mu") <- function(control) {
   isTRUE(!identical(control$muModel, "none")) && isTRUE(control$muRefCovAlg)
 }
+
+#' @export
+rxUiDeparse.ifoceiControl <- function(object, var) .rxUiDeparseFoceiControl(object, var, type = "ifoceiControl")

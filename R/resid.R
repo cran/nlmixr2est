@@ -51,7 +51,7 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
 #' @author Matthew Fidler
 #' @noRd
 .foceiSolveWithId <- function(...) {
-  .ret <- rxode2::rxSolve(..., warnIdSort = FALSE)
+  .ret <- .rxSolveNonmem(..., warnIdSort = FALSE)
   if (names(.ret)[1] == "time") {
     ## For single subject ID is dropped.
     .ret <- data.frame(ID = 1L, .ret)
@@ -61,6 +61,30 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
   return(.ret)
 }
 
+
+#' Name of the ODE method a fit used
+#'
+#' `rxControl()` stores the method as rxode2's integer code.  Read the name
+#' back from rxode2's own table (`odeMethodToInt(NULL)`) rather than a copy
+#' of it here: a copy of only the first methods (`dop853`, `lsoda`,
+#' `liblsoda`, `indLin`) turned any newer code (`cvode` is 21, `lsode` 106)
+#' into a malformed factor, and the table step of the fit failed.
+#'
+#' @param method `fit$methodOde`, a name or rxode2's integer code
+#' @return the method name
+#' @author Matthew L. Fidler
+#' @noRd
+.residOdeMethodName <- function(method) {
+  if (is.character(method)) {
+    return(method)
+  }
+  .codes <- rxode2::odeMethodToInt(NULL)
+  .name <- names(.codes)[match(as.integer(method), .codes)]
+  if (length(.name) != 1L || is.na(.name)) {
+    stop("unknown rxode2 ODE method code: ", paste(method, collapse = ", "), call. = FALSE)
+  }
+  .name
+}
 
 #' Build the ODE-method fallback list for a post-fit table/residual solve
 #'
@@ -82,6 +106,40 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     list(currentOdeMethod),
     as.list(setdiff(allOdeMethods, currentOdeMethod))
   )
+}
+
+#' Covariate interpolation settings a fit was estimated with
+#'
+#' @param fit focei style fit
+#' @return named list of the fit's `covsInterpolation` and
+#'   `naInterpolation` (rxode2 integer codes; `NULL` when unset)
+#' @author Matthew L. Fidler
+#' @noRd
+.residCovsInterpolation <- function(fit) {
+  # the estimation control's own rxControl; $foceiControl can rewrite a
+  # non-focei fit's control
+  .rxControl <- fit$rxControl
+  list(
+    covsInterpolation = .rxControl$covsInterpolation,
+    naInterpolation = .rxControl$naInterpolation,
+    # PK-type statements read the record time (#1167); NULL unless set, since
+    # an rxode2 without rxControl(nonmem=) rejects the argument
+    nonmem = if (isTRUE(.rxControl$nonmem)) TRUE
+  )
+}
+
+#' `rxode2::rxSolve()` that passes `nonmem = TRUE` only when it is set
+#'
+#' @param ... passed to `rxode2::rxSolve()`
+#' @param nonmem `TRUE` to solve with `rxControl(nonmem = TRUE)`; `NULL`
+#'   or `FALSE` leaves it out (older rxode2 does not know the argument)
+#' @return solved data
+#' @noRd
+.rxSolveNonmem <- function(..., nonmem = NULL) {
+  if (isTRUE(nonmem)) {
+    return(rxode2::rxSolve(..., nonmem = TRUE))
+  }
+  rxode2::rxSolve(...)
 }
 
 #' Solve for pred/ipred types of calculations (including residuals)
@@ -110,15 +168,7 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     stop("cannot solve with `model` NULL", call. = FALSE)
   }
   keep <- unique(c(keep, "nlmixrRowNums"))
-  # Use character method names, not numeric codes, to avoid staying in sync
-  # with rxode2 internals.
-  currentOdeMethod <- fit$methodOde
-  if (!inherits(currentOdeMethod, "character")) {
-    cur <- as.integer(currentOdeMethod) + 1L
-    attr(cur, "levels") <- c("dop853", "lsoda", "liblsoda", "indLin")
-    attr(cur, "class") <- "factor"
-    currentOdeMethod <- as.character(cur)
-  }
+  currentOdeMethod <- .residOdeMethodName(fit$methodOde)
   odeMethods <- .residOdeFallbackMethods(currentOdeMethod)
   failedMethods <- character()
   isFirstFit <- TRUE
@@ -126,6 +176,8 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
   maxAtolRtol <- fit$foceiControl$rxControl$maxAtolRtolFactor
   recalcFactor <- fit$foceiControl$odeRecalcFactor
   .tolFactor <- fit$env$tolFactor
+  # the table must interpolate covariates the way the fit did (#1137)
+  .covsi <- .residCovsInterpolation(fit)
   # For mixture models, pass per-subject mixture assignments via iCov so
   # rxode2 sets ind->mixest correctly during the table solve. `fit` is the
   # nlmixr2FitCore environment, accessed directly.
@@ -136,15 +188,11 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
   }
   if (is.environment(.env) && exists("mixIcov", envir = .env, inherits = FALSE)) {
     .iCov <- get("mixIcov", envir = .env, inherits = FALSE)
-    # ID has to match the type of the data's ID column.  It is built as an
-    # integer, but output creation re-levels every ID column in the fit
-    # environment to a factor afterwards, so coerce at the point of use.
+    # ID is the subject index fit$dataSav is solved with.  Output creation may
+    # already have re-leveled it to a factor labeled with the original IDs, so
+    # take the factor's codes (the index), never its labels.
     if (!is.null(.iCov) && !is.null(.iCov$ID)) {
-      .iCov$ID <- if (is.factor(.iCov$ID)) {
-        as.integer(as.character(.iCov$ID))
-      } else {
-        as.integer(.iCov$ID)
-      }
+      .iCov$ID <- as.integer(.iCov$ID)
       if (anyNA(.iCov$ID)) .iCov <- NULL
     }
   }
@@ -153,8 +201,9 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
   # whole table step.  The retry SAYS SO -- mixest/mixnum and everything
   # mix() feeds read 0 without it, and that is the silently-wrong table this
   # whole path exists to stop producing.
-  .iCovOK <- !is.null(.iCov)
-  if (.iCovOK) {
+  .iCovState <- new.env(parent = emptyenv())
+  .iCovState$ok <- !is.null(.iCov)
+  if (.iCovState$ok) {
     # An rxode2 without nlmixr2/rxode2#1358 does not reject the iCov, it just
     # never reads a mixture out of a model whose mix() symengine expanded away.
     # Nothing errors, so say so here or the zeros are silent.
@@ -166,7 +215,7 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
         .predFlags[["mix"]] == 0L
     ) {
       warning("mixture not passed to table; mixest/mixnum read 0", call. = FALSE)
-      .iCovOK <- FALSE
+      .iCovState$ok <- FALSE
     }
   }
   while (recalc && length(odeMethods) > 0) {
@@ -179,7 +228,7 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     while (recalc && recalcN < fit$foceiControl$stickyRecalcN) {
       # Iterate up atol/rtol
       ## message("\t", .atol, " ", .rtol)
-      .res <- if (.iCovOK) {
+      .res <- if (.iCovState$ok) {
         tryCatch(
           .foceiSolveWithId(
             model,
@@ -196,6 +245,9 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
             maxords = fit$maxords,
             method = rxode2::odeMethodToInt(currentOdeMethod),
             tolFactor = .tolFactor,
+            covsInterpolation = .covsi$covsInterpolation,
+            naInterpolation = .covsi$naInterpolation,
+            nonmem = .covsi$nonmem,
             iCov = .iCov,
             keep = keep,
             addDosing = addDosing,
@@ -203,8 +255,10 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
             addCov = addCov
           ),
           error = function(e) {
-            if (grepl("iCov|mixest|mixunif|time.varying", conditionMessage(e), ignore.case = TRUE)) {
-              .iCovOK <<- FALSE
+            # SET_VECTOR_ELT: older rxode2 overran its covariate list when an iCov
+            # mixest came with any other covariate
+            if (grepl("iCov|mixest|mixunif|time.varying|SET_VECTOR_ELT", conditionMessage(e), ignore.case = TRUE)) {
+              .iCovState$ok <- FALSE
               warning("mixture not passed to table; mixest/mixnum read 0", call. = FALSE)
               .foceiSolveWithId(
                 model,
@@ -221,6 +275,9 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
                 maxords = fit$maxords,
                 method = rxode2::odeMethodToInt(currentOdeMethod),
                 tolFactor = .tolFactor,
+                covsInterpolation = .covsi$covsInterpolation,
+                naInterpolation = .covsi$naInterpolation,
+                nonmem = .covsi$nonmem,
                 iCov = NULL,
                 keep = keep,
                 addDosing = addDosing,
@@ -248,6 +305,9 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
           maxords = fit$maxords,
           method = rxode2::odeMethodToInt(currentOdeMethod),
           tolFactor = .tolFactor,
+          covsInterpolation = .covsi$covsInterpolation,
+          naInterpolation = .covsi$naInterpolation,
+          nonmem = .covsi$nonmem,
           iCov = NULL,
           keep = keep,
           addDosing = addDosing,
@@ -566,10 +626,6 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
   .ret
 }
 
-.calcRes <- function(..., predOnly = TRUE) {
-  .calcCwres(..., predOnly = predOnly)
-}
-
 .calcNpde <- function(..., npde = TRUE, predOnly = TRUE) {
   .calcCwres(..., npde = npde, predOnly = predOnly)
 }
@@ -645,22 +701,6 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     .ret <- .ret[, -.dups]
   }
   .addLevels(fit, .ret)
-}
-
-.calcShrinkOnly <- function(fit, thetaEtaParameters = fit$foceiThetaEtaParameters) {
-  .omega <- fit$omega
-  if (exists("etaExpected", envir = fit$env)) {
-    .etas <- fit$env$etaExpected
-    .w <- which(names(.etas) %in% c("mixnum", "MIXEST"))
-    if (length(.w) > 0L) {
-      .etas <- .etas[, -.w, drop = FALSE]
-    }
-    .pars <- .Call(`_nlmixr2est_nlmixr2Parameters`, fit$fixef, .etas)
-    .ret <- .Call(`_nlmixr2est_calcShrinkOnly`, .omega, .pars$eta.lst, length(.etas[, 1]))
-  } else {
-    .ret <- .Call(`_nlmixr2est_calcShrinkOnly`, .omega, thetaEtaParameters$eta.lst, length(fit$eta[, 1]))
-  }
-  .ret[, -dim(.omega)[1] - 1]
 }
 
 #' Add factor levels to data based on fit object
@@ -808,7 +848,36 @@ nmObjGet.foceiThetaEtaParameters <- function(x, ...) {
     .ret <- .ret[, -.dups]
   }
   .ret[[1]] <- .addLevels(fit, .ret[[1]])
+  .ret[[1]] <- .addMixestColumn(fit, .ret[[1]])
   .ret
+}
+
+#' Add the fitted mixture component per subject as a `mixest` column
+#'
+#' @param fit nlmixr2 fit environment
+#' @param df output table with an `ID` column
+#' @return `df`, with `mixest` added when the fit is a mixture fit
+#' @noRd
+.addMixestColumn <- function(fit, df) {
+  .env <- fit
+  if (!is.environment(.env) && is.environment(fit$env)) {
+    .env <- fit$env
+  }
+  if (
+    !is.environment(.env) ||
+      !exists("mixNum", envir = .env, inherits = FALSE) ||
+      is.null(df$ID) ||
+      "mixest" %in% names(df)
+  ) {
+    return(df)
+  }
+  .mn <- get("mixNum", envir = .env, inherits = FALSE)
+  if (!is.data.frame(.mn) || is.null(.mn$ID) || is.null(.mn$mixnum)) {
+    return(df)
+  }
+  # both IDs are the solve's subject index here (a factor's codes, if releveled)
+  df$mixest <- as.integer(.mn$mixnum)[match(as.integer(df$ID), as.integer(.mn$ID))]
+  df
 }
 
 #' Re-insert subjects dropped during preprocessing into an output table
@@ -991,12 +1060,31 @@ addTable <- function(
 ) {
   nlmixr2global$finalUiCompressed <- FALSE
   on.exit(nlmixr2global$finalUiCompressed <- TRUE)
+  ## event bus: `object` is forced first, outside the scope; one fitUpdate is
+  ## emitted on exit.  updateObject = TRUE keeps (and modifies) the shared
+  ## environment, so "in place" is environment identity here (see rxEvents.R)
+  force(object)
+  .nlmixr2EventEnter()
+  .evOrig <- object
+  .evOrigEnv <- if (inherits(object, "nlmixr2FitCore")) object$env else NULL
+  .evName <- .nlmixr2EventObjName(substitute(object))
+  on.exit(
+    .nlmixr2EventExitUpdate(
+      returnValue(),
+      .evOrig,
+      .evName,
+      "table",
+      inherits(returnValue(), "nlmixr2FitCore") && identical(returnValue()$env, .evOrigEnv)
+    ),
+    add = TRUE
+  )
   nlmixrWithTiming(
     "table",
     {
       keep <- unique(c(keep, "nlmixrRowNums"))
       .malert("Calculating residuals/tables")
       .objName <- substitute(object)
+      .objName <- if (is.name(.objName)) as.character(.objName) else NULL
       if (!inherits(object, "nlmixr2FitCore")) {
         stop("requires a nlmixr2 fit object", call. = FALSE)
       }
@@ -1020,7 +1108,7 @@ addTable <- function(
         )
       } else {
         .tabs <- .calcTables(.fit, data = data, table = table, keep = keep)
-        assign("shrink", .tabs$shrink, .fit)
+        assign("shrink", .mixOwnedEtaShrink(.tabs$shrink, .fit), .fit)
         .df <- .tabs$resid
       }
       .rownum <- as.integer(.df$nlmixrRowNums)
@@ -1104,7 +1192,7 @@ addTable <- function(
           .bound <- do.call(
             "c",
             lapply(ls(.parent, all.names = TRUE), function(.cur) {
-              if (.cur == .objName && identical(.parent[[.cur]]$env, .fit$env)) {
+              if (!is.null(.objName) && identical(.cur, .objName) && identical(.parent[[.cur]]$env, .fit$env)) {
                 return(.cur)
               }
               return(NULL)
@@ -1270,8 +1358,4 @@ tableControl <- function(
 }
 
 #' @export
-rxUiDeparse.tableControl <- function(object, var) {
-  .default <- tableControl()
-  .w <- .deparseDifferent(.default, object, "genRxControl")
-  .deparseFinal(.default, object, .w, var)
-}
+rxUiDeparse.tableControl <- function(object, var) .deparseControl(object, var, tableControl())

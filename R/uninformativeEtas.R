@@ -201,13 +201,10 @@ attr(rxUiGet.transUE, "rstudio") <- c(eta.ka = "tka")
     ui <- rxode2::assertRxUi(ui)
     if (length(ui$mixProbs) > 0) {
       .nMix <- length(ui$mixProbs) + 1L
-      if ("ID" %in% names(data)) {
-        .ids <- unique(data$ID)
-        .meMap <- setNames((seq_along(.ids) - 1L) %% .nMix + 1L, .ids)
-        data$mixest <- .meMap[as.character(data$ID)]
-      } else {
-        data$mixest <- 1L
-      }
+      # a plain covariate for the pruned solve, set per component below; a
+      # `mixest` column is not needed, and older rxode2 rejects one next to
+      # any other covariate
+      data$mymixest <- 1L
     }
     .trans <- rxUiGet.transUE(list(ui))
     .pars <- .uninformativeEtasExpand(ui, data, trans = .trans, alpha = alpha, saem = TRUE, q = q)
@@ -228,8 +225,6 @@ attr(rxUiGet.transUE, "rstudio") <- c(eta.ka = "tka")
     .lst <- attr(class(.trans), ".rxode2.lst")
 
     if (length(ui$mixProbs) > 0) {
-      data$mymixest <- data$mixest
-
       # Build pruned model and replace mix() with mymixest expression
       .prunedStr <- paste(c(.foceiPrune(list(ui)), "tad=tad()", "dosenum=dosenum()", ""), collapse = "\n")
       parsed <- as.list(parse(text = .prunedStr))
@@ -259,6 +254,11 @@ attr(rxUiGet.transUE, "rstudio") <- c(eta.ka = "tka")
             }
             return(expr)
           }
+        } else if (identical(expr, quote(mixest))) {
+          # the pruned model is not a mixture, so read the assignment directly
+          quote(mymixest)
+        } else if (identical(expr, quote(mixnum))) {
+          as.double(.nMix)
         } else {
           return(expr)
         }
@@ -289,31 +289,50 @@ attr(rxUiGet.transUE, "rstudio") <- c(eta.ka = "tka")
         }
       }
 
-      # Solve with pruned model
-      .val <- do.call(rxode2::rxSolve, c(list(modelPruned, pRenamed, data), .rxControl))
-      .val <- as.data.frame(.val)
-      .val$id <- as.integer(.val$id)
-      .ind <- .pars$param[, c("id", "sim.id", "rxW", "rxPmz")]
-      .val <- merge(.val[, c("id", "sim.id", "rx_pred_")], .ind)
+      # a component's own eta (a split eta) moves only that component, so
+      # probe every subject under every component and keep any eta that
+      # informs one of them
+      .mat <- NULL
+      for (.k in seq_len(.nMix)) {
+        data$mymixest <- .k
+        .val <- do.call(rxode2::rxSolve, c(list(modelPruned, pRenamed, data), .rxControl))
+        .val <- as.data.frame(.val)
+        .val$id <- as.integer(.val$id)
+        .ind <- .pars$param[, c("id", "sim.id", "rxW", "rxPmz")]
+        .val <- merge(.val[, c("id", "sim.id", "rx_pred_")], .ind)
+        .m <- .uninformativeEtasMask(.val, .pars, tol)
+        .mat <- if (is.null(.mat)) .m else pmax(.mat, .m)
+      }
     } else {
       .val <- do.call(rxode2::rxSolve, c(list(model, .pars$param, data), .rxControl))
       .val$id <- as.integer(.val$id)
       .ind <- .pars$param[, c("id", "sim.id", "rxW", "rxPmz")]
       .val <- merge(.val[, c("id", "sim.id", "rx_pred_")], .ind)
+      .mat <- .uninformativeEtasMask(.val, .pars, tol)
     }
-
-    .env <- new.env(parent = emptyenv())
-    .env$nid <- .pars$n
-    .env$neta <- .pars$neta
-    .env$simId <- .val[["sim.id"]]
-    .env$id <- .val[["id"]]
-    .env$val <- .val[["rx_pred_"]]
-    .env$w <- .val[["rxW"]]
-    .env$pm <- .val[["rxPmz"]]
-    .env$tol <- tol
-    .mat <- .Call(`_nlmixr2est_uninformativeEta`, .env)
     dimnames(.mat) <- list(NULL, names(.pars$trans))
     .minfo("done")
     .mat
   }
+}
+
+#' Per-subject uninformative-eta mask from one probe solve
+#'
+#' @param val probe solve merged with the probe layout (`id`, `sim.id`,
+#'   `rx_pred_`, `rxW`, `rxPmz`)
+#' @param pars `.uninformativeEtasExpand()` result
+#' @param tol tolerance of the second difference
+#' @return subject by eta matrix, 1 when the eta is informative
+#' @noRd
+.uninformativeEtasMask <- function(val, pars, tol) {
+  .env <- new.env(parent = emptyenv())
+  .env$nid <- pars$n
+  .env$neta <- pars$neta
+  .env$simId <- val[["sim.id"]]
+  .env$id <- val[["id"]]
+  .env$val <- val[["rx_pred_"]]
+  .env$w <- val[["rxW"]]
+  .env$pm <- val[["rxPmz"]]
+  .env$tol <- tol
+  .Call(`_nlmixr2est_uninformativeEta`, .env)
 }

@@ -49,7 +49,7 @@ nmTest({
   ## residual sd fixed at truth.  The responsibilities are then essentially 0/1,
   ## so p1 is the observed group fraction and its variance is p(1-p)/n -- an
   ## analytic target the reported SE can be held to without any replicate study.
-  .mixCovData <- function(nSub = 60L, pTrue = 0.45, clTrue = c(1.0, 8.0), seed = 1001L) {
+  .mixCovData <- function(nSub = 60L, pTrue = 0.45, clTrue = c(1.0, 8.0), seed = 1001L, sd = 0.05) {
     set.seed(seed)
     .grp <- sample.int(2L, nSub, TRUE, prob = c(pTrue, 1 - pTrue))
     .sim <- rxode2::rxode2({
@@ -65,7 +65,7 @@ nmTest({
       rbind,
       lapply(seq_len(nSub), function(i) {
         .s <- rxode2::rxSolve(.sim, params = c(CLI = clTrue[.grp[i]]), .ev, returnType = "data.frame")
-        data.frame(ID = i, TIME = .s$time, DV = .s$cp + stats::rnorm(nrow(.s), 0, 0.05), AMT = 0, EVID = 0)
+        data.frame(ID = i, TIME = .s$time, DV = .s$cp + stats::rnorm(nrow(.s), 0, sd), AMT = 0, EVID = 0)
       })
     )
     .d <- rbind(data.frame(ID = seq_len(nSub), TIME = 0, DV = NA_real_, AMT = 320, EVID = 1), .obs)
@@ -317,6 +317,31 @@ nmTest({
     expect_equal(unname(.se1), unname(.se0), tolerance = 1e-10)
   })
 
+  test_that("a mixture fit's condition numbers describe its probability-scale covariance (issue 1140)", {
+    .dat <- .mixCovData()
+    .f <- suppressWarnings(nlmixr2(
+      .mixCovMod,
+      .dat$data,
+      "focei",
+      foceiControl(
+        print = 0,
+        outerOpt = "lbfgsb3c",
+        maxOuterIterations = 200L,
+        maxInnerIterations = 100L,
+        covMethod = "r,s",
+        calcTables = FALSE
+      )
+    ))
+    .cov <- .f$cov
+    expect_true("p1" %in% rownames(.cov))
+    .ev <- abs(eigen(.cov, symmetric = TRUE, only.values = TRUE)$values)
+    .evr <- abs(eigen(stats::cov2cor(.cov), symmetric = TRUE, only.values = TRUE)$values)
+    expect_equal(.f$env$conditionNumberCov, max(.ev) / min(.ev))
+    expect_equal(.f$env$conditionNumberCor, max(.evr) / min(.evr))
+    expect_equal(sort(abs(.f$env$eigenCov)), sort(.ev))
+    expect_equal(.f$objDf[["Condition#(Cov)"]][1], max(.ev) / min(.ev))
+  })
+
   test_that("the S matrix is no longer singular for a mixture model", {
     .dat <- .mixCovData()
     .f <- suppressWarnings(nlmixr2(
@@ -353,6 +378,43 @@ nmTest({
     .D <- sweep(.R[, .free, drop = FALSE], 2, .pi[.free], "-")
     .i <- match(.f$ui$mixProbs, rownames(.f$cov))
     expect_equal(unname(.f$env$S0[.i, .i, drop = FALSE]), unname(t(.D) %*% .D), tolerance = 1e-2)
+  })
+
+  test_that("the S matrix scores the proportion with the responsibilities at the estimates", {
+    ## Overlapping components, so the responsibilities move with every parameter.
+    ## foceiS() read them, and numericGrad()'s, after numericGrad()'s
+    ## finite-difference legs: the proportion's S rows were scored at the last
+    ## leg, off the outer product of the scores at the estimates by 3.3e-5.
+    .dat <- .mixCovData(clTrue = c(1.0, 1.6), sd = 0.6)
+    .mod <- function() {
+      ini({
+        tka <- fix(log(1.1))
+        tcl1 <- fix(log(1.0))
+        tcl2 <- fix(log(1.6))
+        tv <- fix(log(20))
+        p1 <- 0.45
+        eta.cl ~ fix(0.01)
+        add.sd <- 0.6
+      })
+      model({
+        ka <- exp(tka)
+        cl <- mix(exp(tcl1 + eta.cl), p1, exp(tcl2 + eta.cl))
+        v <- exp(tv)
+        linCmt() ~ add(add.sd)
+      })
+    }
+    .f <- suppressWarnings(nlmixr2(
+      .mod,
+      .dat$data,
+      "focei",
+      foceiControl(print = 0, maxOuterIterations = 0L, maxInnerIterations = 100L, covMethod = "s", calcTables = FALSE)
+    ))
+    .pi <- .f$env$mixProbabilities
+    .R <- do.call(cbind, lapply(.f$env$mixList, function(z) z$prob))
+    .D <- .R[, 1] - .pi[1]
+    expect_true(any(.R[, 1] > 0.01 & .R[, 1] < 0.99)) # not all 0 or 1
+    .i <- match(.f$ui$mixProbs, rownames(.f$cov))
+    expect_equal(.f$env$S0[.i, .i], sum(.D^2), tolerance = 1e-7)
   })
 
   test_that("covMethod='imp' gives the mixture proportion the same calibrated SE", {
@@ -416,6 +478,17 @@ nmTest({
     ## does not expose, so they are deliberately absent
     expect_equal(unname(.e$cov[1:2, 1:2]), matrix(c(4, 1, 1, 9), 2, 2))
     expect_equal(unname(.e$cov[1:2, 3]), c(0, 0))
+  })
+
+  test_that("the appended block refreshes the condition numbers (issue 1140)", {
+    .e <- .mkMixEnv(c(rep(1, 45), rep(0, 55)), 0.45, 100L)
+    .e$conditionNumberCov <- 1
+    .mixCovAppendBlock(.e)
+    expect_equal(dim(.e$cov), c(3L, 3L))
+    .ev <- abs(eigen(.e$cov, symmetric = TRUE, only.values = TRUE)$values)
+    expect_equal(.e$conditionNumberCov, max(.ev) / min(.ev))
+    .evr <- abs(eigen(stats::cov2cor(.e$cov), symmetric = TRUE, only.values = TRUE)$values)
+    expect_equal(.e$conditionNumberCor, max(.evr) / min(.evr))
   })
 
   test_that("the appended block is refused when the fit is not at the EM fixed point", {

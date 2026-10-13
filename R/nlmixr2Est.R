@@ -54,6 +54,7 @@
 #'
 #' @export
 nlmixr2Est <- function(env, ...) {
+  .shi21RatioCensor()
   on.exit({
     .nlmixr2clearPipe()
     nlmixr2global$nlmixr2SimInfo <- NULL
@@ -65,6 +66,13 @@ nlmixr2Est <- function(env, ...) {
   }
   if (!inherits(env, "output")) {
     nlmixr2global$nlmixr2EstEnv$iniDf0 <- data.frame(get("ui", envir = env)$iniDf)
+    # nlmixr2CreateOutputFromUi() reads iniDf0 above only inside a run
+    .depth <- nlmixr2global$nlmixr2EstEnv$estDepth
+    if (is.null(.depth)) {
+      .depth <- 0L
+    }
+    nlmixr2global$nlmixr2EstEnv$estDepth <- .depth + 1L
+    on.exit(nlmixr2global$nlmixr2EstEnv$estDepth <- .depth, add = TRUE)
   }
   if (!exists("data", envir = env)) {
     stop("need 'data' object", call. = FALSE)
@@ -240,6 +248,20 @@ nlmixr2Est.default <- function(env, ...) {
 
 .tablePassthrough <- c("addDosing", "subsetNonmem", "cores", "keep", "drop")
 
+#' Set the shi21 step-search treatment of censored ratios
+#'
+#' Reads `getOption("nlmixr2est.shi21RatioCensor")`, one of `"legacy"`,
+#' `"detected"`, `"substitute"` or `"lmomco"` (#1188).
+#'
+#' @param type treatment name; defaults to the option
+#' @return the previous treatment name, invisibly
+#' @noRd
+.shi21RatioCensor <- function(type = getOption("nlmixr2est.shi21RatioCensor", "detected")) {
+  .types <- c("legacy", "detected", "substitute", "lmomco")
+  type <- match.arg(type, .types)
+  invisible(.types[shi21RatioCensorSet(match(type, .types) - 1L) + 1L])
+}
+
 #' Call nlmixr2Est wrapped to collect the warnings
 #'
 #'
@@ -388,11 +410,7 @@ nlmixr2Est0 <- function(env, ...) {
     inherits(.ret, "nlmixr2FitCore") ||
       inherits(.ret, "nlmixr2Fit")
   ) {
-    if (is.environment(.ret)) {
-      try(assign("runInfo", .warnings, .ret), silent = TRUE)
-    } else {
-      try(assign("runInfo", .warnings, .ret$env), silent = TRUE)
-    }
+    .nlmixr2EstSetRunInfo(.ret, .warnings)
   } else {
     .w <- .lst[[2]]
     lapply(seq_along(.w), function(i) {
@@ -400,54 +418,103 @@ nlmixr2Est0 <- function(env, ...) {
     })
   }
   .nlmixrEstUpdatesOrigModel(.ret, env)
-  # Post-fit covariance recompute on the full base model: the mu-referenced
-  # (lin/irls) families' C++ covariance step bailed (a mu->phi reduced cov gives
-  # wrong SEs), and the imp/np/nlme families never compute one during estimation.
-  # Now that the fit is fully finalized, recompute at the converged estimates
-  # (see .foceiRecomputeBaseEst for the est -> base-model mapping).
   if (inherits(.ret, "nlmixr2FitCore")) {
-    # not every method assigns env$est (nlme/saem set it on the fit only), so
-    # fall back to the finalized fit's est
-    .estName <- tryCatch(as.character(get("est", envir = env)), error = function(e) "")
-    if (length(.estName) != 1L || !nzchar(.estName)) {
-      .estName <- tryCatch(as.character(.ret$est), error = function(e) "")
+    # the post-fit hooks run after $runInfo is assembled above; collect their
+    # warnings into it the same way
+    .post <- .collectWarn(.nlmixr2EstPostFit(.ret, env), lst = TRUE)[[2]]
+    .post <- .filterSyntheticIovMuWarnings(.post, get("ui", envir = env))
+    .post <- .post[!(.post %in% .warnings)]
+    if (length(.post) > 0L) {
+      .nlmixr2EstSetRunInfo(.ret, c(.warnings, .post))
     }
-    if (
-      length(.estName) == 1L &&
-        !is.null(.foceiRecomputeBaseEst(.estName))
-    ) {
-      try(.foceiInstallMuCov(.ret, .estName), silent = TRUE)
-    }
-    # A foreign covariance ("sa"/"imp") requested via covMethod= on a family
-    # whose kernel does not compute it (focei/saem/imp/vae/vi/np): recompute at
-    # the converged estimates and install.  Native requests carry no deferred
-    # field.  Drive off the deferred request's presence, skipping only when a
-    # valid matching cov is already installed (idempotent re-run).
-    .def <- .covGetDeferred(.ret)
-    if (!is.na(.def)) {
-      .curCov <- tryCatch(.ret$cov, error = function(e) NULL)
-      .installed <-
-        identical(tryCatch(.ret$covMethod, error = function(e) NULL), .def) &&
-        is.matrix(.curCov) &&
-        all(is.finite(.curCov))
-      if (!.installed) {
-        .rEnv <- if (is.environment(.ret)) .ret else tryCatch(.ret$env, error = function(e) NULL)
-        if (is.environment(.rEnv)) {
-          .r <- tryCatch(.covRecompute(.ret, .def), error = function(e) NULL)
-          if (isTRUE(try(.covInstallResult(.rEnv, .r), silent = TRUE))) {
-            .covOptionsSet(.rEnv, .def, .covOptionsDefault(.rEnv, .def))
+  }
+  .ret
+}
+
+#' Store the warnings of a run as a fit's `$runInfo`
+#' @param ret the fit
+#' @param warnings character vector of warning messages
+#' @return nothing, called for side effects
+#' @noRd
+.nlmixr2EstSetRunInfo <- function(ret, warnings) {
+  if (is.environment(ret)) {
+    try(assign("runInfo", warnings, ret), silent = TRUE)
+  } else {
+    try(assign("runInfo", warnings, ret$env), silent = TRUE)
+  }
+  invisible()
+}
+
+#' The post-fit hooks of `nlmixr2Est0()`
+#'
+#' Post-fit covariance recompute on the full base model: the mu-referenced
+#' (lin/irls) families' C++ covariance step bailed (a mu->phi reduced cov gives
+#' wrong SEs), and the imp/np/nlme families never compute one during estimation.
+#' Now that the fit is fully finalized, recompute at the converged estimates
+#' (see .foceiRecomputeBaseEst for the est -> base-model mapping).
+#' @param ret the finalized fit
+#' @param env the estimation environment
+#' @return nothing, called for side effects
+#' @noRd
+.nlmixr2EstPostFit <- function(ret, env) {
+  # not every method assigns env$est (nlme/saem set it on the fit only), so
+  # fall back to the finalized fit's est
+  .estName <- tryCatch(as.character(get("est", envir = env)), error = function(e) "")
+  if (length(.estName) != 1L || !nzchar(.estName)) {
+    .estName <- tryCatch(as.character(ret$est), error = function(e) "")
+  }
+  if (
+    length(.estName) == 1L &&
+      !is.null(.foceiRecomputeBaseEst(.estName))
+  ) {
+    try(.foceiInstallMuCov(ret, .estName), silent = TRUE)
+  }
+  # A foreign covariance ("sa"/"imp") requested via covMethod= on a family
+  # whose kernel does not compute it (focei/saem/imp/vae/vi/np): recompute at
+  # the converged estimates and install.  Native requests carry no deferred
+  # field.  Drive off the deferred request's presence, skipping only when a
+  # valid matching cov is already installed (idempotent re-run).
+  .def <- .covGetDeferred(ret)
+  if (!is.na(.def)) {
+    .curCov <- tryCatch(ret$cov, error = function(e) NULL)
+    .installed <-
+      .covSameName(.def, tryCatch(ret$covMethod, error = function(e) NULL)) &&
+      is.matrix(.curCov) &&
+      all(is.finite(.curCov))
+    if (!.installed) {
+      .rEnv <- if (is.environment(ret)) ret else tryCatch(ret$env, error = function(e) NULL)
+      if (is.environment(.rEnv)) {
+        .r <- tryCatch(.covRecompute(ret, .def), error = function(e) NULL)
+        # warns when nothing was installed or the nested fit fell back to
+        # another covariance
+        try(.covInstallResult(.rEnv, .r, warn = TRUE, what = .def), silent = TRUE)
+        if (.covSameName(.def, .rEnv$covMethod)) {
+          for (.n in unique(c(.def, .rEnv$covMethod))) {
+            .covOptionsSet(.rEnv, .n, .covOptionsDefault(.rEnv, .def))
           }
         }
       }
     }
-    # snapshot the options the estimation-time covariances used, so setCov()
-    # still sees them if the fit's settings change later
-    try(
-      .covOptionsRecordEstimation(
-        if (is.environment(.ret)) .ret else .ret$env
-      ),
-      silent = TRUE
-    )
   }
-  .ret
+  # a covariance from another computation, when the fit's own step gave none and its
+  # covFallback lists one
+  try(.covFallbackAfterFit(ret), silent = TRUE)
+  # snapshot the options the estimation-time covariances used, so setCov()
+  # still sees them if the fit's settings change later
+  try(
+    .covOptionsRecordEstimation(
+      if (is.environment(ret)) ret else ret$env
+    ),
+    silent = TRUE
+  )
+  # and what its covariance step computed, for later setCov() requests
+  try(
+    {
+      .sEnv <- if (is.environment(ret)) ret else ret$env
+      .sCtl <- .sEnv$foceiControl
+      .covStoreRecord(.sEnv, .covStoreKey(.sEnv, .sCtl), .sEnv, fd = !identical(.sCtl$covType, "analytic"))
+    },
+    silent = TRUE
+  )
+  invisible()
 }

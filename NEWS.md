@@ -1,3 +1,1353 @@
+# nlmixr2est 7.2.0
+
+## New features
+
+- `nlminbControl(solveType = "hessian")`, the default, now takes the
+  covariance from central differences of the analytic gradient at the
+  estimates (`covMethod = "nlminb"`, labelled `"r (nlminb)"`), the Hessian
+  `nlmControl(covMethod = "nlm")` uses, instead of a separate `nlmixr2Hess()`
+  stencil.  On theo_sd the standard errors match the stencil's and the
+  covariance takes 0.01 s instead of 0.9 s; on a pooled warfarin model the
+  stencil differenced solver noise along the ka/ktr ridge.  `covMethod = "r"`
+  keeps the stencil.
+
+- `setCov(fit, "sa")` on a SAEM fit continues the fit's own MCMC chains: the
+  covariance phase starts from the fit's last iteration and runs no new
+  warm-up iterations (`nSaCov` instead of `nBurn + nEm + nSaCov`).  The Monte
+  Carlo path differs from a cold start, so the standard errors differ by Monte
+  Carlo noise; `saControl(warmStart = FALSE)` restores the cold start.  Warm
+  or cold, the Louis residual score reads an estimated additive or
+  proportional sigma at its held value rather than the warm-up's residuals.
+
+- The imp covariance (`covMethod = "imp"`) no longer solves the model at the
+  finite-difference points that move only Omega parameters: its importance
+  samples are fixed in eta-space, so those points change only the eta prior, and
+  each sample's data part is reused from the evaluation at the estimates
+  (`fit$env$impCovReused` counts them).
+
+- `foceiControl(covFallback=)`, `saemControl(covFallback=)` and
+  `emviControl(covFallback=)` say what each covariance method falls back to when
+  it gives no usable covariance, as a named list (by default as before: for FOCEi
+  `"r,s"` to `"r"` then `"s"`, `"r"` to `"s"`, `"analytic"` to `"r,s"`, `"r"`
+  then `"s"`; for SAEM `"sa"`, `"fim"` and `"analytic"` to `"linFim"` then
+  `"Ha"`, `"linFim"` to `"Ha"`; for emvi/fbvi each FOCEi chain then the
+  variational covariance `"vi"`).  A FOCEi list may also name `"sa"` and
+  `"imp"`, which are computed after the fit when the methods before them gave no
+  covariance.  `setCov()` falls back only as `rsControl(covFallback=)` lists (by
+  default not at all, as before); the list decides only what is installed, so a
+  covariance the fit already holds is reused whatever the list.  A theta-only
+  `"r,s"` fit now keeps its `"r"` and `"s"` covariances in `fit$covList`, so
+  `setCov()` switches to them without computing anything.  A list you give replaces the default, so a method it does not name
+  has no fallback.  The choice among the R, S and sandwich covariances is now
+  made in R (`.covSelectFocei()`), `fit$env$covTried` records each method tried
+  and why it was not used, and a fit that falls back or gets no covariance says
+  so in one warning (e.g. `"r,s" not usable (S not PD); installed "r"`) instead
+  of the earlier separate ones.
+
+- The FOCEi covariance step does less work (issue 1140).  With `covFull = TRUE`
+  (the default) one finite-difference computation over theta, sigma and Omega
+  gives both shapes: the structural-theta covariance is its theta block, so the
+  separate theta-only step search, R stencil and S legs no longer run, and both
+  shapes use the covariance step sizes (`gillKcov`, `gillStepCov`,
+  `gillFtolCov`); `rmatNorm`, `smatNorm` and `covGillF` now apply only to a
+  theta-only stage that runs on its own (`covFull = FALSE`, mixtures,
+  mu-referenced models, a generalized log-likelihood, `gillKcov = 0` or
+  `covDerivMethod = "forward"`).  The S matrix is read from the points the R stencil already
+  evaluates; with `covFull = FALSE` this also holds for `smatNorm = FALSE`, whose
+  S steps are the R stencil's.  `covMethod = "analytic"` runs no step search
+  unless the analytic R is declined.  On `theo_sd` and the warfarin model of the audit the default
+  covariance takes about a quarter fewer objective evaluations (242 to 178, 505
+  to 368) and 30-45% less time, and the theta-only standard errors move closer to
+  the analytic ones (theo_sd 2.9% to 0.3%, warfarin 28% to 6%).  The fit's
+  `env$covEvals` counts the evaluations of each stage.  With `covFull = TRUE`
+  the covariance columns of `$scaleInfo` read "Not Assessed", since no
+  theta-only step search runs.
+
+- `setCov()` reads what the fit's earlier covariance steps computed for the same
+  estimates and settings (the fit's `env$covStore`: the finite-difference R, S
+  and steps) and computes only what is missing, with the same result: after an
+  `"r"` covariance, `"r,s"` computes only S, and `"r"` or `"s"` after `"r,s"`
+  computes nothing.  Every fit starts with an empty store.
+
+- A `setCov()` finite-difference covariance of the full shape (`"r,s (full)"`,
+  `"r (full)"`, `"s (full)"`) can start from what the fit already holds:
+  `foceiControl(covPrecursor=)` and `rsControl(covPrecursor=)` name the sources,
+  `"fd"` (a full-stage R the fit computed under other settings) and `"analytic"`
+  (the analytic covariance it holds), in order of preference.  The precursor's
+  diagonal seeds each step search, which then usually takes its first step (21
+  instead of 25 evaluations on `theo_sd`, 33 instead of 39 on the warfarin
+  model); every step still passes the same acceptance test.  A fresh fit holds
+  no precursor, so its own covariance is unchanged.  `NULL` turns it off;
+  `fit$env$covPrecursorUsed` and the fit print say how one served.
+
+- With a precursor, `foceiControl(covShortcut = TRUE)` (opt-in, also in
+  `rsControl()`) predicts the full R from the measured diagonal and the
+  precursor's correlations, checks it against the objective along four fixed
+  directions, and when each agrees to 1% does not measure the off-diagonals.
+  On `theo_sd`, `setCov(fit, "r,s (full)")` after an analytic fit took 95
+  evaluations instead of 175 (0.9 s instead of 1.3 s), with standard errors
+  within 0.4% of the measured ones.  When a check disagrees the off-diagonals are
+  measured as before, at the cost of the check's evaluations (12 on the warfarin
+  model, where one direction missed by 1.9%).  The default `covShortcut = FALSE`
+  always measures them, since four directions cannot see every pattern of wrong
+  correlations.
+
+- nlmixr2est now tells the rxode2 event bus (`rxode2::rxEventListen()`)
+  about top-level work, so loggers such as nlmixr2log can record it:
+  `nlmixr2()` emits `fitComplete` (or `solveComplete` for simulations and
+  predictions); `addCwres()`, `addNpde()`, `addTable()`, `setOfv()` and
+  reading a deferred objective emit `fitUpdate`; `vpcSim()` and `augPred()`
+  emit `solveComplete`.  Internal refits and solves are silent.  Without an
+  rxode2 that has the bus nothing changes.
+
+- `nlmixrUpdateObject()` now returns whether it rebound the object, and
+  `addCwres()`, `addNpde()` and `addTable(updateObject = TRUE)` no longer
+  error when called on an expression such as `fits[[1]]`.
+
+- With an rxode2 that supports `rxControl(nonmem = TRUE)`, the estimation
+  methods now honor it: `time` read in a statement that does not depend on a
+  state (NONMEM's `$PK`) is the time of the record ending the interval, also
+  after it is inlined into `d/dt()` (via `rxS(pkTime = TRUE)`), and the fit's
+  tables, `augPred()` and `vpc()` solve with it too (#1167).  ADDL doses are
+  expanded in `$dataSav`, so they still act as records there.
+
+- `foceiControl(innerOpt = "lbfgsb3c")` runs L-BFGS-B on the per-subject
+  ETA problem, using `lbfgsb3c`'s thread-safe port (`lbfgsb3c >= 2024-3.6`).
+  It replaces `innerOpt = "BFGS"`, which silently fell back to `"n1qn1"`
+  (#927, #1160).  Its tolerances are set by the new `innerLbfgsLmm`,
+  `innerLbfgsFactr`, `innerLbfgsPgtol`, `innerLbfgsAbstol` and
+  `innerLbfgsReltol` arguments, separate from the outer L-BFGS-B ones; the
+  tolerances default from `sigdig`.  `innerOpt = "auto"` never picks it.
+
+- `est = "lbfgsb3c"` now runs lbfgsb3c's thread-safe L-BFGS-B directly from
+  C++ on the nlm-family objective, with no R callback per evaluation, and
+  `foceiControl(outerOpt = "lbfgsb3c")` uses the same port.  Results are
+  unchanged.  The FOCEi fit now reports the L-BFGS-B exit message (it was
+  empty), and `lbfgsb3cControl(trace=)` is ignored.
+
+- `foceiControl(trustPolish = TRUE)` finishes each converged
+  `innerOpt="trust"` solve with Newton steps on the ETAs, down to
+  `trustFterm`.  The default trust solve can stop up to `sqrt(trustFterm)`
+  short of the mode, which the FOCEi `log|H|` term turns into objective noise
+  that depends on the previous evaluation's ETAs; on `pheno_sd` that stopped
+  the outer search 0.03 OFV short with inflated full-sandwich SEs (#1152).
+  It is off by default: across a 372-case FOCEi corpus it moved most fits
+  toward their minimum for about 6% more time, but not every fit.
+
+- With `foceiControl(trustPolish = TRUE)` the `"bobyqa"` outer search now
+  restarts once from where it stops, for about twice the outer evaluations.
+  The objective noise that remains can still shrink bobyqa's trust region
+  early: from 10 starting estimates of `pheno_sd`, 2 fits stopped up to 0.05
+  OFV short, and the polished fit of the #1152 model stopped 0.018 short once
+  residual-error parameters kept their own scaling; with the restart every fit
+  reaches the minimum.
+
+- The table of a mixture fit now has a `mixest` column: each subject's fitted
+  mixture component (as in `$mixNum`).
+
+- `foceiControl(priorMethod = "none")` builds no prior specification: the
+  `ini({})` priors stay on the model but are not evaluated, so the objective is
+  the plain likelihood.  It is for callers that handled the priors elsewhere and
+  only finalize through the FOCEi family's control -- 'nlmixr2bayes' finalizes a
+  Stan posterior this way.  Before this, finalizing such a fit built a FOCEi
+  prior specification it never used, and that build refused any prior the
+  shared kernel cannot evaluate (`dbeta()`, `dgamma()`, `dlnorm()`, `dexp()`,
+  `dunif()`, `dweibull()`, `dlogis()`), failing a fit whose sampler had already
+  handled those priors correctly.
+  
+## Bug fixes
+
+- Now requires 'rxode2' >= 5.1.8, which no longer parses models in parallel
+  with a 'dparser' that is not thread-safe; this fixes the segfault in
+  `rxOptExpr()` seen in the CRAN r-devel clang checks of 7.1.0.
+
+- 'Matrix' moved from Imports to Suggests; it is only used in the tests.
+
+- The analytic FOCE outer gradient (`fast = TRUE`) now finite-differences a
+  subject whose frozen-variance ETAs it cannot find (a failed solve, or a mode
+  it does not reach) on its own, as FOCEi does a subject whose sensitivity
+  solve fails.  One such subject sent the whole gradient to finite
+  differences.
+- The damped-BFGS curvature of `outerOpt = "trust"` and `hessianMethod =
+  "bfgs"` (`trustControl()`, `foceiControl()`) is now one C update.  The two
+  had rounded differently (bitwise apart in 177 of 200 random updates); an
+  `outerOpt = "trust"` fit is unchanged, and a `hessianMethod = "bfgs"` one
+  may move at the last digits.
+- The default FOCEi outer search (`outerOpt = "bobyqa"`) now checks that its
+  normal exit is a stationary point: a central-difference gradient and a short
+  downhill probe, restarting bobyqa (up to 3 times) when the probe lowers the
+  objective by more than `10^(1-sigdig)`.  In a narrow curved valley bobyqa
+  shrank its trust region and stopped early; an `ar()` fit stopped at OFV
+  -1132.2 with `ar1.cor` 0.44 (truth 0.70) and now reaches -1222.5 with 0.70
+  (#1196).  A converged fit pays `2n + 4` extra evaluations and is otherwise
+  unchanged; `foceiControl(bobyqaStationary = FALSE)` skips the check.
+- A Gill83 step search with a nonzero `gillFtol`/`gillFtolCov` whose
+  derivative failed the error test fell back to a central-difference step equal
+  to the slope (possibly negative) and a slope as the curvature; it now keeps the
+  saved trial's step and curvature, and no longer saves a step the search
+  rejected for roundoff (#1194).
+
+- A Gill83 search that finds the objective constant in a parameter now reports
+  its error estimate rather than leaving it unset (#1194).
+
+- A Gill83 step search no longer labels an accurate derivative "High Grad
+  Error" when the slope is negative or the accepted interval came from
+  shrinking the step; these spurious labels raised the "gradient problems"
+  warning and, with a nonzero `gillFtol`, replaced a good step (#1194).
+- A Gill83 step search that shrank its step into roundoff and backed off to
+  the previous step now computes the forward interval from that step's
+  curvature, not from the rejected step's (#1197).
+- `foceiControl(fast = TRUE)` no longer stops on a model with an `ar()`
+  residual ("required for solving: rx_arEp_cp, rx_arT_cp"); the fit uses the
+  finite-difference gradient instead, and `covMethod = "analytic"` falls back
+  to the finite-difference covariance (#1195).
+
+- The nlm-family covariance (`covMethod = "r"`, from `nlmixr2Hess()`) now runs
+  its finite-difference stencil at the ODE tolerances FOCEi's covariance step
+  uses (the fit's times 1e-3, capped at 1e-7).  At the fit's own tolerance
+  (`rtol` 1e-3 by default) the stencil differenced solver noise: an `nlminb`
+  fit with `solveType = "fun"` reported a repaired `|r|` covariance with
+  standard errors about 6 times too small.
+
+- The importance-sampling covariance (`covMethod = "imp"`) now evaluates its
+  finite differences at the same covariance probe tolerances.  At the fit's own
+  tolerance an `impmap` fit on `theo_sd` reported a repaired `|imp|` covariance
+  with the `tka` standard error about 3 times too small.
+
+- `nlmControl(covMethod = "nlm")`, the default with `solveType = "hessian"` or
+  `"grad"`, now builds its Hessian from central differences of the analytic
+  gradient at the estimates, over `nlmixr2Gill83()` steps and at the
+  covariance probe tolerances.  It used `stats::nlm(hessian = TRUE)`'s, which
+  differences function values over a step of about 10%; on `theo_sd` its
+  standard errors were 9-15% off.  `solveType = "fun"` still uses nlm's own.
+
+- `trustControl(hessianMethod = "fd")` with the default `covMethod = "r"` now
+  takes its covariance from the same gradient-difference Hessian at the
+  estimates.  It used the last iteration's Hessian, whose steps are searched
+  afresh at every iteration, and on `theo_sd` reported the `add.sd` standard
+  error 16% high.
+
+- A fit with ODE tolerances below about 1e-10 now gets a covariance.  The
+  covariance step's probe tolerances (the fit's times 1e-3) were floored at
+  1e-14, where the probe solves failed: a FOCEi fit at
+  `rxControl(atol = 1e-11, rtol = 1e-11)` reported no covariance ("R not PD; S
+  failed") and an `impmap` fit no standard errors.  The floor is now 1e-12, also
+  for the analytic covariance's solves.
+
+- `saemControl(nBurn = 0)` and `nEm = 0` no longer add two spurious
+  iterations' gains to the step-size schedule, which shifted every later gain.
+
+- The table step of a fit ("Calculating residuals/tables") now protects the
+  state, `lhs` and covariate columns it adds to the table from R's garbage
+  collector.  A collection that landed in a window of a few allocations
+  dropped those columns from the table, or corrupted R's heap so that R could
+  crash later (for example with `malloc(): unsorted double linked list
+  corrupted`).  The window is small, so this was rare and intermittent.
+
+- `est = "imp"`, `"impmap"` and `"qrpem"` fits of a mixture model with
+  `auto = TRUE` (the default) now reallocate the importance samples by each
+  mixture component's own effective sample size.  The reallocation read the
+  per-subject effective sample sizes with the index of the expanded
+  (subject x component) list, past the end of them, so the sample counts of
+  every component after the first came from unrelated memory.
+
+- An `mtime()` variable with a `.` in its name (such as nonmem2rx's
+  `rx.mtime.1.`) no longer fails with `SymEngine exception: Parse error`
+  (#1189).
+- The Shi (2021) finite-difference step search over a vector (the
+  nlm/nlminb Hessian, the FOCEi inner eta Hessian, theta sensitivities and
+  the analytic-covariance tensor) now leaves components with a ratio below
+  1 out of its harmonic mean.  Such a component has no third-difference
+  signal above the noise, often because it does not depend on the stepped
+  parameter at all, and it pinned the ratio near 0, so the step grew to
+  `hMax`: on a binary `ll()` model the nlm Hessian was off by a factor of 58
+  and nlminb stopped 18 OFV points short.  The old treatment, whose zero
+  correction also mis-transcribed `lmomco::harmonic.mean()`, is available
+  with `options(nlmixr2est.shi21RatioCensor = "legacy")`; `"substitute"`
+  and `"lmomco"` are also accepted (#1188).
+
+- FOCEi-family eta sensitivities (and the imp/impmap theta sensitivities)
+  now chain through `lag()`/`diff()` of a calculated variable, so a model
+  whose random effect reaches the prediction only that way no longer errors
+  with "none of the model predictions depend on a random effect", and one
+  where it also enters directly gets the full inner gradient.  An ODE that
+  uses such a variable now compiles, and `lag()` of a variable inside an ODE
+  gives a clear error.  The analytic `fast=TRUE` gradient and analytic
+  covariance fall back to finite differences for these models (#1176).
+  This also holds for a lagged variable that is assigned more than once,
+  which rxode2 now reads through a snapshot (rxode2#1435).
+
+- `$etaMat` of a fit with inter-occasion variability now holds the occasion
+  ETAs as the model estimated them; it held them multiplied by the occasion
+  standard deviation (the scale of `$iov`).  `setOfv()`, `addCwres()`,
+  `setCov()` and fits started from `etaMat = fit` evaluated the occasion
+  effects at those values: `setOfv(fit, "foce")` on an additive-error
+  `theo_md` model gave 482.5 for a fit whose objective was 458.3.
+
+- `est="nls"` fits a delay differential equation model with its `past()`
+  pre-history.  The nls models dropped the `past()` lines, so nls fitted a
+  model with a different history: its estimates were biased, and the
+  residuals it minimized did not match the fit's own table.
+
+- `est="nls"` started from parameters that are all zero (all-zero initial
+  estimates with `nlsControl(scaleTo = 0)`) now solves the model for its first
+  evaluation.  It answered that evaluation from an empty cache, all zero
+  residuals and Jacobian, and stopped with `incorrect number of dimensions`
+  (`singular gradient matrix at initial parameter estimates` with
+  `algorithm = "default"`).
+
+- `est = "lbfgsb3c"` stopped early at the default `sigdig`: its `factr` was
+  `10^-sigdig / eps`, which tests one step's objective reduction, so a logistic
+  Emax fit ended ~1.6 OFV short of the optimum.  It is now
+  `10^(-sigdig-2) / eps`, matching `foceiControl(lbfgsFactr=)`.
+  `est = "optim"` with `method = "L-BFGS-B"` stopped short the same way and
+  now uses the same rule.
+
+- `lbfgsb3cControl(maxit=)` was documented but dropped, so `est="lbfgsb3c"`
+  always used lbfgsb3c's own limit of 1000 evaluations; it is now honored
+  (default 10000).
+
+- `nlmeControl()` reads an integer `covMethod` as the `foceiControl()` slot
+  it is: `1`, `2` and `3` keep `"r,s"`, `"r"` and `"s"`, where every
+  non-zero integer became `"analytic"`; any other integer is an error.
+  `vaeControl()` and `emviControl()` now accept the same slots instead of
+  failing.
+
+- `rxUiDeparse()` of a `foceiControl()` (and of the focei-family controls
+  deparsed the same way) writes `covMethod = "sa"` or `"imp"` for a deferred
+  covariance; it wrote `covMethod = ""`, so the control it rebuilt computed
+  no covariance.  A control whose covariance step is off is written as
+  `covMethod = ""` even when its `covType` is `"analytic"`, where it was
+  written as `covMethod = "analytic"`.
+
+- `rxUiDeparse()` of an estimation control evaluates back to the identical
+  control.  A control with a non-default `sigdig` is written as `sigdig = `
+  rather than as every tolerance derived from it (some of them rounded, such
+  as `lbfgsFactr`); `print` is written for the focei family, where it was
+  dropped; and saem's integer `nBurn`/`nEm` stay integer.
+
+- `impControl()`, `impmapControl()`, `npagControl()` and `npbControl()` now
+  have an `rxUiDeparse()` method; a fit with one of these controls deparsed
+  its control as nothing.
+
+- `est="nls"` dropped the `past()` pre-history of a delay differential
+  equation model, biasing its estimates; the history is now kept.
+
+- `est="nls"` with `nlsControl(solveType="fun")` no longer stopped with
+  "required for solving" on a model using `lag()` of a calculated variable.
+
+- A model computing `linCmt()` into a variable (`cp <- linCmt()`) rather than
+  as the endpoint is now recognized as a `linCmt()` model.  Under rxode2 5.1.8
+  its second-order sensitivities are incomplete, so the default analytic
+  covariance, `fast=TRUE` gradients and the `ll()` exact-Hessian objective were
+  wrong; these now fall back to finite differences, and `est="flaplace"`/`"fagq"`
+  stop with a clear message (#1103).
+
+- When `fast=TRUE` is turned off during setup (`linCmt()`, mixture,
+  out-of-scope `ll()` and some `matExp()` models), a defaulted outer optimizer
+  now also reverts to `bobyqa`; keeping `lbfgsb3c` with finite-difference
+  gradients stalled well short of the optimum.
+
+- All compiled sources, C as well as C++, are now built with `R_NO_REMAP`
+  defined before any R header is included, as 'Writing R Extensions'
+  requires, so C and C++ sources use the same remapping rules (#1154).
+- The FOCEi-family objective no longer jumps where a residual variance crosses
+  `sqrt(.Machine$double.eps)`: such a variance is now floored instead of being
+  replaced by 1, which added about +16 per observation.  Proportional-error fits
+  with predictions below ~1e-3 could converge to a wrong optimum.  The
+  `foceiControl(fast=TRUE)` analytic outer gradient now applies the same floor;
+  it had differentiated the raw variance, which stopped fits short.  The
+  analytic covariance (`covMethod="analytic"`) of an additive/proportional fit
+  with a floored variance is now assembled from the floored variance too; its
+  observed information was off by up to ~30%.  An adaptive Gaussian
+  quadrature fit whose nodes floor the variance uses the finite-difference
+  covariance instead (#1132).
+- A fit's `IPRED`/`PRED` table, `vpcSim()` (and so `npde`) and `augPred()`
+  now interpolate time-varying covariates with the fit's
+  `rxControl(covsInterpolation=)` and `naInterpolation=` instead of always
+  using `"locf"`; a `"nocb"` fit (the default for NONMEM-imported models)
+  had individual predictions that did not match its own model (#1137).
+- `vpcSim(fit, events = ...)` (or any other setting the fit's simulation
+  information already holds) replaces that setting instead of failing with
+  `formal argument matched by multiple actual arguments`.
+- `vpcSim(fit, n = 1)` no longer fails with `object '.sim2' not found`.
+- `vpcSim()` (and so `addNpde()`) and `augPred()` no longer fail with a
+  syntax error for a model that uses `lag()` or `diff()` of a calculated
+  variable (#1173).
+- The table of a fit whose `rxControl(method=)` is one of rxode2's newer ODE
+  methods (`"cvode"`, `"lsode"`, `"bdf"`, `"dop5"`, ...) is calculated again.
+  The post-fit solve turned the fit's integer method code back into a name
+  with a copy of only the first four methods, so any newer code was a
+  `malformed factor` error; the name now comes from rxode2's own table
+  (`rxode2::odeMethodToInt(NULL)`).  Fits read back from external programs
+  ('babelmixr2' with Monolix) lost their table this way without an error.
+- A model mixing `linCmt()` with ODEs, fitted with a method that solves it as
+  ODEs (the FOCEi and nlm families), no longer renumbers its compartments: a
+  numeric `cmt` in the data doses the same compartment as with the `linCmt()`
+  model (depot and central first, then the ODE states).  Every compartment
+  shifted by one before, silently; with a newer rxode2 the fit instead warned
+  that the compartments were renumbered when they were not.
+
+- A `mix()` model that also uses a data covariate (for example `WT`) now fits
+  with `est="saem"`, which stopped with `mixest is time-varying but must be
+  constant within an individual`.  Every other mixture-capable method fitted
+  but silently dropped its table step (`$runInfo`: "error calculating tables");
+  that half is fixed in rxode2, and with an older rxode2 the table is now
+  produced without the fitted component assignment, and a warning saying so.
+
+- An `est="saem"` mixture fit whose subject IDs were not 1..N in data order
+  solved its table without the fitted components (character IDs) or lost the
+  table entirely (numeric IDs).
+
+- With rxode2 after rxode2#1365, `est="vae"` again fits an omega block
+  declaring a covariance of exactly `0`; it stopped with `omega position list
+  (5) != omegan (6)`.  That rxode2 accepts such an omega unfilled but still
+  estimates the zero, so the block's zeros are now filled before the call
+  rather than only when rxode2 refused it (#1079).
+
+- `foceiControl(fast=TRUE)` (the `foceif`/`*f` family) no longer refuses to fit
+  a model whose compartment has a constant initial condition (`center(0) <-
+  0.03`), which failed with `The following parameter(s) are required for
+  solving: .l`.  Such an initial condition reaches the augmented sensitivity
+  model as a plain number rather than a symbolic expression, and differentiating
+  one raised an error that was then swallowed and written into the model as the
+  literal symbol `.l` (#1115).  A model whose initial condition depends on an
+  ESTIMATED parameter is a separate defect and is still open on that issue.
+
+- An omega block declaring one of its covariances at exactly `0` (for example
+  `eta.ka + eta.cl + eta.v ~ c(0.1, 0.01, 0.1, 0, 0.01, 0.1)`) no longer aborts
+  the fit with `theta has to have N elements`.  The block's cholesky factor is
+  dense, so that `0` cannot be held; it is now estimated from ~0, as a `0`
+  element of a NONMEM `$OMEGA BLOCK` is, and `$runInfo` names the random
+  effects involved.  The same applies to a correlated pair that is not adjacent
+  in eta order (`eta.a` with `eta.c`, `eta.b` between them), which used to be
+  refused as well.  The FOCEi family, `est="vae"` and the general-likelihood
+  inner driver all took the same route (#1079, rxode2#1365).  A covariance
+  declared at `0` in a two-eta block is unchanged: it leaves the two etas
+  uncorrelated, as it always has.
+- `foceiControl(warm="save")` now restarts the n1qn1 inner problem from the
+  curvature the subject's previous inner solve left, as it was always meant
+  to.  It reconstructed that Hessian from a buffer it had just zeroed, so
+  n1qn1 was handed an all-zero factorization and self-initialized on every
+  inner solve -- the option reused nothing since FOCEi was first imported
+  (#1043).  A single-eta model was additionally unseedable because the
+  one-by-one case multiplied the factorization back out as a zero matrix.
+  With `mceta` sampling the `eta=0` floor pass now gets that same seed rather
+  than self-initializing, so it stays the run `mceta=0` would have made.  The
+  previous self-initialized behavior is available as the new
+  `foceiControl(warm="none")`, and `warm="save"` reuse is reported in the fit's
+  `$nWarmSave`.
+
+- The finite-difference Hessian of `est="nlm"` (`solveType="hessian"`),
+  `est="nlminb"` and `est="trust"` no longer moves the parameters it is
+  computed at.  When the gradient could not be evaluated on either side of a
+  parameter, that parameter was left shifted by the step in the vector the
+  optimizer passed in (for `nlminb`, its current iterate), and the iteration
+  history, the saved objective and `trust`'s quasi-Newton update recorded the
+  shifted point in place of the one evaluated.  The other parameters could
+  move by rounding.
+
+- The per-observation log-likelihoods (`$llikObs`, and `nlmixrLlikObs` in the
+  merged data) of a fit with a non-normal endpoint (`dnorm()`, `ll()`,
+  `dpois()` and the like, with the default `fast=FALSE`) are now those at the
+  reported ETAs.  They came from the last evaluation of the finite-difference
+  inner Hessian, at an ETA moved by a few steps (off by up to 0.93 per
+  observation on `theo_sd`).
+  
+- Added a native analytical outer Hessian for fast Gaussian FOCE/FOCE+/FOCEI/AGQ fits, using
+  the existing sensitivity pool. Fast `nlminb` fits used it automatically.
+
+- The FOCEi-family outer optimizer now scales each parameter by its own
+  scaling constant when a fixed theta (with `literalFix = FALSE`) or a
+  regression-updated theta (`mfocei`, `ifocei` and the other mu-referenced
+  variants) comes before it.  Each later parameter took the constant of
+  another, `foceiControl(scaleCband=)` also guarded some omega parameters, and
+  `$scaleInfo` listed the constants out of place; it now shows `NA` for the
+  parameters the optimizer does not move.
+
+- The values of a `foceiControl(scaleC=)` vector longer than the parameters
+  are now ignored past them (after the existing warning).  They were written
+  over the adaptive quadrature nodes, changing an `agq` objective, and a long
+  enough vector past the end of the buffer, crashing the fit.
+
+- `setOfv(fit, "laplace<n>")` and `setOfv(fit, "gauss<n>_<sd>")` on a saem fit
+  whose environment holds no `adjObf` now take it from the fit's control, as
+  `setOfv(fit, "imp")` does, instead of stopping with `arguments imply
+  differing number of rows`.  Both now read the fit's own control (`$control`);
+  the imp objective read `$foceiControl`, which never holds `adjObf`.
+
+- A failed evaluation of a subject's inner (ETA) problem -- an ODE solve that
+  fails, or a prediction that is not finite -- no longer leaves values that a
+  later evaluation returns.  The inner problem keeps its last evaluation and
+  answers a repeat at the same ETAs from it; after a failure, a repeat at the
+  last ETAs that succeeded returned what the failed evaluation had left (an
+  objective of 0 when the failure came in the observations).  The ETA
+  gradient of a failed evaluation is now `NA` rather than the previous
+  evaluation's or a partly summed one, so the finite-difference inner Hessian
+  of a non-normal endpoint takes its one-sided difference when a leg fails,
+  and its step search rejects the failed probe, instead of differencing that
+  value.  The `n1qn1` inner optimizer is not handed a gradient at a point
+  whose evaluation failed (it keeps the one it has), and every inner
+  optimizer counts a `NaN` objective as a failed evaluation, as it did `NA`.
+
+- The ETA gradient of a non-normal (log-likelihood) endpoint evaluated with
+  the eta-epsilon interaction no longer adds `sqrt(.Machine$double.eps)` for
+  every observation the ETA does not affect.  `est = "vi"` and the
+  conditional likelihood of `foceiLikRun()` and its C interface used that
+  gradient; a FOCEi fit of such a model runs without the interaction and was
+  not affected.
+
+- The per-observation log-likelihoods of an `agq` fit (`$llikObs`, the
+  `nlmixrLlikObs` column) are now those at each subject's ETAs.  Every
+  quadrature node re-evaluated the subject at another ETA, so they came from
+  the last node (up to 2.5 away on `theo_sd`).
+
+- `mfoce` and `ifoce` (and their `f` variants) now evaluate the FOCE objective
+  with the residual variance of the current thetas.  FOCE ("nonmem") freezes
+  the variance at each subject's `eta = 0` prediction and keeps it until the
+  thetas change, but the regression of the mu-referenced thetas inside an
+  evaluation changed them without renewing it, so the later
+  {re-optimize ETAs, regress} cycles used the variance of the thetas the
+  evaluation started from.  On `theo_sd` with a proportional error, a
+  zero-iteration `mfoce` fit reported an objective 15.5 below the FOCE
+  objective at its own estimates, and a full fit stopped at an objective 1.0
+  above the one it now reaches.
+
+- `est = "vae"` with `likelihood = "foce"` and the default
+  `residOptimize = "twoStage"` now estimates the residual parameters at the
+  ETAs it fixed for them.  That stage pins the ODE states and recomputes only
+  the residual variance, but the `eta = 0` solve FOCE takes its variance from
+  was written over the pinned states, so the population prediction stood in
+  for every individual one: a proportional error came out 0.377 where FOCE+
+  gives 0.193 (now 0.182).
+
+- Values the FOCEi family reads as those of the current parameters are now
+  taken there, not at the last finite-difference leg that ran before them.
+  The gradient of a mixture proportion (gradient-based outer optimizers) and
+  the proportion's rows of the S matrix use the subjects' responsibilities,
+  which every leg rewrites: the gradient of the same proportion at the same
+  point depended on where it was declared in `ini()`, and the S matrix entry
+  was off by 3e-5 (relative) on a two-component example with overlapping
+  components.  With `covDerivMethod = "forward"`, each subject's S-matrix
+  score was differenced from its value at the last leg of the pooled
+  gradient, which made S 100 to 1000 times too large on `theo_sd`; it now
+  agrees with the central-difference S to the truncation error.
+
+- `outerOpt = "trust"` with `outerTrustHessian = "fd"` no longer records its
+  finite-difference probes in the parameter history (`$parHistData`) or
+  prints them as iterations.  On `theo_sd` with four parameters, 1169
+  objective rows were recorded for the 167 evaluations the optimizer asked
+  for.  The `iter` column still counts every objective evaluation, so it
+  skips the probes.
+
+- An ETA finite-differenced through the prediction model (`eventSens = "fd"`
+  or a dosing parameter) is now differenced
+  against the prediction model's own value at the ETA.  The base point came
+  from the sensitivity model, a solve of another ODE system, so a forward
+  difference (`eventType = "forward"`) divided the difference between the two
+  solves by the step: at `atol = rtol = 1e-3` a gradient of 33.8 came out
+  11.6.
+
+- `foceiControl(covMethod=)` (and the controls built on it, such as
+  `foceControl()` and `impmapControl()`) is now an error for a number that is
+  not a covariance slot (`0` to `3`) and for anything that is neither a
+  method name nor a number (`NULL`, `NA`, `TRUE`, a vector).  It was stored
+  as given.
+
+- `est = "foce"`, `"focep"`, `"laplace"` and `"agq"` given a `foControl()` or
+  `foiControl()` now convert it; they stopped with `unused argument:
+  'posthoc'`.  These four methods now convert another method's control the
+  way the mu-referenced methods do, keeping only the settings its caller
+  changed, so that method's own settings no longer replace theirs: `est =
+  "agq"` given a `foceControl()` ran FOCE (`nAGQ = 0`, no interaction), and
+  `est = "laplace"` given an `agqControl()` ran a two-node quadrature.
+
+- `rxUiDeparse()` now writes `foceControl()`, `focepControl()`,
+  `foControl()`, `foiControl()`, `posthocControl()`, `mfoceiControl()`,
+  `ifoceiControl()`, `mfoceControl()`, `ifoceControl()`, `mfocepControl()`
+  and `ifocepControl()` as the call that rebuilds them, as it already did for
+  the other focei-family controls; it returned `NULL` for these.
+
+- `saemControl()` now checks `nSaCov` as `saControl()` does (a whole number
+  of at least 1) and requires a single `seed`.  A zero, negative or missing
+  `nSaCov` was accepted and skipped the covariance phase of
+  `covMethod = "sa"`, and a vector `seed` stopped the fit with
+  `'.Random.seed' has wrong length`.
+
+- `foceiControl(gillStep=)` and `foceiControl(gillStepCovLlik=)` must now be
+  at least 1, as `gillStepCov` already had to be, and all three must be
+  finite (`rsControl(gillStepCov=)` too); `nlmixr2Gill83(gillStep=)` makes
+  the same check.  The Gill step search grows its step by multiplying by
+  this factor and shrinks it by dividing, so a factor below 1 ran the search
+  backwards: on `exp(3 * x)` at `x = 1`, `nlmixr2Gill83(gillStep = 0.1)`
+  gave a derivative 1% off, against 0.01% with the default.
+
+- The FOCEi control of a saem fit (`fit$foceiControl`, which
+  `setOfv(fit, "focei")` and `addCwres()` refit with) now follows
+  `saemControl(literalFix=)` and keeps fixed residual parameters in the
+  model, as the saem fit itself did.  It substituted fixed thetas and fixed
+  residual parameters into the model even with `literalFix = FALSE`, the
+  saem default, so those refits used a model the fit had not.
+
+- `sqrtm()` of a matrix that is not finite is now an error.  It returned an
+  empty `0 x 0` matrix for most such matrices (a `NaN` or `Inf` off the
+  diagonal), reported "imaginary" components for a `NaN` diagonal, and gave an
+  infinite root for an infinite diagonal.
+
+- `setOfv(fit, "imp")` (and `"impmap"`) on a saem fit now switches the fit to
+  the importance-sampling objective.  It stopped with `unknown error` after
+  the objective, log-likelihood, AIC and BIC had already been switched,
+  leaving the objective type and the fit header naming the previous one.  An
+  objective a saem fit cannot describe now stops before anything changes.
+
+- The warnings of the steps that run after a fit is finalized -- the post-fit
+  covariance recompute of the mu-referenced (`mfocei`-style), imp, np and
+  nlme families and the deferred `covMethod = "sa"`/`"imp"` covariance -- are
+  now kept in the fit's `$runInfo` with the other warnings of the run.  They
+  were raised by `nlmixr2()` itself instead, and `$runInfo` did not have them.
+
+- Refitting a fit whose fixed thetas stay in the model (`literalFix = FALSE`,
+  the saem default) with `nlmixr2(fit, ...)`, and so `setOfv(fit, "focei")`
+  and `addCwres()` on such a saem fit, no longer stops with `arguments imply
+  differing number of rows: 0, 1`; neither does `setCov()` or
+  `getVarCov(force = TRUE)` after `augPred()` or `vpcSim()` on such a fit.
+  The simulation these run first substituted the fixed thetas into its model
+  and left the unsubstituted model recorded for the next estimation, whose
+  parameter table then looked for fixed thetas that were not substituted.
+
+- An `est="saem"` mixture fit's Gaussian-quadrature and Laplace -2LL now
+  weight each subject's likelihood under every component by the mixture
+  probabilities, integrating each component over its own random effects.  It
+  solved every subject under whichever component the previous solve left, so
+  the value was far too high and changed between builds (#1184).
+
+- `setOfv(fit, "foce")`, `"focei"`, `"fo"`, `"imp"` and `"impmap"` now
+  calculate an objective whose row is the uncalculated (`NA`) placeholder a
+  saem fit starts with, instead of switching to the `NA` row; `setOfv(fit,
+  "imp")` on a saem fit no longer stops with `unknown error` (#1184).
+
+- An `est="saem"` mixture fit with a separate eta in each component (for
+  example `mix(exp(tcl1 + eta.cl1), p1, exp(tcl2 + eta.cl2))`) kept its pooled
+  eta in the wrong column of `$etaMat`, leaving another eta `NA`; its table
+  step failed and its FOCEi objective could not be calculated (#1184).
+
+- `shiErr` and `hessErr` must now be > 0 in `nlmControl()`,
+  `nlminbControl()`, `nlsControl()`, `optimControl()` and `trustControl()`,
+  as must `hessEps`/`hessEpsLlik` in `foceiControl()` and `rsControl()`;
+  0 was accepted and gave a zero finite-difference step (an all-zero
+  gradient for event parameters).  A hand-built nlm control with a
+  non-positive value uses the default (#1174).
+
+- `est = "nlme"` with a covariance in `ini()` now reports nlme's estimate of
+  omega in `$omega` and in the fit's `ini()`, and so to every step that starts
+  from the fit (`setCov()`, `setOfv()`, `addCwres()`, simulation, the
+  `covMethod = "analytic"`, `"r,s"`, `"sa"` and `"imp"` recomputes, refits);
+  it reported the initial omega.  nlme now estimates only the covariances
+  `ini()` declares (a `pdBlocked` structure): it estimated a full covariance
+  matrix over every eta, with the warning `nlme will estimate a full omega
+  matrix if any covariances are estimated`.  `VarCorr()` of such a fit is
+  nlme's own, which prints no correlations for a blocked structure; `$omega`
+  has them.  The columns of `$eta` and `$etaMat` follow the ui's eta order,
+  not nlme's.  An omega declared as one full block is still a single
+  `pdSymm`, and a diagonal one a `pdDiag`.  A `fix()`ed omega element is now
+  an error: nlme cannot hold it, so it estimated the element and wrote the
+  estimate into a row marked fixed.
+
+- A fit whose omega estimate is not positive definite (a variance collapsed to
+  0 or a correlation of 1, as a degenerate `saem`, `nlme`, `vae` or `vi` fit
+  can end with) now reports that estimate in `$omega` and in its `ini()`.
+  Both held the nearest positive-definite matrix the table step needs instead
+  (on a saem fit with a correlation of 1, variances of 0.21 and 0.050 for an
+  estimate of 0.081 and 0.019).  The repair is now a warning: `omega not positive
+  definite; tables use its nearest PD matrix`.  A posthoc fit
+  (`maxOuterIterations = 0`) whose `ini()` omega is only nearly singular, as a
+  rounded NONMEM import can be, reports it corrected instead: when the
+  modified Cholesky factorization adds no more than `cholAccept` to its
+  diagonal, the fit and its `ini()` hold that corrected omega, with the
+  warning `omega nearly singular; corrected within cholAccept`.
+
+- When an omega or an eta Hessian is not positive definite, the repair that
+  keeps its diagonal now falls back to one that does not when it cannot make
+  the matrix positive definite (a zero or negative diagonal).  `saem` used to
+  invert the singular omega anyway, and the FOCEi eta Hessian was left
+  unrepaired.  The fallback is noted in `$runInfo` (`omega repair changed its
+  variances`, `eta Hessian repair changed its diagonal <n> times`), and the
+  saem warning no longer starts with `SAEM:`.
+
+- `nlmixr2CreateOutputFromUi()` now keeps its contract for a method that
+  passes its estimates in `$omega` and `$fullTheta` without writing them into
+  the ui: the fit's `$omega`, `$theta` and ui carry those estimates (it
+  reported the ui's initial values), and `$iniDf0` is the model passed in
+  when it is called outside an `nlmixr2()` run (it was the original model of
+  whichever fit ran last).
+
+- A FOCEi-family fit with `outerOpt = "uobyqa"` or `"newuoa"` and a bounded
+  theta now writes that theta's estimate into the fit's `ini()` on its own
+  scale; it wrote the internal (logit or log) value, so `ini(fit)`,
+  `setCov()`, `setOfv()`, `addCwres()`, simulation and refits used it as the
+  estimate (a `td1` in `[0, 1]` held at 0.5 read 0).  `$theta` was right.
+
+- A `saem` mixture whose components use different etas
+  (`mix(exp(tcl1 + eta.cl1), p1, exp(tcl2 + eta.cl2))`) now reports them
+  separately, as the other methods do, each with its own component's
+  variance.  It merged them into one eta (`eta.cl`), put after the objective
+  column, so `$ranef`/`$eta` showed `eta.v`'s values as `eta.cl` and `NA` as
+  `eta.v`, and the tables, the shrinkage and the etas handed to `setOfv()`,
+  `setCov()` and refits used the wrong columns.  A component's own eta is now
+  its posterior mean under that component (it was blended with the other
+  components' chains, which never apply it) and is 0 for subjects of the
+  other components.  A component without an eta of its own
+  (`mix(..., p2, exp(tcl3))`) no longer stops the fit with `subscript out of
+  bounds`.
+
+- The shrinkage of an eta used by only one mixture component is now taken
+  over that component's subjects, for every estimation method.  The other
+  subjects' etas are 0, and counting them reported it as heavily shrunk.
+
+- A `saem` mixture whose components have etas of their own (split etas) no
+  longer freezes them at 0 for most subjects.  The up-front uninformative-eta
+  check probed each subject under one component, assigned by ID in turn, so
+  an eta used only by the other components was never sampled for that
+  subject.  Every subject is now probed under every component.  Sampling them
+  needed two changes to the default `mixSampleMethod = "parallel"`: a split
+  eta's variance is estimated from its own component's chain, weighted by the
+  responsibilities, and the responsibilities compare each component's density
+  of its own etas, including its normalizing constant.  On the two-population
+  test data (clearances 0.8 and 8, 40:20) the fit recovers 0.78 and 7.25 with
+  every subject classified correctly; it reported 2.2 and 8.0 with 18 of the
+  40 high-clearance subjects in the low component once the etas were sampled
+  without these changes.
+
+- `VarCorr()` of a fit by any method but `nlme` now reports the omega
+  correlations (one column per eta, the lower triangle); it reported only
+  the variances and standard deviations.  It no longer fails for a fit with
+  inter-occasion variability (`'list' object cannot be coerced to type
+  'double'`): the occasion etas get rows of their own.
+
+- The importance-sampling (`imp`, `impmap`, `qrpem`) and nonparametric
+  (`npag`, `npb`) fits now warn when an omega variance below 1e-6 is raised
+  to 1e-6, the floor their omega inverse needs: `omega variance floored at 1e-6:
+  eta.ka`.  The floored value is what `$omega` and the
+  fit's `ini()` report, so a support dimension that collapsed, or a variance
+  fixed below 1e-6, changed with no message (`npagOmega` keeps the support's
+  own covariance).
+
+- `$eta`/`$ranef` of a mixture fit with inter-occasion variability now has
+  one `mixnum` column; it had `mixnum.x` and `mixnum.y`, which `$etaMat` then
+  passed on as etas.
+
+- `$etaMat` of a `saem` fit with `saemControl(iovMethod = "twoLevel")` or
+  `"collapsed"` now holds the occasion ETAs the way a FOCEi-family refit
+  expands them, with unit variance; it held the occasion deviations
+  themselves.  `setOfv()`, `addCwres()`, `setCov()` and fits started from
+  `etaMat = fit` evaluated the occasion effects 12 (`"twoLevel"`) and 18
+  (`"collapsed"`) times too small on `theo_md`.
+
+- `est = "nlme"` with a combined additive and proportional error now reports
+  the residual parameters of nlme's own error model.  nlme's residual
+  standard deviation is `sigma` times its variance function, and the
+  additive coefficient (both coefficients with `addProp = "combined2"`) was
+  reported without that factor: on a simulated data set with additive 0.3
+  and proportional 0.1, the `combined2` parameters gave residual standard
+  deviations near 121 for nlme's 0.3 to 1.  The residual parameters, and
+  every refit that starts from them, now reproduce nlme's.  With
+  `addProp = "combined2"` nlme's `sigma` is now fixed at 1, as nlme
+  recommends for `varConstProp()` (sigma, the additive and the proportional
+  coefficients are not separately identifiable), so the additive and
+  proportional parameters are nlme's `const` and `prop` themselves.
+
+### Parameter scaling
+
+- `ui$scaleCtheta` (and `ui$scaleCnls`) now give one scaling constant per
+  estimated theta.  For a model with random effects the values were followed
+  by an `NA` for each of them, and a `foceiControl(scaleC=)` longer than the
+  thetas was returned whole.
+
+- The FOCEi family now scales each `theta` by the constant R chooses for it
+  (the one `ui$scaleCtheta` shows and the nlm family uses): a transformed
+  parameter's constant inside that transform's own band (21.3 for
+  `expit(tcl, 1, 100)` at `tcl = 3`), `0.5*|est|` for a residual-error
+  parameter, or the value given in `foceiControl(scaleC=)`.  FOCEi guarded
+  every theta's constant to `scaleCband` a second time and replaced any of
+  these outside the band by `|init|` (a `prop.sd` of `0.1` was scaled by `0.1`,
+  not `0.05`), which also turned both zero-gradient retries with `scaleC0`
+  into `|init|`.  Fits with such parameters take a different path: the
+  warfarin model with proportional and additive error now ends at an
+  objective of 223.25 instead of 223.58.
+
+- `foceiControl(normType = "mean")`, `"std"` and `"len"` now take the mean,
+  standard deviation and length over every FOCEi parameter; they left out the
+  last one (the last omega parameter), as the nlm family did before #995.
+  FOCEi now uses the nlm family's normalization, so initial estimates that are
+  all zero run without normalization instead of with a scale of about `1e-8`.
+
+- `$scaleInfo` of a FOCEi-family fit lists each parameter's own first-gradient
+  step search ("Initial Gradient" and the forward and central steps) when a
+  fixed theta (`literalFix = FALSE`) or a regression-updated theta (`mfocei`
+  and the other mu-referenced variants) comes before it.  Each row showed the
+  search of the next parameter the optimizer moves, and the last row none.
+
+- `$scaleInfo` lists the covariance step's search of each parameter
+  ("Covariance Gradient" and its steps) in that parameter's row.  The rows were
+  read by the index of the covariance step's own parameters, so a fixed theta
+  (`literalFix = FALSE`) before the others shifted every later theta's search
+  up one row.
+
+- With `foceiControl(diagXform = "log")` or `"identity"` the FOCEi outer
+  problem scales the first omega parameter like the other diagonals (`1/2`, or
+  `1/(2|init|)`); it took the default of a linear theta, `1/|init|`.
+
+- A FOCEi theta reset (`foceiControl(resetThetaP=)`, `resetThetaFinalP=`, and
+  the reset after a zero gradient) now restarts the fit from the values it
+  reset to, with each eta's drift moved into the theta that eta belongs to.
+  The reset took the current thetas through the parameter scaling a second
+  time (with another parameter's constants), moved every eta's drift into the
+  first theta, and a restart after the first evaluation went back to the
+  initial estimates and the etas from before the reset, with its bounds
+  scaled twice.  A model whose etas drift at the initial estimates was driven
+  to an objective of 4.5e231 with `resetThetaP = 0.2`; it now reaches 160.8,
+  and a final reset (`resetThetaFinalP`) that stopped with "Starting values
+  violate bounds" now restarts.
+
+- A theta reset that would put a mu-referenced theta back at the bound an
+  earlier reset of the same fit clamped it to is skipped, with a warning, and
+  the optimization goes on.  Once resets took effect, a theta whose optimum
+  lies past its bound was reset there each time the outer optimizer probed it
+  inward, until the fit stopped with "Maximum number of theta resets (10)
+  exceeded".
+
+- A theta reset no longer fires when every eta whose drift triggers it belongs
+  to a theta already pinned at its bound.  It went ahead whenever another eta
+  could take any shift, however small, so the restart's first evaluation
+  fired it again at the same point until the restart limit.
+
+- When a fixed theta (`literalFix = FALSE`) or a regression-updated theta
+  comes before others, each FOCEi parameter now gets its own bound code for
+  the L-BFGS-B outer optimizers (`outerOpt = "lbfgsb3c"`, `"L-BFGS-B"`) and
+  for the covariance step's boundary check.  A parameter with an upper bound
+  took its code from the parameter after it, and the last one from an
+  unrelated buffer: omega parameters lost their lower bound, and a theta
+  estimated on its lower bound got a covariance (`"r,s (full)"`) instead of
+  the boundary message.
+
+- The FOCEi outer gradient searches a zero derivative again with
+  `foceiControl(scaleC0=)` only for `scaleType = "nlmixr2"` (the only scaling
+  that uses the constant) and only at the parameter's starting value.  At any
+  other point the new constant moved the parameter under the outer optimizer
+  and the search differenced about the objective of the old point; that
+  happens for a repeated Gill search (`repeatGillMax`), on the restart after a
+  theta reset and with a custom outer optimizer.  When neither retry finds a
+  slope, the parameter keeps its own scaling constant; it kept `1/scaleC0`
+  (`1e-5` by default) for the rest of the fit, which left it all but unable to
+  move.
+
+- The covariance step of a FOCEi-family fit without outer iterations
+  (`maxOuterIterations = 0`, which includes the second pass of `fo` and
+  `foi`) checks the estimates against their own bounds.  It took bounds that
+  were never put on the optimizer's scale back from that scale, so it missed
+  an estimate on its bound (a `tcl` of 1.1 with a lower bound of 1.0999 was
+  compared with 2.77) and could flag one far from it.
+
+- `foceiControl()` (and the FOCEi-family controls built on it) now requires
+  `scaleCmin`, `scaleCmax`, `scaleC` and `scaleC0` to be finite and above 0,
+  with `scaleCmin < scaleCmax`.  `scaleCmin = 0` let a `scaleC` of 0 through,
+  which stopped the fit with `missing value where TRUE/FALSE needed`, and
+  `scaleCmax = Inf` let an infinite one through.
+
+### Covariance
+
+- The FOCEi covariance step no longer accepts an R or S matrix with a
+  non-finite entry as positive definite (the modified Cholesky factorization
+  reported one so); it is not usable, as in the nlm family.
+
+- A fit's covariance (`covMethod = "r,s"`, `"r"` and `"s"`, either shape) is
+  now the one `setCov()` computes for it.  The covariance step starts every
+  subject's inner problem as a fresh setup leaves it (estimation's warm
+  Hessian, ETA nudge state and quasi-Newton memory are not carried over),
+  draws its inner restart points from the estimated Omega rather than the
+  starting one, and scales the S step (`smatNorm = TRUE`) by its own centre
+  objective rather than the fit's initial one; `setCov()` installs the fit's
+  parameters to the last bit (`env$covHandoff`).
+
+- The covariance step's progress bar now always reaches 100% and ends its line
+  (#1171).  After an earlier bar had finished it stopped at a few percent, the
+  next message could print on the bar's line, and an `imp` fit's bar was
+  sometimes not shown at all.
+
+- The analytic covariance (`covMethod = "analytic"`, `setCov(fit, "analytic")`)
+  of a model with additive plus proportional error reported the two residual
+  SEs under each other's names when `ini()` declared the proportional one
+  first.  They are now named by parameter.
+
+- The analytic outer gradient (`foceiControl(fast = TRUE)`) of the same models
+  used each residual parameter's derivative for the other, so the optimizer
+  stepped along a wrong gradient and the fit depended on the `ini()` order.
+
+- The post-fit covariance of a model with inter-occasion variability is now
+  computed: the recompute of the `mfocei`-style families (and of imp/np with
+  a requested covariance) and `setCov(fit, "imp")` (or a deferred
+  `covMethod = "imp"`) refit without the occasion ETAs, the refit stopped,
+  and no covariance was installed.
+- A covariance computed after the fit is now installed only when it is
+  finite, symmetric and positive definite; otherwise the fit keeps the
+  covariance it had and a warning names the method and the reason.  This
+  covers the post-fit recompute of the `mfocei`/`ifocei`-style, imp, np and
+  nlme families (whose failures were silent, and whose nested warnings are
+  suppressed), the deferred `covMethod = "sa"`/`"imp"` (silent when it failed,
+  silent when it fell back to another covariance), `setCov()` (a covariance
+  cached under the requested name was reinstalled even when not positive
+  definite) and `getVarCov(force = TRUE)`.
+- `setCov(fit, "r,s")` (and `"r"`, `"s"`, `" (full)"`) keeps the label its
+  refit computed, so a corrected result reads `"|r|,s"` rather than `"r,s"`.
+  A refit that falls back to another covariance (`"r"` for `"r,s"`, the
+  theta-only shape for a full one, or none at all, as on a mu-referenced fit)
+  is an error and leaves the covariance unchanged; it used to install the
+  fallback (or no covariance) under the requested name.  `setCov(fit, "sa")`
+  whose nested SAEM falls back to `"linFim"` no longer replaces the
+  covariance before reporting the error.
+- The full finite-difference covariance (`foceiControl(covFull = TRUE)`, the
+  default) is no longer installed when the full R matrix is not positive
+  definite: the `"r,s (full)"` sandwich built from it still looked positive
+  definite.  A requested `"r,s"` uses `"s (full)"` instead, with a warning, as
+  the theta-only step does (#1152); otherwise the fit keeps the native
+  theta-only covariance, with a warning.  Either way the indefinite R is no longer stored as `$covR` or cached as
+  `"r (full)"`.  A default `focei` fit of the ODE one-compartment model of
+  `theo_sd` was such a case.
+- When the analytic covariance (`covMethod = "analytic"`) is not positive
+  definite, the theta block the native step installed from it is labelled
+  `"r (analytic)"` (it was `"r"`), and the warning no longer calls it a
+  finite-difference covariance.
+- The condition numbers, `$eigenCov` and `$fullCor` now describe the full
+  covariance once it is installed (`covFull = TRUE`, the analytic
+  covariance); `foceiCovAnalytic()` also refreshes the parameter-table SEs and
+  keeps the covariance it replaced in `$covList`.
+- A SAEM full covariance (theta + residual + Omega) corrected by `sqrtm()`
+  keeps its `"|linFim|"` label (it was relabelled `"linFim"`), and the
+  condition numbers are refreshed when it is installed.
+  `saemControl(covMethod = "linFim")` now warns when the linearization cannot
+  be used and the SAEM information matrix is inverted instead, and when no
+  covariance can be computed at all; both were silent.  That inverted
+  information matrix is now labelled `"Ha"`; it had no `covMethod`.  `covMethod =
+  "analytic"` falling back to `"linFim"` is now a warning, kept in
+  `$runInfo`, rather than a message.
+- `saemControl(covMethod = "r,s")` (and `"r"`, `"s"`) computes no R or S
+  matrix: it inverts the theta block of SAEM's estimation-phase information
+  `$saem$Ha`.  That covariance is now installed as `"Ha"`
+  (`"|Ha|"` when `sqrtm()` repaired the block) instead of with no
+  label, and its rows follow the order the SAEM kernel lays them out in.  With
+  a `fix()`ed theta, or with a theta without a random effect ahead of one with
+  a random effect, the standard errors went to the wrong parameters (#906): on
+  `theo_sd` with `tcl` fixed, `tv` got the standard error of `tcl`.  A theta
+  without a random effect has no information of its own in that block, so it
+  now gets no standard error, with a warning, instead of a near-zero one.  The
+  same matrix is what an unusable `covMethod = "linFim"` falls back to; it
+  carries the same label there and no longer borrows the linearized FIM's
+  variance block.  Every SAEM covariance is now checked (finite, symmetric,
+  positive definite on its identified rows) before it is installed, and an
+  integer `covMethod` is read as a `foceiControl()` slot, so `covMethod = 0L`
+  computes no covariance (it inverted `Ha`).
+- The Omega rows of the SAEM covariances (`"sa"`, `"fim"`, `"linFim"`, and the
+  linearized variance block spliced into `"sa"`/`"fim"`) now belong to the
+  random effects they are named after.  They were named in the order the etas
+  are declared in `ini()`, but SAEM orders its variance parameters by the
+  thetas the etas belong to, so declaring `eta.v` before `eta.ka` reported the
+  standard error of the variance of `eta.ka` as that of `eta.v`.  A model with
+  a random effect that is not mu-referenced (`cl <- exp(tcl) * (1 + eta.cl)`)
+  is such a model whatever the declaration order, and with it a theta without a
+  random effect made `"sa"`/`"fim"` fall back to `"linFim"`; they are now
+  computed.  When the random effects cannot be matched one to one to SAEM's
+  variance parameters, the Omega rows are left out with a warning; they were
+  left out silently.
+- When a SAEM `"sa"` or `"fim"` covariance falls back to `"linFim"`, the
+  message says why (for example `the covariance is not positive definite` or
+  `the information matrix is singular`).
+- The per-observation log-likelihoods of an `imp`, `impmap` or `qrpem` fit
+  (`$llikObs`, the `nlmixrLlikObs` column) with the default `covMethod = "imp"`
+  are those at the estimates.  They were those of the last importance sample
+  of the last finite-difference evaluation of the covariance step: on
+  `theo_sd` they differed from the same fit without a covariance step by up
+  to 7.6 (`impmap`) and 8.1 (`imp`) log-likelihood units.
+- The `imp`/`impmap`/`qrpem` covariance (`covMethod = "imp"`, the default)
+  reports its Omega rows as the variances and covariances they are named
+  after (`om.<eta>`, `cov.<eta>.<eta>`).  They held the parameters the fit
+  estimates Omega in (the entries of `chol(Omega^-1)`, a square-root
+  diagonal by default) and are now mapped by the delta method: on `theo_sd`
+  the `impmap` standard errors of the Omega variances go from 0.153, 0.240,
+  0.393 (`eta.ka`, `eta.cl`, `eta.v`) to 0.196, 0.036, 0.010, in line with
+  the other methods.  `$impCov`/`$impSe` hold the mapped matrix,
+  `$impCovInternal` the one in the estimation parameterization and
+  `$impCovJacobian` the map.  The matrix is installed as `"imp"` only when
+  it is positive definite: `est = "imp"` on `theo_sd` installed one with a
+  negative variance for the `tka` estimate (standard error `NaN`).  An
+  information matrix that is not positive definite is now repaired as the
+  FOCEi `"|r|"` covariance is, by `sqrtm(info %*% info)`, and installed as
+  `"|imp|"` with a warning; when even that fails, a warning says why and no
+  covariance is installed.
+- `setCov(fit, "sa")`, `setCov(fit, "imp")`, a deferred `covMethod = "sa"` or
+  `"imp"` and the default `npag`/`npb` covariance now compute the covariance
+  at the fit's estimates, as `saControl()`/`impCovControl()` say.  The SAEM
+  run re-estimated every parameter during its `nBurn`/`nEm` warm-up and the
+  importance-sampling run took a full EM step (`impCovControl(nIter = 1)`),
+  so the covariance was that of nearby estimates: on `theo_sd`, `tka` 0.466
+  became 0.463 (SAEM, 40 warm-up iterations) and 0.455 (three EM steps).
+  The SAEM warm-up now holds every population parameter (mixture proportions
+  excepted) and only equilibrates the chains; the importance-sampling
+  iterations are E-steps only.
+- The printed parameter table of a full-Bayes `fbvi`/`emvi` fit now shows the
+  standard errors of the variational covariance (only `$parFixedDf` had
+  them), its confidence interval uses the fit's `ci`, and the condition
+  numbers describe that covariance.
+- The nlm-family covariance (`bobyqa`, `uobyqa`, `newuoa`, `optim`, `nlminb`,
+  `nlm`, `n1qn1`, `lbfgsb3c`, `trust`, `nls` with `"LM"`) now repairs a
+  Hessian that is not positive definite as the FOCEi covariance step repairs
+  its R matrix, under the same labels: `"r+"` (the Schnabel-Eskow modified
+  Cholesky factor, when every diagonal it adds is within `foceiControl()`'s
+  default `cholAccept`; this includes a positive-definite but nearly singular
+  Hessian) or, failing that, `"|r|"` (`sqrtm(R %*% R)`), with a warning in
+  `$runInfo`.  `"r"` means the Hessian was factored as it is.  It used to
+  invert every Hessian after an unreported Schnabel-Eskow perturbation and
+  label it `"r"`, which gave several parameters of the derivative-free fits
+  of `theo_sd` the same standard error.  A non-finite Hessian, or one the
+  repairs cannot fix (including the zero one of a failed `trust` solve), gives
+  `covMethod = "failed"` with a warning instead of a covariance.  A numerically
+  singular Hessian is `"r+"` when the correction is within `cholAccept`, as
+  FOCEi's R is, and never `"|r|"`.
+- The Gill (1983) step-size search no longer leaves a parameter at its last
+  probe when it ends without an accepted interval (`$scaleInfo` reports
+  "Constant Grad", "Odd/Linear Grad" or "Grad changes quickly").  That moved
+  the outer optimizer's own iterate on the first gradient (`outerOpt="nlminb"`,
+  `"L-BFGS-B"`, `"lbfgsb3c"`), the base point of the covariance step, and the
+  base point of the parameters `nlmixr2Gill83()` searched after it.
+- `nlmixr2Gill83()` and `nlmixr2Hess()` no longer modify the caller's
+  parameter vector in place: an error part-way through left it at a probe, and
+  `nlmixr2Hess()` handed the objective that same vector on every call, so a
+  value the objective kept changed under it.
+- The step search of `nlmixr2Gill83()`, `nlmixr2Hess()` and the first
+  `nlmixr2GradFun()` gradient now hands the objective the caller's names and
+  other attributes; an objective that indexed by name (`x["a"]`) got `NA`.
+- `nlmixr2Gill83()` (and so `nlmixr2Hess(...)`) now uses its `gillRtol`,
+  `gillK`, `gillStep` and `gillFtol` arguments; the defaults were always used.
+  As documented, `gillK = 0` now determines no step size: the search is
+  skipped and the interval it would start from is reported as "Not Assessed";
+  `nlmixr2Hess()` and the first `nlmixr2GradFun()` gradient difference with
+  that interval.  `gillK = 0` used to lift the search's iteration limit
+  instead, which could leave it running indefinitely; with
+  `foceiControl(gillK = 0)` the full (`covFull`) covariance now takes its
+  step-doubling steps.
+- `nlmixr2Gill83(which=)` that leaves out the last parameter no longer
+  searches the others about an objective value that was never computed.
+- `foceiControl(shi21maxOuter=)` no longer runs an unused Shi21 step search in
+  the covariance step: the covariance steps come from the Gill search (or the
+  fixed `hessEps` step with `gillKcov = 0`), as they always did, because they
+  overwrote the Shi21 result.  The search only cost time, and with
+  `gillKcov = 0` its last probe became the centre of the R matrix.  For a
+  non-normal endpoint `gillKcovLlik = 0`, not `gillKcov = 0`, now selects the
+  fixed step.
+- Every stage of the FOCEi-family covariance step is now taken about the
+  estimates.  The last leg of the R matrix left the parameters at
+  `theta0 - 2*eps` (`theta0` the first estimated parameter), the S matrix was
+  centred there, its own last leg moved them again, and the full covariance
+  (`covFull = TRUE`) took that as its centre.  This changes the default
+  (`"r,s"`) standard errors, most for the first estimated parameter; the
+  sandwich SE of `tka` for `theo_sd` with a one-compartment model went from
+  0.43 to 0.15.
+- A FOCEi-family fit's per-observation log-likelihoods (`$llikObs`, the
+  `nlmixrLlikObs` column) are now those of the final objective at the
+  estimates.  The covariance step rewrote them on every finite-difference leg,
+  so with any covariance method they came from its last leg, away from the
+  estimates.  This affected `focei`, `laplace`, `agq` and population-only fits.
+- The covariance of a FOCEi-family fit with a single estimated parameter no
+  longer installs `1/(cholSEtol*|R|)` labelled `"r"` when the R matrix is not
+  positive (`R <= 0`): it is now repaired, or not used, like a larger R.  A
+  requested `"s"` covariance whose S matrix cannot be repaired is reported as
+  `"failed"` instead of `"s"` with no covariance.  A numerically singular R or
+  S (such as S from a single subject) is no longer "repaired" into `"|r|"` or
+  `"|s|"`, which installed a covariance of rounding noise.
+- The `grad()` function from `nlmixr2GradFun()` no longer leaves the point at
+  `x - h` when a forward difference is not finite and it falls back to a
+  backward one.  That point was the caller's own vector, which was also the
+  key of the cached objective value, so the next gradient reused the objective
+  of the original point at the moved one.
+- `foceiControl()` and `rsControl()` now check the finite-difference
+  covariance options the same way.  `gillStepCov` must be at least 1 in both:
+  the Gill search grows its step by this factor and shrinks it by dividing,
+  so `foceiControl()`'s smaller values reversed the search (and 0 gave a zero
+  step).  `covSmall` must be one finite number in both (`rsControl()`
+  accepted `Inf`, `foceiControl()` a vector).  `rsControl()` takes the 0/1
+  flags `covGillF`, `rmatNorm` and `smatNorm` as integers too, like
+  `foceiControl()`.
+- `getVarCov(fit, force = TRUE, ...)` given a log-likelihood option
+  (`hessEpsLlik`, `gillKcovLlik`, `gillStepCovLlik`, `gillFtolCovLlik`,
+  `rmatNormLlik`, `smatNormLlik`) no longer sets the option of the same name
+  without `Llik` to its value as well.
+- `foceiControl(covDerivMethod = "forward")` no longer fails the `"r"` and
+  `"r,s"` covariances: it chooses the differences of the S matrix's
+  per-subject scores, and the R matrix keeps its central stencil.  The
+  documentation said it applied to the Hessian as well.
+- A requested `"r,s"` (or `"s"`) full covariance (`covFull = TRUE`) is now
+  computed when the theta-only step falls back to the R matrix.  The full S
+  was computed only for the theta-only step's final choice, so the requested
+  shape found no S and the fit kept the theta-only covariance without saying
+  why; it is now checked like any full shape, and installed or reported.
+- A FOCEi-family fit's per-subject ODE tolerance factors (`$tolFactor`, which
+  its tables solve with) are now those the estimation left.  The covariance
+  step changed them: `covSolveTol` and the analytic covariance set every
+  subject's factor to 1, and its finite-difference legs loosened them on hard
+  solves (to 316 for every subject of a `theo_sd` fit with a flat
+  parameter, whose estimation loosened none).
+- Warnings about difficult ODE solves in the covariance step now say so:
+  loosened tolerances and approximated sensitivities were reported as
+  happening "during the optimization".  A zero in the covariance step's
+  pooled gradient (the S matrix's fallback score) no longer reports "zero
+  gradient replaced with small number": nothing is replaced there.
+- An R matrix that is zero (an objective flat in every estimated parameter)
+  is no longer "corrected" as `"r+"`: the modified Cholesky factor has no
+  scale to correct such a matrix within, and a one-parameter fit installed
+  `1/cholSEtol` (165140) as its variance.  It is now not usable, like any R
+  the repairs cannot fix.
+
+- The covariance of an `est = "nlme"` fit (`nlmeControl(covMethod = "nlme")`,
+  the default) now holds nlme's correlations of the fixed effects
+  (`vcov(fit$nlme)`, nlme's `varFix` as is); it was diagonal.  Its standard
+  errors are now `vcov()`'s; for an ML fit they are slightly smaller than the
+  ones `summary(fit$nlme)` prints, which adjust the residual sd.
+- The condition numbers, `$eigenCov` and `$fullCor` of a mixture fit now
+  describe its covariance with the mixture proportions on the probability
+  scale, the one installed as `$cov`; they were taken before those rows were
+  rotated from the mlogit scale (23088 instead of 1332 on a two-component
+  model), or, for `saem`, before the proportions' block was appended (86
+  instead of 544 on a split-eta model).
+- When a covariance replaces another after the parameter table is built (the
+  full covariance with `covFull = TRUE`, `setCov()`, `foceiCovAnalytic()`,
+  the deferred and post-fit recomputes), the confidence interval of a
+  parameter with a `backTransform()` function is now recomputed with that
+  function; it kept the interval of the previous covariance beside the new
+  standard error.  A `backTransform()` that names no function keeps the
+  default back-transformation, as it does when the fit is built.
+- The finite-difference covariance of the FOCEi family (`covMethod = "r,s"`,
+  `"r"`, `"s"` and their `covFull` shapes) now differentiates the marginal
+  objective the same way in every leg: each leg optimizes the ETAs again,
+  starting from the ETAs the fit converged to.  The legs used to start from
+  wherever the previous leg had left them, and the full (`covFull = TRUE`)
+  stage restarted every probe at ETA = 0, so the result depended on the order
+  the legs ran in.  The centre of the R matrix's stencil is now evaluated the
+  same way as the legs.  It was the final objective, whose ETAs another
+  procedure had optimized (with `covSolveTol`, at another ODE tolerance too),
+  and that offset pulled every diagonal of R down: on `theo_sd` at the initial
+  estimates all of them were negative.  With tight covariance solves and inner
+  problem (`covSolveTol = 1e-9`, `trustFterm = trustMterm = 1e-8`) the
+  finite-difference R now matches the analytic observed information within
+  1% on `theo_sd`; the theta-only `"r"` standard error of `tka` was 0.11
+  there, against 0.19.  At the default tolerances (ODE `rtol = 1e-3`) the
+  finite-difference covariance of an ODE model like this one is dominated by
+  numerical noise, before and after this change, so its default standard
+  errors move by about as much as that noise.
+- `setCov(fit, "r,s")`, `"r"`, `"s"` (and their `" (full)"` shapes) and
+  `getVarCov(fit, force = TRUE)` now compute the covariance of the fit's
+  marginal likelihood, as the estimation-time covariance of the same name
+  does: every finite-difference leg optimizes the ETAs again, starting from
+  the fit's, with the fit's own `interaction`.  The result is the covariance
+  of a FOCEi fit with no outer iterations started from the fit's ETAs; on a
+  saem or nlme fit that likelihood is FOCEI.  They held the ETAs fixed and
+  used `interaction = 0` (FOCE), and on `theo_sd` the structural standard
+  errors came out 2 to 25 times too small (`setCov(fit, "r,s")` gave `tka`
+  0.0076 where the analytic covariance gives 0.19).
+- The post-fit covariance of the `mfocei`/`ifocei`-style families, and of
+  nlme, imp/impmap/qrpem and np fits that request `covMethod = "r,s"`, `"r"`
+  or `"s"`, now optimizes the ETAs again in every finite-difference leg.  It
+  held them at the fit's ETAs, and on `theo_sd` the structural standard
+  errors came out 4 to 12 times too small.  A requested `"analytic"`
+  covariance that is out of its scope (a `linCmt()` model, for example)
+  falls back to this finite-difference `"r,s"`, so the fallback is the
+  marginal covariance too; a warning names the covariance installed instead.
+- vae, emvi and fbvi now compute their FOCEi covariance (`covMethod = "r,s"`,
+  `"r"`, `"s"` or `"analytic"`, and emvi's default `"vi"`) after their output
+  step, at their estimates: the covariance of the marginal likelihood of their
+  `likelihood` (FOCEI by default), with the ETAs optimized again, from the
+  method's own, in every finite-difference leg.  It was computed in the output
+  step with the encoder or variational means held fixed and `interaction = 0`,
+  and on `theo_sd` the structural standard errors came out 3 to 9 times too
+  small.  The reported objective is unchanged (the output step's FOCE
+  objective at the method's ETAs).  `fit$foceiControl` of a vae, emvi or fbvi
+  fit now carries its likelihood.
+- `covMethod = "analytic"` on a saem fit, and `setCov(fit, "analytic")` on
+  saem, nlme, vae, emvi and fbvi fits, now assemble the observed information
+  with the `interaction` of the method's likelihood (FOCEI unless its
+  `likelihood` says otherwise).  They took `interaction = 0` from the control
+  of the output step that finalizes those fits, so the FOCE formulas were
+  used; with a proportional residual error the standard errors differ (the
+  `add.sd` standard error of a combined-error `theo_sd` saem fit was 46%
+  larger).
+- A FOCEi-family fit with `maxInnerIterations = 0` (for example
+  `posthocControl(maxInnerIterations = 0, etaMat = ...)`, or `fo`/`foi` with
+  `posthoc = FALSE`) still holds its ETAs fixed in its finite-difference
+  covariance, as asked, and now warns that this covariance is conditional on
+  those ETAs and that `setCov()` computes the covariance of the marginal
+  likelihood.
+- The finite-difference covariance of the FOCEi family (and `setCov()`,
+  `getVarCov(force = TRUE)`, the post-fit recomputes and the vae/emvi/fbvi
+  covariance) now solves its probes, and the centre they are compared with,
+  at tolerances derived from the fit's: each ODE tolerance times 1e-3, capped
+  at 1e-7, and the inner optimizer's tolerances (`trustFterm`/`trustMterm`,
+  n1qn1's `epsilon`, lbfgsb3c's `innerLbfgs*`) times 1e-3, capped at 1e-9
+  (at the default `sigdig = 3`: `rtol = 1e-7`, `atol = 1e-9`, inner 1e-9).
+  `covSolveTol = NULL` used to leave them at the estimation's tolerances
+  (`rtol = 1e-3`, inner 1e-5), where the probes differenced numerical noise:
+  on `theo_sd` the theta-only `"r"` standard error of `tka` was 0.47 against
+  an analytic 0.19 and is now 0.190; every structural standard error of the
+  theta-only `"r"` covariance (native, `setCov()` and the `mfocei` recompute)
+  is within 4% of the analytic one.  A number for `covSolveTol` still sets the
+  ODE tolerance.  Estimation is unchanged (the objective, estimates, ETAs and
+  tables are identical); the covariance step takes 2 to 3 times longer on
+  `theo_sd` and 5 to 8 times longer on the warfarin example model.
+
+### nlm family
+
+- The gradient of the nlm-family methods (`nlm`, `nlminb`, `optim`, `n1qn1`,
+  `lbfgsb3c`, `trust`, `nls`) finite-differences each subject with that
+  subject's own step where it needs one (censored observations, or the dosing
+  parameters under `eventSens = "fd"`).  Every subject used the first
+  subject's step, which is 0 when the first subject needs none: with
+  M3/M4-censored data in which only later subjects are censored every
+  gradient was NaN, `nlminb` stopped with `NA/NaN gradient evaluation` and
+  `nlm` returned its initial estimates.  The steps are also searched again
+  once the parameter scaling is set, instead of being kept from the trial
+  gradient that sets it.
+
+- The Shi (2021) finite-difference step search no longer returns a wrong
+  derivative or step after a probe whose objective is not finite.  When the
+  outer central probe (`x + 3h`) failed, the central difference at `h` was
+  divided by the shrunken step and came out 1.5 times too large; when the
+  outer forward probe (`x + 4h`) failed, the step grew 3.5 times (into the
+  region that failed) and the forward difference at `h` was divided by it;
+  and a forward difference taken after a failed backward probe was returned
+  with an earlier step.  This search gives the finite-difference gradient
+  columns of the nlm family and the FOCEi family's finite-difference
+  gradients and Hessians.
+
+- The finite-difference gradient columns of the nlm family now difference the
+  prediction model against its own value at the estimate.  The base point
+  came from the sensitivity model, a solve of a different ODE system, so a
+  forward difference (the default of `n1qn1`, `lbfgsb3c` and `trust`) also
+  divided the difference between the two solves by the step: 0.3% of the
+  gradient on `theo_sd`.
+
+- `nlmControl()`, `nlminbControl()`, `optimControl()` and `nlsControl()` now
+  reject an integer `eventType`, `optimHessType` or `solveType` that is not
+  one of their codes (`eventType`/`optimHessType`: 1 forward, 2 central;
+  `solveType`: 1 `"fun"`, 2 `"grad"`, 3 `"hessian"`, and no `"hessian"` for
+  `optim`).  The codes 3-6 were accepted: they left a finite-difference
+  gradient column uninitialized (`eventType`), a Hessian at zero
+  (`optimHessType`), or the objective undefined (`solveType`).  A
+  hand-built control with such a code now stops the nlm problem setup.
+
+- `nlminbControl(covMethod = "nlminb")` and `n1qn1Control(covMethod =
+  "n1qn1")` now use the optimizer's own Hessian, as documented, instead of
+  recomputing `nlmixr2Hess()` under another label: for `nlminb` the
+  finite-difference Hessian of the analytic gradient its Hessian function
+  computes, at the final estimates (on `theo_sd` it matches a central
+  difference of the gradient to 5e-5); for `n1qn1` the quasi-Newton matrix
+  `H` it built along its path, a secant approximation (its standard errors
+  were 0.83-0.99 of the finite-difference ones on the test models).  The
+  label stays `"r (nlminb)"`/`"r (n1qn1)"`, and a matrix that is not
+  positive definite is repaired with a warning as for `"r"`.
+  `nlminbControl()`'s default is now `"r"`, as documented; it was `"nlminb"`
+  with `solveType = "hessian"` or `"grad"`, which computed the same
+  `nlmixr2Hess()` covariance as `"r"`, so default fits are unchanged except
+  for the label (`"r"` instead of `"r (nlminb)"`).
+
+- A covariance labelled `"r+"` (or `"|r|"`) now comes from the same repair of
+  the R matrix whichever method computed it, nlm family or FOCEi family (see
+  the nlm-family covariance entry under Covariance).  The nlm family used
+  `"r+"` for the nearest positive-definite matrix (`nmNearPD()`), a repair
+  the FOCEi family does not make; it now fails where the FOCEi R matrix
+  repairs do.
+
+- Every nlm-family control (`nlmControl()`, `nlminbControl()`,
+  `optimControl()`, `bobyqaControl()`, `newuoaControl()`, `uobyqaControl()`,
+  `n1qn1Control()`, `lbfgsb3cControl()`, `trustControl()`) now accepts its
+  documented `covMethod = ""`, which skips the covariance step.  It stopped
+  with `'arg' should be one of ...`, because `match.arg()` cannot match `""`.
+
+- `nlmixr2Hess(par, fn, which = )` now returns the whole Hessian: a parameter
+  that `which` leaves out of the step search is differenced with the
+  interval the search would start from (what `gillK = 0` gives).  Its row and
+  column were `NA`, and when the first parameter was left out every
+  diagonal was taken about `f = 0` instead of `fn(par)` (2.5e8 instead of 6
+  for a quadratic).  `nlmixr2Gill83()` now reports the objective at `args`
+  in the `f` column of every row; it was 0 on the rows `which` left out.
+
+- The fit table of a model that uses `lag()` (or `lead()`, `diff()`, ...) of a
+  calculated variable now has the right `PRED`, `IPRED` and residuals (checked
+  for `nlm` and a zero-iteration `focei` fit).  The table read the prediction
+  from the column after `time`, which for such a model is the lagged variable
+  (it is output ahead of the prediction), and the residual variance from the
+  column after that: `IPRED` was the variable itself (for `cp <- 0.5 * c0 +
+  0.5 * lag(c0)`, `IPRED` was `c0`).  The table step now finds the prediction
+  and its variance by name, and stops naming a column it cannot find.
+
+- The nlm-family gradient (`nlm`, `nlminb`, `optim`, `n1qn1`, `lbfgsb3c`,
+  `trust`, `nls`) of a model that uses `lag()` or `diff()` of a calculated
+  variable now carries the variable's sensitivities through
+  (`d(lag(v))/d(theta) = lag(d(v)/d(theta))`), including into an ODE that
+  uses the variable; only an ODE with `lag()` itself, or a lagged variable
+  defined more than once, is finite-differenced.
+  Such a variable is a bare symbol to symengine, so its analytic gradient was
+  0 for every structural parameter: `nlm`, `nlminb`, `n1qn1`, `lbfgsb3c` and
+  `optim` returned the initial structural estimates, and `nls` (with its
+  default `solveType = "grad"`) stopped with `none of the predictions
+  depend on 'THETA'`.
+
+- The covariance of an `est = "nls"` fit is now the least-squares one,
+  `sigma^2 (J'J)^-1` (what `vcov()` of the underlying `nls` or `nls.lm`
+  fit gives).  It left out the residual variance `sigma^2`, so every
+  standard error was divided by the residual standard deviation: 0.635
+  instead of 6.95 for `Vm` of the `Puromycin` Michaelis-Menten model.  The
+  covariance is checked like the other nlm-family ones, and a fit with no
+  residual degrees of freedom (no more observations than parameters) gets
+  `covMethod = "failed"` with a warning.
+
+- The objective of an `est = "nls"` fit with the default `algorithm = "LM"`
+  is now the -2 log-likelihood at the maximum-likelihood residual variance,
+  as with the other algorithms (`logLik()` of the `nls` fit).  It took the
+  residuals as standard normal: 249.71 instead of 216.15 for the
+  one-compartment additive model of `theo_sd`.
+
+- The warnings of an `nlminb`, `optim`, `bobyqa`, `newuoa`, `uobyqa`,
+  `n1qn1`, `lbfgsb3c`, `trust` or `nls` run now reach the fit's `$runInfo`,
+  as those of `nlm` did: the optimizer's own, `trust`'s unverified stationary
+  point, and the solver reports (NaN gradients resolved by finite
+  differences, NaN solves replaced by 0, loosened ODE tolerances).  They
+  were dropped.  For packages that call `.nlmFamilyFitGeneric()`:
+  `emitFitWarnings` now defaults to `TRUE` (`FALSE` drops them as before), and
+  `.nlmFinalizeList()` raises the covariance step's report as a warning
+  instead of returning it as `$covWarning`.
+
+- `trustControl(covMethod = "r")`, the default, now inverts a
+  finite-difference Hessian: `nlmixr2Hess()`'s, or the last outer
+  iteration's with `hessianMethod = "fd"`.  It inverted the last outer
+  iteration's Hessian, which with the default `hessianMethod = "sr1"` is a
+  quasi-Newton approximation; that covariance is now `covMethod = "trust"`
+  (labelled `"r (trust)"`).
+
+- An `nlm` fit of a `matExp()` model with `indLin()` forcing now warns that
+  its sensitivities use the ODE form, a work-around until the native
+  matrix-exponential sensitivities of such a model match.
+
+- `est = "nls"` declares the model covariates in its `params()`, as `nlm`
+  does, so the solve's parameter layout is fixed.
+
+- The residual standard deviation an `est = "nls"` fit reports (`add.sd`,
+  `prop.sd`, ...) is now `sigma()` of the `nls` fit, `sqrt(RSS / (n - p))`,
+  the residual variance its covariance uses.  It was `sd()` of the residuals,
+  which also subtracted their mean and divided by `n - 1`.  The objective
+  stays `logLik()` of the fit, the -2 log-likelihood at `RSS / n`.
+
+- The internal, exported `.nlmixrNlsFun()` is removed: it solved a model
+  that nothing set up any more.  `est = "nls"` calls `.nlmixrNlsFunValGrad()`,
+  `.nlmixrNlsFunVal()` and `.nlmixrNlsFunGrad()`.
+
+
 # nlmixr2est 7.1.0
 
 ## Breaking changes
@@ -126,11 +1476,7 @@
   `theta + mean(eta)`, the temporary eta is removed from the fit, and
   `$runInfo` lists the thetas that received one.  These parameters were
   previously left near their initial values.
-
-
-- Added a native analytical outer Hessian for fast Gaussian FOCE/FOCE+/FOCEI/AGQ fits, using
-  the existing sensitivity pool. Fast `nlminb` fits used it automatically.
-
+  
 - Added optional full conditional inner curvature for fast Gaussian FOCEI via
   `innerHessian="conditional"`, used by inner trust and n1qn1's `warm="calc"`
   seed. The FOCEI marginal objective was unchanged.
@@ -738,6 +2084,56 @@
   handles this mix -- no `distribution()`-family limitation remains.
 
 ## Bug fixes
+
+- FOCEi's Gill gradient left the internal "this is a gradient leg" flag set,
+  so every objective-only evaluation between the first gradient (always Gill)
+  and the second ran as a gradient leg: the inner (eta) solve skipped its
+  standardized-eta reset and mceta start search, and the objective skipped
+  its ODE-tolerance retry and its `lastOfv` bookkeeping.  An outer trial step
+  that blew the etas up then had no way back, and when the optimizer never
+  reached a second gradient the final re-evaluation inherited the flag too.
+  Issue 1114 is that path: `scaleType = "norm"` with a between-study variance
+  starting at `2.5e-6` normalizes every parameter by the range of the
+  internal vector, which the omega's `omega^(-1/4)` value of 25 dominates, so
+  nlminb's first trial step moved `slope` from 0.0035 to 12.6 (objective
+  ~4e283), the etas of that step were carried into every later evaluation,
+  nlminb reported "false convergence (8)", and the fit returned ~2e244 with
+  every parameter at its initial estimate and no diagnostic.  The flag is now
+  cleared like the other gradient branches do, and the final re-evaluation
+  clears it explicitly.  `innerOpt = "trust"` (the default since 7.1.0)
+  recovers from such a start on its own, which masked the fault on the
+  development branch; `innerOpt = "n1qn1"` reproduced it until this fix.
+  The covariance step had the same shape: its R-matrix Hessian legs only ran
+  as gradient legs when the step-size search (`gillKcov`, `shi21maxOuter`)
+  happened to set the flag, and a `covMethod` without an S matrix left it set
+  after the fit.  The covariance step now owns the flag for its whole
+  duration and restores it on every exit.
+
+- A FOCEi fit now warns when the objective function it reports at the final
+  estimates is worse than the one at the initial estimates (by more than 1%,
+  or not finite): the outer optimizer failed to improve on the starting point,
+  or the inner (eta) problem did not converge when the final estimates were
+  re-evaluated, and the estimates are not reliable.  Like the other FOCEi run
+  notes the warning is collected on the fit's `$runInfo`.  This is the gate
+  against a result like issue 1114's being returned silently again; the
+  reprex (its data and model) is pinned as a regression test under both inner
+  optimizers, next to the default-scaling fit.
+- `est = "npag"` / `est = "npb"`: the per-observation endpoint map behind the
+  residual step's per-endpoint moments never worked.  It was built while
+  parsing the control list, before the first solve, when rxode2's sorted
+  event index is still empty, so every row read as a dose and the map came
+  back empty without a warning; and its endpoint compartments were the ui's
+  `predDf$cmt` numbers, while the CMT covariate is numbered in the inner
+  model's basis (the user's states plus the eta sensitivities, then the
+  endpoint pseudo-compartments), so even a populated map matched nothing.
+  The per-endpoint moment warm start, its closed-form fast path for a lone
+  additive/proportional scale, and the endpoint bucketing (#856) were
+  therefore silently disabled for every fit.  The map is now built after the
+  first solve, in the inner model's basis, and an empty map warns.  With the
+  residual search warm-started at the moments each cycle, two endpoints that
+  are exact scaled copies of each other keep their fixed ratio to the
+  optimizer's stopping radius (they came out 2.6% apart before, issue 1118),
+  and theophylline's `add.sd` lands at the FOCEi value (0.784 vs 0.784).
 
 ### Estimation
 

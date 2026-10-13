@@ -63,7 +63,7 @@
   if (is.null(maximum)) {
     maximum <- .range[2]
   }
-  .fs <- c(locf = 0, nocb = 1, midpoint = 0.5, linear = 0)
+  .fs <- c(locf = 0, nocb = 1, midpoint = 0, linear = 0)
   .base <- expand.grid(
     TIME = seq(minimum, maximum, length.out = length.out),
     EVID = 2,
@@ -83,9 +83,19 @@
           setNames(
             data.frame(lapply(.covs, function(cov) {
               suppressWarnings({
+                .x <- .cur$TIME
+                .y <- .cur[[cov]]
+                if (.covsi == "midpoint" && length(.x) > 1L) {
+                  # rxode2 steps to the next value at the midpoint, it does
+                  # not average the two
+                  .o <- order(.x)
+                  .x <- .x[.o]
+                  .y <- .y[.o]
+                  .x <- c(.x[1], (.x[-1] + .x[-length(.x)]) / 2)
+                }
                 .fun <- stats::approxfun(
-                  .cur$TIME,
-                  .cur[[cov]],
+                  .x,
+                  .y,
                   method = ifelse(.covsi == "linear", "linear", "constant"),
                   rule = 2,
                   f = .fs[.covsi]
@@ -147,9 +157,29 @@
   .params
 }
 
+#' Name of the covariate interpolation a fit was estimated with
+#'
+#' @param fit nlmixr2 fit
+#' @return interpolation name; `"locf"` when the fit did not set one
+#' @noRd
+.augPredCovsInterpolation <- function(fit) {
+  .codes <- c(linear = 0L, locf = 1L, nocb = 2L, midpoint = 3L)
+  .ci <- .residCovsInterpolation(fit)$covsInterpolation
+  if (is.character(.ci) && length(.ci) == 1L && .ci %in% names(.codes)) {
+    return(.ci)
+  }
+  .name <- names(.codes)[match(as.integer(.ci), .codes)]
+  if (length(.name) != 1L || is.na(.name)) {
+    return("locf")
+  }
+  .name
+}
+
 #' Augmented Prediction for nlmixr2 fit
 #'
 #' @param fit Nlmixr2 fit object
+#' @param covsInterpolation covariate interpolation; by default the one
+#'   the fit was estimated with
 #' @inheritParams nlme::augPred
 #' @inheritParams rxode2::rxSolve
 #' @return Stacked data.frame with observations, individual/population predictions.
@@ -163,12 +193,22 @@ nlmixr2AugPredSolve <- function(
   length.out = 51L,
   ...
 ) {
+  if (missing(covsInterpolation)) {
+    covsInterpolation <- .augPredCovsInterpolation(fit)
+  }
+  covsInterpolation <- match.arg(covsInterpolation)
+  .naInterpolation <- .residCovsInterpolation(fit)$naInterpolation
+  .nonmem <- .residCovsInterpolation(fit)$nonmem
   .si <- fit$simInfo
   .env <- new.env(parent = emptyenv())
   .env$ui <- fit$ui
   .env$data <- fit$origData
   suppressMessages(.preProcessHooksRun(.env, "rxSolve"))
   .rx <- .getSimModel(.env$ui, hideIpred = TRUE)
+  .drop <- setdiff(attr(.rx, "lagged"), c("DV", "CMT"))
+  if (length(.drop) == 0L) {
+    .drop <- NULL
+  }
   .rx <- eval(.rx)
   .sigma <- .si$sigma
   .omega <- .si$omega
@@ -182,28 +222,36 @@ nlmixr2AugPredSolve <- function(
   )
   .tolFactor <- fit$env$tolFactor
   # ipred
-  .sim <- rxode2::rxSolve(
+  .sim <- .rxSolveNonmem(
     object = .rx,
     .params,
     .events,
     keepInterpolation = "na",
+    covsInterpolation = covsInterpolation,
+    naInterpolation = .naInterpolation,
+    nonmem = .nonmem,
     tolFactor = .tolFactor,
     keep = c("DV", "CMT"),
+    drop = .drop,
     returnType = "data.frame"
   )
   # now do pred
   if (is.null(.omega)) {
-    names(.sim) <- sub("sim", "pred", names(.sim))
+    names(.sim) <- sub("^sim$", "pred", names(.sim))
     .stk <- stack(.sim[, c("pred", "DV")])
   } else {
-    names(.sim) <- sub("sim", "ipred", names(.sim))
+    names(.sim) <- sub("^sim$", "ipred", names(.sim))
     .params <- c(t(fit$theta), t(rep(0, dim(.omega)[1])), t(rep(0, dim(.sigma)[1])))
     .params <- setNames(.params, c(names(fit$theta), dimnames(.omega)[[2]], dimnames(.sigma)[[2]]))
-    .sim2 <- rxode2::rxSolve(
+    .sim2 <- .rxSolveNonmem(
       object = .rx,
       params = .params,
       events = .events,
+      covsInterpolation = covsInterpolation,
+      naInterpolation = .naInterpolation,
+      nonmem = .nonmem,
       tolFactor = .tolFactor,
+      drop = .drop,
       returnType = "data.frame"
     )
     .sim$pred <- .sim2$sim
@@ -246,6 +294,11 @@ nlmixr2AugPredSolve <- function(
 #' @rdname nlmixr2AugPredSolve
 #' @export
 augPred.nlmixr2FitData <- function(object, primary = NULL, minimum = NULL, maximum = NULL, length.out = 51, ...) {
+  ## event bus: one solveComplete linked to the fit (see rxEvents.R)
+  force(object)
+  .nlmixr2EventEnter()
+  .evCall <- sys.call()
+  on.exit(.nlmixr2EventExitSolve(returnValue(), object, .evCall, "augPred"), add = TRUE)
   nlmixr2AugPredSolve(
     fit = object,
     minimum = minimum,

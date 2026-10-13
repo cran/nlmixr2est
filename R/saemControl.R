@@ -77,11 +77,18 @@
 #'  modeled components (\code{a <- add.sd*exp(eta.sd); cp ~ add(a)}), which saem
 #'  fits as \code{cp ~ add(a) + dnorm()}.
 #'
-#'  "\code{r,s}" Uses the sandwich matrix to calculate the covariance, that is: \eqn{R^-1 \times S \times R^-1}
-#'
-#'  "\code{r}" Uses the Hessian matrix to calculate the covariance as \eqn{2\times R^-1}
-#'
-#'  "\code{s}" Uses the crossproduct matrix to calculate the covariance as \eqn{4\times S^-1}
+#'  "\code{r,s}", "\code{r}" and "\code{s}" compute no R or S matrix in
+#'  \code{saem}: all three invert the structural-theta block of the
+#'  estimation-phase information matrix (\code{fit$saem$Ha}, the matrix
+#'  \code{fim} inverts in full).  The result covers the estimated mu-referenced
+#'  thetas only, conditional on the \code{Omega} and residual parameters; a
+#'  theta without a random effect has no row in it and gets no standard error.
+#'  It is installed as \code{fit$covMethod == "Ha"}, or
+#'  \code{"|Ha|"} when the block was not positive definite and was
+#'  replaced by \code{sqrtm(Ha \%*\% Ha)}.  For the finite-difference R and S
+#'  covariances at the SAEM estimates use \code{setCov(fit, "r,s")}.  An integer
+#'  \code{covMethod} is a \code{foceiControl()} slot: \code{0} is no covariance,
+#'  \code{1}, \code{2} and \code{3} are \code{"r,s"}, \code{"r"} and \code{"s"}.
 #'
 #'  "" Does not calculate the covariance step.
 #'
@@ -89,6 +96,15 @@
 #'   is requested, it is stashed here and computed post-fit at the converged
 #'   estimates by the decoupled recompute engine (\code{setCov()} uses the same
 #'   path); \code{NA} otherwise.
+#'
+#' @param covFallback what each \code{covMethod} falls back to when it gives no
+#'     usable covariance: a named list, one element per method, each the ordered
+#'     methods to try instead (\code{"sa"}, \code{"fim"}, \code{"linFim"} or
+#'     \code{"Ha"}, the inverse of the information matrix's theta block).  The
+#'     default is the established behaviour: \code{"sa"}, \code{"fim"} and
+#'     \code{"analytic"} fall to \code{"linFim"} then \code{"Ha"}, and
+#'     \code{"linFim"} to \code{"Ha"}.  A list you give replaces the default: a
+#'     method it does not name has no fallback.
 #'
 #' @param covFull Boolean (default \code{TRUE}) indicating the covariance
 #'   should include every estimated population parameter -- the structural and
@@ -98,7 +114,8 @@
 #'   \code{covMethod="sa"}, which is always full.
 #'
 #' @param nSaCov Number of iterations in the dedicated stochastic-approximation
-#'   covariance phase used by \code{covMethod="sa"} (default \code{500}).  These
+#'   covariance phase used by \code{covMethod="sa"}, a whole number of at least 1
+#'   (default \code{500}).  These
 #'   iterations run at the converged estimate (parameters frozen) and only
 #'   resimulate the individual parameters to build the observed Fisher
 #'   information; a larger value gives a less noisy covariance.  Ignored by other
@@ -379,6 +396,7 @@ saemControl <- function(
   trace = 0, # nolint
   covMethod = c("sa", "analytic", "linFim", "fim", "r,s", "r", "s", "imp", ""),
   covMethodDeferred = NA_character_,
+  covFallback = list(sa = c("linFim", "Ha"), fim = c("linFim", "Ha"), analytic = c("linFim", "Ha"), linFim = "Ha"),
   covFull = TRUE,
   nSaCov = 500L,
   calcTables = TRUE,
@@ -436,14 +454,15 @@ saemControl <- function(
   .nuAuto <- missing(nu)
   .xtra <- list(...)
   .bad <- names(.xtra)
-  .bad <- .bad[!(.bad %in% c("genRxControl", "mcmc", "DEBUG", "iterPrintControl"))]
+  .bad <- .bad[!(.bad %in% c("genRxControl", "mcmc", "DEBUG", "iterPrintControl", "saemHoldPar", "saemWarmState"))]
   if (length(.bad) > 0) {
     stop("unused argument: ", paste(paste0("'", .bad, "'", sep = ""), collapse = ", "), call. = FALSE)
   }
 
   iovXform <- match.arg(iovXform)
   iovMethod <- match.arg(iovMethod)
-  checkmate::assertIntegerish(seed, any.missing = FALSE, min.len = 1)
+  checkmate::assertIntegerish(seed, any.missing = FALSE, len = 1)
+  checkmate::assertIntegerish(nSaCov, lower = 1, len = 1, any.missing = FALSE)
   if (!is.null(.xtra$mcmc)) {
     #mcmc = list(niter = c(nBurn, nEm), nmc = nmc, nu = nu),
     checkmate::assertIntegerish(.xtra$mcmc$niter, len = 2, lower = 0, any.missing = FALSE, .var.name = "mcmc$niter")
@@ -565,20 +584,19 @@ saemControl <- function(
   # "imp" is foreign to the SAEM kernel; skip the native cov and recompute the
   # importance-sampling covariance post-fit at the converged estimates.  The
   # covMethodDeferred formal carries a round-tripped request (default NA).
-  if (identical(covMethod, "")) {
-    ## "" requests no covariance; match.arg() cannot select it because
-    ## pmatch("") matches nothing, so handle it explicitly.
+  # An integer is a foceiControl() slot (a round-tripped control carries one):
+  # 0 is no covariance, 1/2/3 are "r,s"/"r"/"s".
+  .covMethod <- .covMethodArg(covMethod, match.arg(covMethod))
+  if (identical(.covMethod, "imp")) {
+    covMethodDeferred <- "imp"
     .covMethod <- ""
-  } else if (checkmate::testIntegerish(covMethod, lower = 0, len = 1, any.missing = FALSE)) {
-    .covMethod <- covMethod
-  } else {
-    .covMethod <- match.arg(covMethod)
-    if (identical(.covMethod, "imp")) {
-      covMethodDeferred <- "imp"
-      .covMethod <- ""
-    }
   }
 
+  covFallback <- .covFallbackCheck(
+    covFallback,
+    methods = c("sa", "fim", "analytic", "linFim", "r,s", "r", "s"),
+    targets = c("sa", "fim", "linFim", "Ha")
+  )
   checkmate::assertLogical(covFull, len = 1, any.missing = FALSE)
 
   # censOption: FOCEI-family censored (M2/M3/M4) 2nd-derivative treatment -- "gauss" (historic
@@ -621,6 +639,7 @@ saemControl <- function(
     ci = ci,
     covMethod = .covMethod,
     covMethodDeferred = covMethodDeferred,
+    covFallback = covFallback,
     covFull = covFull,
     nSaCov = as.integer(nSaCov),
     logLik = logLik,
@@ -648,25 +667,63 @@ saemControl <- function(
     phi1Hessian = isTRUE(phi1Hessian),
     residWarmStart = residWarmStart
   )
+  # internal: the "sa" covariance recompute at a fit's estimates holds every
+  # population parameter where it was supplied (.covEngineControl, .saemHoldCfg)
+  if (isTRUE(.xtra$saemHoldPar)) {
+    .ret$saemHoldPar <- TRUE
+  }
+  # internal: that recompute continues a SAEM fit's chains (.saemChainState)
+  if (!is.null(.xtra$saemWarmState)) {
+    checkmate::assertList(.xtra$saemWarmState, .var.name = "saemWarmState")
+    checkmate::assertMatrix(
+      .xtra$saemWarmState$phiM,
+      mode = "numeric",
+      any.missing = FALSE,
+      .var.name = "saemWarmState$phiM"
+    )
+    checkmate::assertNumeric(
+      .xtra$saemWarmState$sigma2,
+      lower = 0,
+      finite = TRUE,
+      null.ok = TRUE,
+      .var.name = "saemWarmState$sigma2"
+    )
+    checkmate::assertMatrix(
+      .xtra$saemWarmState$mpostPhi,
+      mode = "numeric",
+      any.missing = FALSE,
+      null.ok = TRUE,
+      .var.name = "saemWarmState$mpostPhi"
+    )
+    .ret$saemWarmState <- .xtra$saemWarmState
+  }
   class(.ret) <- "saemControl"
   .ret
 }
 
 .saemDeparseExtra <- function(default, name, value) {
+  if (name == "DEBUG") {
+    return(paste0("trace=", deparse1(value)))
+  }
   if (name == "mcmc") {
     .ret <- character(0)
     if (!identical(default$mcmc$niter, value$niter)) {
-      if (default$mcmc$niter[1] != value$niter[1]) {
-        .ret <- c(.ret, paste0("nBurn=", value$niter[1]))
+      # both are written when integer, since c(nBurn, nEm) is integer only then
+      .both <- !identical(storage.mode(default$mcmc$niter), storage.mode(value$niter)) ||
+        !is.null(names(value$niter))
+      if (.both || default$mcmc$niter[1] != value$niter[1]) {
+        .ret <- c(.ret, paste0("nBurn=", deparse1(value$niter[1])))
       }
-      if (default$mcmc$niter[2] != value$niter[2]) {
-        .ret <- c(.ret, paste0("nEm=", value$niter[2]))
+      if (.both || default$mcmc$niter[2] != value$niter[2]) {
+        .ret <- c(.ret, paste0("nEm=", deparse1(value$niter[2])))
       }
     }
-    if (default$mcmc$nmc != value$nmc) {
-      .ret <- c(.ret, paste0("nmc=", value$nmc))
+    if (!identical(default$mcmc$nmc, value$nmc)) {
+      .ret <- c(.ret, paste0("nmc=", deparse1(value$nmc)))
     }
-    if (!identical(default$mcmc$nu, value$nu)) {
+    # nu is written only when supplied (nuAuto FALSE), even at its default; an
+    # automatic nu may have been raised by the fit (.saemAutoNu) and is redone
+    if (!isTRUE(value$nuAuto) && (!identical(default$mcmc$nu, value$nu) || isTRUE(default$mcmc$nuAuto))) {
       .ret <- c(.ret, paste0("nu=", deparse1(value$nu)))
     }
     return(paste0(.ret, collapse = ","))
@@ -676,7 +733,10 @@ saemControl <- function(
 
 #' @export
 rxUiDeparse.saemControl <- function(object, var) {
-  .default <- saemControl()
-  .w <- .deparseDifferent(.default, object, c("genRxControl", "DEBUG"))
-  .deparseFinal(.default, object, .w, var, fun = .saemDeparseExtra)
+  .ret <- .deparseControl(object, var, saemControl(), "genRxControl", fun = .saemDeparseExtra)
+  # an rxControl generated at a sigdig that could not be recovered
+  if (isTRUE(object$genRxControl) && !is.null(.ret[[3]]$rxControl)) {
+    .ret[[3]]$genRxControl <- TRUE
+  }
+  .ret
 }

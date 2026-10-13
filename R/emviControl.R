@@ -37,6 +37,29 @@
 #' @inheritParams saemControl
 #' @inheritParams foceiControl
 #'
+#' @param covMethod Covariance of the population estimates.
+#'
+#'  "`vi`" (default) For a full-Bayes fit (`fbvi`, `pointEstimate = FALSE`)
+#'  the population variational covariance; a point-estimate fit (`emvi`) has
+#'  no population variational block and uses the FOCEI `"r,s"` covariance.
+#'
+#'  "`analytic`", "`r,s`", "`r`" and "`s`" run the FOCEI covariance step (see
+#'  [foceiControl()]) at the estimates, starting the individual estimates at
+#'  the variational posterior means.  When it gives no covariance, a
+#'  full-Bayes fit installs the population variational covariance instead,
+#'  with a message.  An integer `covMethod` is a `foceiControl()` slot: `0` is
+#'  no covariance, `1`, `2` and `3` are `"r,s"`, `"r"` and `"s"`.
+#'
+#'  "" Does not calculate the covariance step.
+#'
+#' @param covFallback what each `covMethod` falls back to when it gives no
+#'  usable covariance: a named list, one element per method, each the ordered
+#'  methods to try instead -- the FOCEI `"r,s"`, `"r"` and `"s"` (see
+#'  [foceiControl()]), and `"vi"`, the population variational covariance of a
+#'  full-Bayes fit.  The default is the established behaviour: each FOCEI method
+#'  keeps its FOCEI fallbacks and ends with `"vi"`.  A list you give replaces the
+#'  default: a method it does not name has no fallback.
+#'
 #' @param seed Random seed for the variational optimization (reparameterization
 #'   sampling); default 42.  The Monte-Carlo gradient is stochastic, so a fixed
 #'   seed makes every fit reproducible.  Reparameterization noise is drawn from a
@@ -215,6 +238,12 @@ emviControl <- function(
   printNcol = NULL,
 
   covMethod = c("vi", "analytic", "r,s", "r", "s", ""),
+  covFallback = list(
+    "r,s" = c("r", "s", "vi"),
+    r = c("s", "vi"),
+    s = "vi",
+    analytic = c("r,s", "r", "s", "vi")
+  ),
   optExpression = TRUE,
   sumProd = FALSE,
   literalFix = TRUE,
@@ -292,12 +321,12 @@ emviControl <- function(
   viFamily <- match.arg(viFamily)
   optim <- match.arg(optim)
   likelihood <- match.arg(likelihood)
-  # match.arg cannot match ""; treat it (skip covariance) like foceiControl does
-  if (length(covMethod) == 1L && covMethod == "") {
-    covMethod <- ""
-  } else {
-    covMethod <- match.arg(covMethod)
-  }
+  covMethod <- .covMethodArg(covMethod, match.arg(covMethod))
+  covFallback <- .covFallbackCheck(
+    covFallback,
+    methods = c("analytic", "r,s", "r", "s"),
+    targets = c("r,s", "r", "s", "vi")
+  )
   addProp <- match.arg(addProp)
   eventSens <- match.arg(eventSens)
 
@@ -362,6 +391,7 @@ emviControl <- function(
     returnVi = returnVi,
     resume = resume,
     covMethod = covMethod,
+    covFallback = covFallback,
     optExpression = optExpression,
     sumProd = sumProd,
     literalFix = literalFix,
@@ -388,17 +418,13 @@ emviControl <- function(
 
 #' @export
 rxUiDeparse.emviControl <- function(object, var) {
-  .default <- emviControl()
   object$resume <- NULL # not deparsable (may be a whole fit)
-  .w <- .deparseDifferent(.default, object, "genRxControl")
-  .deparseFinal(.default, object, .w, var)
+  .deparseControl(object, var, emviControl())
 }
 
 #' @rdname nmObjHandleControlObject
 #' @export
-nmObjHandleControlObject.emviControl <- function(control, env) {
-  assign("emviControl", control, envir = env)
-}
+nmObjHandleControlObject.emviControl <- function(control, env) assign("emviControl", control, envir = env)
 
 #' Shared control lookup for the two variational methods.
 #' @noRd

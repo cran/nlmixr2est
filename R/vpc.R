@@ -77,6 +77,12 @@ vpcSim <- function(
   checkmate::assertLogical(normRelated, len = 1, any.missing = FALSE)
   checkmate::assertCharacter(keep, null.ok = TRUE, pattern = "^[.]*[a-zA-Z]+[a-zA-Z0-9._]*$")
   checkmate::assertIntegerish(seed)
+  ## event bus: the simulations inside are silent; emit one solveComplete
+  ## linked to the fit on exit (see rxEvents.R)
+  force(object)
+  .nlmixr2EventEnter()
+  .evCall <- sys.call()
+  on.exit(.nlmixr2EventExitSolve(returnValue(), object, .evCall, "vpcSim"), add = TRUE)
   # seed R's RNG and switch rxode2's own seed sequence off for the simulation: a
   # sequence left in force by an earlier rxSetSeed() advances by the thread
   # count per solve, which would make the simulations thread dependent
@@ -100,13 +106,25 @@ vpcSim <- function(
   .env$ui <- object$ui
   .env$data <- object$origData
   suppressMessages(.preProcessHooksRun(.env, "rxSolve"))
-  .si$object <- eval(.getSimModel(.env$ui, hideIpred = FALSE))
+  .simModel <- .getSimModel(.env$ui, hideIpred = FALSE)
+  .si$object <- eval(.simModel)
   .w <- which(names(.si) == "rx")
   .si <- .si[-.w]
   .si$nsim <- n
-  .si <- c(.si, list(...))
+  # the fit's covariate interpolation (#1137), then `...` replaces any
+  # setting by name instead of passing it twice
+  .covsi <- .residCovsInterpolation(object)
+  .si <- c(.si, .covsi[!vapply(.covsi, is.null, logical(1))])
+  .dots <- list(...)
+  .named <- if (is.null(names(.dots))) logical(length(.dots)) else nzchar(names(.dots))
+  .si[names(.dots)[.named]] <- .dots[.named]
+  .si <- c(.si, .dots[!.named])
   .pt <- proc.time()
   .si$keep <- unique(c(keep, "nlmixrRowNums"))
+  .drop <- setdiff(attr(.simModel, "lagged"), .si$keep)
+  if (length(.drop) > 0L) {
+    .si$drop <- unique(c(.si$drop, .drop))
+  }
   .data <- .si$events
   .data$nlmixrRowNums <- seq_along(.data[, 1])
   if (normRelated) {
@@ -135,7 +153,7 @@ vpcSim <- function(
   .si$returnType <- "data.frame.TBS"
   .sim <- do.call(rxode2::rxSolve, .si)
   if (!("sim.id" %in% names(.sim))) {
-    .sim2$sim.id <- 1
+    .sim$sim.id <- 1
   }
   # now look for how many have missing values
   .w <- which(is.na(.sim$ipred))

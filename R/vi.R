@@ -10,43 +10,11 @@
 # only the user-facing surface moved.  The inner marker in particular is load
 # bearing: .foceiOptEnvLik selects the theta-sensitivity model build on it.
 
-#' A foceiControl carrying the chosen inner likelihood + solving options.
-#' Mirrors .vaeInnerFoceiControl: focei -> interaction=1; foce/focep ->
-#' interaction=0 (focep = FOCE+, R at the live conditional eta); laplace -> the
-#' Laplace method.
-#' @noRd
-.adviInnerFoceiControl <- function(control) {
-  .lik <- control$likelihood
-  .interaction <- if (.lik %in% c("foce", "focep")) 0L else 1L
-  .foce <- if (identical(.lik, "focep")) "foce+" else "nonmem"
-  foceiControl(
-    rxControl = control$rxControl,
-    maxOuterIterations = 0L,
-    maxInnerIterations = 0L,
-    covMethod = "",
-    interaction = .interaction,
-    foce = .foce,
-    sumProd = control$sumProd,
-    optExpression = control$optExpression,
-    literalFix = control$literalFix,
-    literalFixRes = control$literalFixRes,
-    addProp = control$addProp,
-    calcTables = FALSE,
-    compress = FALSE,
-    eventSens = control$eventSens,
-    indTolRelax = control$indTolRelax,
-    maxOdeRecalc = control$maxOdeRecalc,
-    odeRecalcFactor = control$odeRecalcFactor,
-    stickyRecalcN = control$stickyRecalcN,
-    print = 0L
-  )
-}
-
 #' Set up the FOCEi inner problem (reused for the per-subject log-joint and
 #' eta-gradient) plus, when non-mu structural/sigma thetas are present, the
 #' impmap theta-sensitivity model (reused for the outer population gradient).
-#' Modeled on .vaeInnerSetup, adding the 0-based `impThetaSensIdx` so foceiSetup_
-#' wires the sensitivity output offsets into op_focei.
+#' `.foceiInnerEnv()` with the 0-based `impThetaSensIdx`, so foceiSetup_ wires
+#' the sensitivity output offsets into op_focei.
 #' @param ui rxode2 ui object (already bounded-transformed by the dispatch hook)
 #' @param data estimation data
 #' @param etaMat starting etas [nsub, neta]
@@ -55,36 +23,25 @@
 #' @noRd
 .adviInnerSetup <- function(ui, data, etaMat, control) {
   .ui <- rxode2::rxUiDecompress(ui)
-  .fc <- .adviInnerFoceiControl(control)
-  .fc$est <- "advi"
+  .fc <- .foceiInnerControl(
+    control,
+    likelihood = control$likelihood,
+    literalFixRes = control$literalFixRes,
+    eventSens = control$eventSens,
+    indTolRelax = control$indTolRelax,
+    stickyRecalcN = control$stickyRecalcN
+  )
   ## 0-based non-mu theta indices with d(f)/d(theta) & d(V)/d(theta) outputs; the
   ## theta-sensitivity model (built in .foceiOptEnvLik for est="advi") supplies
   ## the columns and foceiSetup_ records their lhs offsets in op_focei.
-  .fc$impThetaSensIdx <- as.integer(.impmapEstTheta(.ui)$all - 1L)
-  .ui$control <- .fc
-  .env <- .ui$foceiOptEnv
-  .env$ui <- .ui
-  .env$est <- "advi"
-  .env$table <- NULL
-  .foceiPreProcessData(data, .env, .ui, .fc$rxControl)
-  .env$control$est <- "advi"
-  ## foceiSetup_ reads impThetaSensIdx from e$control (foceiO); make sure it is
-  ## present there (not only on the pre-build .fc) so op_focei wires the offsets.
-  .env$control$impThetaSensIdx <- as.integer(.impmapEstTheta(.ui)$all - 1L)
-  .env$control$printTop <- FALSE
-  if (is.null(.env$control$nF)) {
-    .env$control$nF <- 0L
-  }
-  .env$control$needOptimHess <- isTRUE(any(.ui$predDfFocei$distribution != "norm"))
-  .env$aqn <- 0L
-  .env$qx <- double(0)
-  .env$qw <- double(0)
-  .env$qfirst <- FALSE
-  .env$nAGQ <- 0L
-  .env$aqLow <- -Inf
-  .env$aqHi <- Inf
-  .env$nEstOmega <- 0L
-  .env$etaMat <- etaMat
+  .env <- .foceiInnerEnv(
+    .ui,
+    data,
+    .fc,
+    "advi",
+    etaMat,
+    extra = list(impThetaSensIdx = as.integer(.impmapEstTheta(.ui)$all - 1L))
+  )
   ## declared population omega structure: installs the off-diagonal mask so the
   ## ELBO/gradient entry points see it without going through adviOptimize_
   .ob <- .omegaBlockFromIniDf(.ui$iniDf, .foceiEtaThetaMap(.ui)$etaNames)
@@ -230,11 +187,10 @@
     .est <- if (isTRUE(res$pointEstimate)) "emvi" else "fbvi"
   }
   .prep <- res$prep
-  .rxControl <- .control$rxControl
 
   .ret <- new.env(parent = emptyenv())
   .ret$table <- env$table
-  .foceiPreProcessData(env$data, .ret, .ui, .rxControl)
+  .foceiPreProcessData(env$data, .ret, .ui, .control$rxControl)
 
   ## seed the ui iniDf with the variational estimates so the eval reports them
   .uiD <- rxode2::rxUiDecompress(.ui)
@@ -261,51 +217,14 @@
   ## variational posterior means as the FOCEi inner EBE start [nsub, neta]
   .eb <- res$mu
   colnames(.eb) <- .prep$etaNames
-  .ret$.etaMat <- .eb
-  .ret$.etaMatBase <- .eb
-  .ret$etaObf <- data.frame(ID = seq_len(nrow(.eb)), stats::setNames(as.data.frame(.eb), .prep$etaNames), OBJI = NA)
-  .ret$omega <- .omM
   .ret$ui <- .ui2
-  .ret$fullTheta <- stats::setNames(res$theta, names(.prep$th))
 
-  ## covMethod="vi": for full-Bayes the SEs come from the population variational
-  ## covariance (installed below, so skip the FOCEi cov step); for point-estimate
-  ## there is no population variational block, so fall back to the FOCEi "r,s".
-  .covM <- if (identical(.control$covMethod, "vi")) {
-    (if (isTRUE(res$pointEstimate)) "r,s" else "")
-  } else {
-    .control$covMethod
-  }
-  .lik <- .control$likelihood
-  .interaction <- if (.lik %in% c("foce", "focep")) 0L else 1L
-  .foce <- if (identical(.lik, "focep")) "foce+" else "nonmem"
-  .fc <- foceiControl(
-    rxControl = .rxControl,
-    maxOuterIterations = 0L,
-    maxInnerIterations = 0L,
-    covMethod = .covM,
-    etaMat = .eb,
-    scaleTo = 0,
-    interaction = .interaction,
-    foce = .foce,
-    sumProd = .control$sumProd,
-    optExpression = .control$optExpression,
-    literalFix = .control$literalFix,
-    literalFixRes = .control$literalFixRes,
-    addProp = .control$addProp,
-    calcTables = .control$calcTables,
-    compress = .control$compress,
-    ci = .control$ci,
-    sigdigTable = .control$sigdigTable,
-    stickyRecalcN = .control$stickyRecalcN,
-    maxOdeRecalc = .control$maxOdeRecalc,
-    odeRecalcFactor = .control$odeRecalcFactor,
-    indTolRelax = .control$indTolRelax,
-    eventSens = .control$eventSens,
-    fast = FALSE,
-    print = 0L
-  )
-  .ret$control <- .fc
+  ## the output step evaluates the variational means only; the FOCEi covariance
+  ## is computed after it (.foceiInstallOwnEtaCov, below)
+  .fc <- .adviFoceiControl(.control, .eb, isTRUE(res$pointEstimate))
+  .fcOut <- .fc
+  .fcOut$covMethod <- 0L
+  .ret$control <- .fcOut
   .ret$method <- .est
   .ret$extra <- ""
   .ret$est <- .est
@@ -328,11 +247,12 @@
   .fit <- nlmixr2CreateOutputFromUi(
     .ret$ui,
     data = .ret$origData,
-    control = .fc,
+    control = .fcOut,
     table = .ret$table,
     env = .ret,
     est = .est
   )
+  .foceiInstallOwnEtaCov(.fit, .fc)
   ## variational artifacts + warm-resume state on the fit env
   .e <- .fit$env
   .e$viElbo <- res$elbo
@@ -404,76 +324,104 @@
     ## covMethod="vi": install the population variational covariance as the
     ## fit's SE source (the theta block maps directly to parFixedDf's
     ## population/residual parameters).  For any other covMethod the FOCEi
-    ## covariance step (analytic/r,s/...) already ran on the full inner model;
-    ## only fall back to the variational covariance if that chain came up empty.
+    ## covariance (analytic/r,s/...) was computed above; only fall back to the
+    ## variational covariance if that came up empty.
     .cmDone <- tryCatch(as.character(.e$covMethod), error = function(e) "")
     if (identical(.control$covMethod, "vi")) {
       .adviInstallVarCov(.fit, res)
     } else if (
-      is.null(.e$cov) || !is.matrix(.e$cov) || length(.cmDone) != 1L || !nzchar(.cmDone) || identical(.cmDone, "failed")
+      "vi" %in%
+        .covFallbackOf(.control, "emviControl")[[.control$covMethod]] &&
+        (is.null(.e$cov) ||
+          !is.matrix(.e$cov) ||
+          length(.cmDone) != 1L ||
+          !nzchar(.cmDone) ||
+          identical(.cmDone, "failed"))
     ) {
       message("covMethod=\"", .control$covMethod, "\" covariance was not available; using the variational covariance")
       .adviInstallVarCov(.fit, res)
+      .tried <- if (is.data.frame(.e$covTried)) {
+        .e$covTried
+      } else {
+        data.frame(method = .control$covMethod, outcome = "not usable")
+      }
+      .e$covTried <- rbind(
+        .tried,
+        data.frame(method = "vi", outcome = if (identical(.e$covMethod, "vi")) "used" else "not usable")
+      )
     }
   }
   .e$viState <- .st
   .fit
 }
 
-#' Install a named theta-block covariance as the fit's covariance and update
-#' the parFixedDf SEs / RSEs / CIs accordingly.
+#' The FOCEi control of a variational fit
+#'
+#' No outer or inner optimization (the variational estimates and means are
+#' final), the method's inner `likelihood`, and its covariance request:
+#' `covMethod = "vi"` is the population variational covariance for full Bayes
+#' (no FOCEi covariance) and the FOCEi `"r,s"` for a point estimate, which has
+#' no population variational block.
+#' @param control `emviControl()`/`fbviControl()`
+#' @param etaMat variational means (subjects x etas), or `NULL`
+#' @param pointEstimate `TRUE` for emvi, `FALSE` for fbvi
+#' @return `foceiControl()` object
 #' @noRd
-.adviInstallThetaCov <- function(fit, cov) {
-  .env <- if (rxode2::rxIs(fit, "nlmixr2FitData")) fit$env else fit
-  if (!is.environment(.env) || is.null(cov)) {
-    return(invisible())
+.adviFoceiControl <- function(control, etaMat, pointEstimate) {
+  .covM <- if (identical(control$covMethod, "vi")) {
+    (if (pointEstimate) "r,s" else "")
+  } else {
+    control$covMethod
   }
-  .env$cov <- cov
-  if (!exists("parFixedDf", envir = .env, inherits = FALSE)) {
-    return(invisible())
-  }
-  .pf <- .env$parFixedDf
-  .se <- sqrt(diag(cov))
-  .ci <- tryCatch(as.numeric(rxode2::rxGetControl(.env$ui, "ci", 0.95)), error = function(e) 0.95)
-  .qn <- stats::qnorm(1 - (1 - .ci) / 2)
-  for (.n in rownames(.pf)) {
-    if (.n %in% names(.se) && "SE" %in% names(.pf)) {
-      .s <- .se[[.n]]
-      .e <- .pf[.n, "Estimate"]
-      .pf[.n, "SE"] <- .s
-      if ("%RSE" %in% names(.pf)) {
-        .pf[.n, "%RSE"] <- abs(.s / .e) * 100
-      }
-      if (
-        all(c("CI Lower", "CI Upper", "Back-transformed") %in% names(.pf)) &&
-          isTRUE(all.equal(unname(.pf[.n, "Back-transformed"]), unname(.e)))
-      ) {
-        .pf[.n, "CI Lower"] <- .e - .qn * .s
-        .pf[.n, "CI Upper"] <- .e + .qn * .s
-      }
-    }
-  }
-  .env$parFixedDf <- .pf
-  invisible()
+  # the FOCEI fallbacks; "vi" is installed after the FOCEI covariance (.adviFitModel)
+  .fb <- lapply(.covFallbackOf(control, "emviControl"), setdiff, y = "vi")
+  .foceiOwnEtaControl(
+    control,
+    etaMat,
+    covMethod = .covM,
+    covFallback = .fb,
+    likelihood = control$likelihood,
+    scaleTo = 0,
+    literalFix = control$literalFix,
+    literalFixRes = control$literalFixRes,
+    stickyRecalcN = control$stickyRecalcN,
+    maxOdeRecalc = control$maxOdeRecalc,
+    odeRecalcFactor = control$odeRecalcFactor,
+    indTolRelax = control$indTolRelax,
+    fast = FALSE,
+    print = 0L
+  )
+}
+
+#' @export
+#' @rdname nmObjGetFoceiControl
+nmObjGetFoceiControl.emvi <- function(x, ...) {
+  .adviFoceiControl(x[[1]]$emviControl, NULL, TRUE)
+}
+
+#' @export
+#' @rdname nmObjGetFoceiControl
+nmObjGetFoceiControl.fbvi <- function(x, ...) {
+  .adviFoceiControl(x[[1]]$emviControl, NULL, FALSE)
 }
 
 #' Install the population variational covariance (Lpop Lpop^T) as the fit's
 #' covariance + parFixedDf SEs -- the natural full-Bayes uncertainty.  The theta
 #' block of the phi-space covariance maps directly to the population / residual
-#' parameters (by name); the log-variance block is retained on $env$viCov.
+#' parameters (by name); the log-variance block is retained on $env$viCov.  Its
+#' confidence interval is the identity one, on the rows reported untransformed.
 #' @noRd
 .adviInstallVarCov <- function(fit, res) {
+  .env <- .setCovEnv(fit)
   .thComp <- which(res$phiThetaIdx >= 0)
-  if (length(.thComp) == 0L) {
+  if (length(.thComp) == 0L || !is.environment(.env)) {
     return(invisible())
   }
   .thNames <- res$prep$thetaRealNames[res$phiThetaIdx[.thComp] + 1L]
   .thetaCov <- res$viCov[.thComp, .thComp, drop = FALSE]
   dimnames(.thetaCov) <- list(.thNames, .thNames)
-  .adviInstallThetaCov(fit, .thetaCov)
-  .env <- if (rxode2::rxIs(fit, "nlmixr2FitData")) fit$env else fit
-  if (is.environment(.env)) {
-    .env$covMethod <- "vi"
+  if (.covInstall(.env, .thetaCov, "vi", refresh = "none")) {
+    .updateParFixedRefreshSeFromCov(.env, .env$cov, ciIdentity = TRUE)
   }
   invisible()
 }

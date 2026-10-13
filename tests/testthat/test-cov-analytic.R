@@ -125,23 +125,22 @@ nmTest({
   test_that("an indefinite analytic covariance is reported but not installed (#1055)", {
     skip_on_cran()
     skip_if_not_installed("nlmixr2data")
-    # sigdig = 3 stops this model short of a local minimum: the observed information has a
-    # negative eigenvalue and two SEs are NaN, under the analytic engine AND under an
-    # independent brute-force FD Hessian of the same objective at the same estimates.  The
-    # analytic pieces are still returned (the caller asked for them) but must not overwrite
-    # the fit's usable covariance.
-    #
-    # This asked at sigdig = 4 until 2026-09-12, when the inner-solver rework in #1044/#1069
-    # made that point converge -- measured on this model, min eigenvalue of R goes
-    # -3698 at sigdig 3 to +108 at sigdig 4 (and -6394 at 2, -1816 at
-    # maxOuterIterations = 1).  Better fits are the point of that work; what this test needs
-    # is a point that is genuinely NOT a minimum, so it asks one sigdig earlier rather than
-    # giving up the indefinite path.  The margin here is large, not marginal.
+    # One outer iteration stops far from the minimum, so the observed information is
+    # indefinite (two SEs NaN).  The analytic pieces are still returned but must not
+    # overwrite the fit's usable covariance.  A converged-but-loose fit (sigdig = 3 or 4)
+    # was used before; whether it lands at a minimum moves with optimizer changes and
+    # platform, so it does not reliably exercise the indefinite path.
     fit <- suppressMessages(nlmixr(
       .cov_blk_omega,
       .cov_blk_data(),
       "focei",
-      foceiControl(sigdig = 3, print = 0L, covMethod = "r,s", covFull = TRUE)
+      foceiControl(
+        sigdig = 3,
+        maxOuterIterations = 1L,
+        print = 0L,
+        covMethod = "r,s",
+        covFull = TRUE
+      )
     ))
     .cov0 <- fit$cov
     .m0 <- fit$covMethod
@@ -229,7 +228,11 @@ nmTest({
     # the full theta+sigma+Omega covariance over the SAME parameter set as the analytic engine
     # (structural + residual thetas plus the Omega variance-covariance elements; Omega perturbed
     # on the variance scale, no Jacobian), assembled as a TRUE sandwich solve(Rfull) %*% Sfull
-    # %*% solve(Rfull) -- not merely the Hessian inverse.
+    # %*% solve(Rfull) -- not merely the Hessian inverse.  The covariance solves are tight
+    # (covSolveTol): at the fit's own rtol = 1e-4 the finite differences are noise-dominated
+    # and whether the full R comes out positive definite is luck.  The sandwich made from an
+    # indefinite R is refused; that is tested on hand-made pieces in
+    # test-cov-fdfull-install.R.
     fa <- suppressMessages(nlmixr(
       .cov_one_cmt,
       nlmixr2data::theo_sd,
@@ -240,10 +243,11 @@ nmTest({
       .cov_one_cmt,
       nlmixr2data::theo_sd,
       "focei",
-      foceiControl(sigdig = 4, print = 0L, covMethod = "r,s", covFull = TRUE)
+      foceiControl(sigdig = 4, print = 0L, covMethod = "r,s", covFull = TRUE, covSolveTol = 1e-9)
     ))
     .nm <- c("tka", "tcl", "tv", "add.sd", "om.eta.ka", "om.eta.cl", "om.eta.v")
     # full theta+sigma+Omega cov, and covR/covS/covRS carry the same full shape
+    expect_identical(ff$covMethod, "r,s (full)")
     expect_setequal(rownames(ff$cov), .nm)
     expect_setequal(rownames(ff$covRS), .nm)
     expect_setequal(rownames(ff$covR), .nm)
@@ -253,6 +257,7 @@ nmTest({
     # it is the sandwich Rinv %*% S %*% Rinv, not the Hessian inverse .fdFullCov
     .Rinv <- get(".fdFullCov", ff$env)
     .S <- get(".fdFullS", ff$env)
+    expect_gt(min(eigen(.Rinv, symmetric = TRUE, only.values = TRUE)$values), 0)
     expect_equal(unname(unclass(ff$cov)), unname(.Rinv %*% .S %*% .Rinv), tolerance = 1e-6)
     expect_false(isTRUE(all.equal(unclass(ff$cov), unclass(.Rinv), check.attributes = FALSE)))
     # the structural theta SEs stay in the analytic ballpark (sandwich != observed information,
@@ -311,12 +316,13 @@ nmTest({
     d <- nlmixr2data::theo_sd
     d$CENS <- ifelse(d$DV < 2 & d$EVID == 0, 1L, 0L)
     d$DV[d$CENS == 1] <- 2
-    # out of scope -> foceiCalcR warns (visibly) and uses the finite-difference cov
+    # out of scope -> foceiCalcR warns (visibly) and uses the finite-difference cov, with
+    # its solves tight (covSolveTol) so that the full R is a reliable positive definite
     fit <- suppressWarnings(suppressMessages(nlmixr(
       cm,
       d,
       "focei",
-      foceiControl(sigdig = 4, print = 0L, covMethod = "analytic", censOption = "laplace")
+      foceiControl(sigdig = 4, print = 0L, covMethod = "analytic", censOption = "laplace", covSolveTol = 1e-9)
     )))
     expect_true(is.matrix(fit$cov))
     # analytic bowed out (laplace determinant is out of scope) -> the finite-difference
@@ -423,12 +429,13 @@ nmTest({
     expect_identical(.covBaseName(fFp$covMethod), "analytic")
     expect_true(any(grepl("^om\\.", rownames(fFp$cov))))
     # the laplace censored determinant is out of analytic scope -> the finite-difference
-    # sandwich; with covFull=TRUE (default) that fallback carries the full cov (om. rows)
+    # sandwich; with covFull=TRUE (default) that fallback carries the full cov (om. rows).
+    # Its solves are tight (covSolveTol), as in the fallback test above.
     fL <- suppressWarnings(suppressMessages(nlmixr(
       cm,
       dM3,
       "focei",
-      foceiControl(sigdig = 4, print = 0L, covMethod = "analytic", censOption = "laplace")
+      foceiControl(sigdig = 4, print = 0L, covMethod = "analytic", censOption = "laplace", covSolveTol = 1e-9)
     )))
     expect_false(identical(.covBaseName(fL$covMethod), "analytic"))
     expect_true(any(grepl("^om\\.", rownames(fL$cov))))
@@ -456,10 +463,22 @@ nmTest({
       foceiControl(sigdig = 4, print = 0L, covMethod = "analytic")
     )))
     expect_true(is.matrix(fit$cov))
-    # the near-zero-prediction guard drops to the finite-difference fallback; covFull=TRUE
-    # (default) makes it the full theta+sigma+Omega cov
+    # the near-zero-prediction guard drops to the finite-difference fallback
     expect_false(identical(.covBaseName(fit$covMethod), "analytic"))
-    expect_true(any(grepl("^om\\.", rownames(fit$cov))))
+    # covFull=TRUE (default) installs the full theta+sigma+Omega sandwich when its R is
+    # positive definite, else the full S (#1152), else keeps the theta-only sandwich and
+    # records why.  Which applies depends on where the FD stages are centred, so every
+    # outcome is pinned here.
+    .sh <- .foceiFdFullShapes(get(".fdFullCov", fit$env), get0(".fdFullS", fit$env))
+    if (.sh$r$ok) {
+      expect_true(any(grepl("^om\\.", rownames(fit$cov))))
+    } else if (.sh$s$ok) {
+      expect_identical(fit$covMethod, "s (full)")
+      expect_true("full R matrix non-positive definite; using s (full)" %in% fit$runInfo)
+    } else {
+      expect_false(any(grepl("^om\\.", rownames(fit$cov))))
+      expect_true("\"r,s (full)\" covariance needs a positive-definite R; kept \"r,s\"" %in% fit$runInfo)
+    }
   })
 
   test_that("FOCE and foce+ additive analytic R equal the FOCEI analytic R at the same EBEs", {
@@ -1982,4 +2001,44 @@ nmTest({
     expect_gt(length(.n), 0L)
     expect_equal(unname(.rT$se[.n]), unname(.rF$se[.n]), tolerance = 1e-8)
   })
+})
+
+test_that("a constant compartment initial condition does not leak a symbol into the augmented model", {
+  # `rx_<state>_ini_0__` comes back from the pruned env as a plain R numeric when
+  # the initial condition is a constant, and `symengine::D()` refuses one.  That
+  # refusal used to be swallowed by `rxFromSE()`, which is non-standard
+  # evaluating and deparsed its own argument name, so the augmented model was
+  # emitted with `rx__sens_<state>_BY_<dir>__(0)=.l` and the fit died with
+  # "parameter(s) are required for solving: .l" (#1115).
+  .model <- function() {
+    ini({
+      tka <- 0.45
+      tcl <- 1
+      tv <- 3.45
+      eta.cl ~ 0.3
+      add.sd <- 0.7
+    })
+    model({
+      ka <- exp(tka)
+      cl <- exp(tcl + eta.cl)
+      v <- exp(tv)
+      center(0) <- 0.03
+      d / dt(depot) <- -ka * depot
+      d / dt(center) <- ka * depot - cl / v * center
+      cp <- center / v
+      cp ~ add(add.sd)
+    })
+  }
+  .ui <- nlmixr2(.model)
+  .am <- suppressMessages(suppressWarnings(
+    .foceiAnalyticAugModelDirs(.ui, .foceiOuterDirs(.ui)$dirs)
+  ))
+  .lines <- strsplit(rxode2::rxNorm(.am$augMod), "\n")[[1]]
+  .ic <- grep("\\(0\\)[ ]*=", .lines, value = TRUE)
+  # the base state keeps its constant, and no sensitivity compartment is given
+  # an initial condition built out of an R symbol
+  expect_true(any(grepl("^center\\(0\\)=0.03", .ic)))
+  expect_false(any(grepl("=\\s*\\.[A-Za-z]", .lines)))
+  # every parameter the augmented model needs is a real model parameter
+  expect_false(any(grepl("^\\.", rxode2::rxModelVars(.am$augMod)$params)))
 })

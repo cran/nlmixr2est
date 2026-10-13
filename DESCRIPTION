@@ -2,7 +2,7 @@ Type: Package
 Package: nlmixr2est
 Title: Nonlinear Mixed Effects Models in Population PK/PD, Estimation
         Routines
-Version: 7.1.0
+Version: 7.2.0
 Authors@R: c(
     person("Matthew", "Fidler", , "matthew.fidler@gmail.com", role = c("aut", "cre"), comment = c(ORCID = "0000-0001-8538-6691")),
     person("Wenping", "Wang", , "wwang8198@gmail.com", role = "aut"),
@@ -41,17 +41,17 @@ License: GPL (>= 3)
 URL: https://github.com/nlmixr2/nlmixr2est,
         https://nlmixr2.github.io/nlmixr2est/
 Depends: nlmixr2data, R (>= 4.1.0)
-Imports: backports, checkmate, cli, graphics, knitr, L0Learn, lbfgsb3c,
-        lotri, Matrix, methods, minqa, n1qn1 (>= 6.0.1-12), nlme, Rcpp,
-        RcppTrust (>= 0.1.0), rex, rxode2 (>= 5.1.7), stats, symengine,
-        utils
+Imports: backports, checkmate, cli, graphics, knitr, L0Learn, lbfgsb3c
+        (>= 2024-3.6), lotri, methods, minqa, n1qn1 (>= 6.0.1-12),
+        nlme, Rcpp, RcppTrust (>= 0.1.0), rex, rxode2 (>= 5.1.8),
+        stats, symengine, utils
 Suggests: broom.mixed, callr, crayon, data.table, devtools, digest,
         dplyr (>= 1.1.0), generics, nloptr, sys, testthat, tibble,
-        withr, xgxr, sfsmisc, minpack.lm, remotes, fastGHQuad,
+        withr, xgxr, sfsmisc, minpack.lm, Matrix, remotes, fastGHQuad,
         rmarkdown, rlang, numDeriv, rstan, loo
-LinkingTo: BH, n1qn1 (>= 6.0.1-12), lbfgsb3c (>= 2024-3.5), lotri (>=
+LinkingTo: BH, n1qn1 (>= 6.0.1-12), lbfgsb3c (>= 2024-3.6), lotri (>=
         0.5.0), Rcpp, RcppArmadillo (>= 0.11.2.3.1), RcppEigen,
-        RcppTrust (>= 0.1.0), rxode2 (>= 5.1.7)
+        RcppTrust (>= 0.1.0), rxode2 (>= 5.1.8)
 Biarch: true
 Config/testthat/edition: 3
 Encoding: UTF-8
@@ -60,7 +60,7 @@ NeedsCompilation: yes
 LazyData: true
 VignetteBuilder: knitr
 Config/roxygen2/version: 8.1.0
-Packaged: 2026-09-20 03:58:55 UTC; matt-fidler
+Packaged: 2026-10-13 17:58:16 UTC; matt-fidler
 Author: Matthew Fidler [aut, cre] (ORCID:
     <https://orcid.org/0000-0001-8538-6691>),
   Wenping Wang [aut],
@@ -88,4 +88,4 @@ Author: Matthew Fidler [aut, cre] (ORCID:
   Vipul Mann [aut],
   Yuan Xiong [aut]
 Repository: CRAN
-Date/Publication: 2026-09-20 05:10:02 UTC
+Date/Publication: 2026-10-13 19:30:02 UTC

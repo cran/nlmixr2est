@@ -27,6 +27,9 @@ bool impPoolSizing();              // true when the pool is sized for the theta-
 
 // 0.5 * log|Omega^-1| = -0.5 * log|Omega| (importance-sampling objective normalizer).
 double impLogDetOmegaInv5();
+double impEtaPriorHalf(const arma::vec& eta);
+bool impCovReuseOn();
+bool impIsFo();
 
 // Maximum EM iterations (from the impmap control).
 int impNiter();
@@ -63,7 +66,9 @@ bool impIsImp();                                   // est="imp": no MAP search, 
 double impUpdateMuThetas();                        // mu-referenced covariate regression (updateMuGroups)
 void impMuInterceptStep();                         // simple mu intercept EM update (no covariates)
 void impReMap();                                   // re-optimize all conditional modes (innerOpt)
-void impSetOmega(const arma::mat& Omega, const std::string& diagXform); // install new Omega
+// install new Omega; returns the etas whose variance it floored at 1e-6
+std::vector<int> impSetOmega(const arma::mat& Omega, const std::string& diagXform);
+void impWarnOmegaFloor(Rcpp::Environment e, const std::vector<int>& idx); // warn, naming them
 void impSyncInitParToFullTheta();                  // sync optimizer reference to converged fullTheta
 void impGetEstPar(arma::vec& par);                 // current estimated free-parameter vector (EM convergence)
 
@@ -73,9 +78,6 @@ void impMapPass(Rcpp::Environment e);
 
 // Copy subject `id`'s current MAP mode (eta, length neta) into `mode`.
 void impGetMode(int id, arma::vec& mode);
-
-// Subject `id`'s individual objective contribution at its current mode.
-double impGetIndLik(int id);
 
 // Eta Hessian of the negative inner joint objective at subject `id`'s mode
 // (the FOCEI Laplace information matrix; positive-definite at the mode).
@@ -180,6 +182,7 @@ double impMixLogSumExp(const std::vector<double>& ll);  // log(sum_m p_m exp(ll[
 // ---- Monte-Carlo covariance support (implemented in inner.cpp) ----
 int impNtheta();                                   // number of thetas
 bool impCovEnabled();                              // whether impCov=TRUE was requested
+bool impFrozen();                                  // E-steps only, at the supplied parameters
 
 // ---- quasi-random (QRPEM) + SIR controls (from impmapControl) ----
 bool impQrEnabled();                               // qr=TRUE: Sobol importance samples
@@ -191,14 +194,25 @@ void impPropMixGet(std::vector<double>& c, std::vector<double>& w); // mixture s
 bool impSirEnabled();                              // sir=TRUE: SIR-accelerated theta M-step
 int impSirN();                                     // SIR resampled points per subject
 int impBaseSeed();                                 // base seed for the per-(iter,subject) streams
-void impGetEstThetaIdx(std::vector<int>& idx);     // fullTheta indices of the estimated thetas
 void impGetCovParList(std::vector<int>& idx);      // fullTheta index of every free param (fixedTrans order)
 double impGetFullThetaVal(int idx);                // current value of fullTheta[idx]
 void impSetThetaAll(int idx, double val);          // set fullTheta[idx] on every subject (FD perturb)
 void impForceResolve(int id);                      // force likInner0 to re-solve subject id
-int impOmegaN();                                   // number of parameterized Omega free parameters
 double impGetOmegaThetaVal(int m);                 // current value of Omega free parameter m
 void impSetOmegaThetaAll(int m, double val);       // set Omega free param m + rebuild omegaInv/logdet
+// d(Omega)/d(p_m) for every Omega parameter p_m = fullTheta[ntheta + m] at the
+// current estimate (element m of the list is an neta x neta matrix), from the
+// chol(Omega^-1) parameterization the inner problem uses.
+Rcpp::List impOmegaParDeriv();
+
+// The per-observation log-likelihoods the fit reports (addLlikObs) are those of the
+// final objective at the estimates, and every covariance evaluation rewrites them:
+// saved on construction, put back on destruction.
+struct CovLlikObsGuard {
+  std::vector<double> sav;
+  CovLlikObsGuard();
+  ~CovLlikObsGuard();
+};
 
 // Clear the persistent inner neqOverride (multi-endpoint pool) at fit end so it
 // does not leak into a subsequent fit sharing the global solve context.

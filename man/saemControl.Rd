@@ -14,6 +14,8 @@ saemControl(
   trace = 0,
   covMethod = c("sa", "analytic", "linFim", "fim", "r,s", "r", "s", "imp", ""),
   covMethodDeferred = NA_character_,
+  covFallback = list(sa = c("linFim", "Ha"), fim = c("linFim", "Ha"), analytic =
+    c("linFim", "Ha"), linFim = "Ha"),
   covFull = TRUE,
   nSaCov = 500L,
   calcTables = TRUE,
@@ -149,11 +151,18 @@ typical fitting.}
  modeled components (\code{a <- add.sd*exp(eta.sd); cp ~ add(a)}), which saem
  fits as \code{cp ~ add(a) + dnorm()}.
 
- "\code{r,s}" Uses the sandwich matrix to calculate the covariance, that is: \eqn{R^-1 \times S \times R^-1}
-
- "\code{r}" Uses the Hessian matrix to calculate the covariance as \eqn{2\times R^-1}
-
- "\code{s}" Uses the crossproduct matrix to calculate the covariance as \eqn{4\times S^-1}
+ "\code{r,s}", "\code{r}" and "\code{s}" compute no R or S matrix in
+ \code{saem}: all three invert the structural-theta block of the
+ estimation-phase information matrix (\code{fit$saem$Ha}, the matrix
+ \code{fim} inverts in full).  The result covers the estimated mu-referenced
+ thetas only, conditional on the \code{Omega} and residual parameters; a
+ theta without a random effect has no row in it and gets no standard error.
+ It is installed as \code{fit$covMethod == "Ha"}, or
+ \code{"|Ha|"} when the block was not positive definite and was
+ replaced by \code{sqrtm(Ha \%*\% Ha)}.  For the finite-difference R and S
+ covariances at the SAEM estimates use \code{setCov(fit, "r,s")}.  An integer
+ \code{covMethod} is a \code{foceiControl()} slot: \code{0} is no covariance,
+ \code{1}, \code{2} and \code{3} are \code{"r,s"}, \code{"r"} and \code{"s"}.
 
  "" Does not calculate the covariance step.}
 
@@ -161,6 +170,15 @@ typical fitting.}
 is requested, it is stashed here and computed post-fit at the converged
 estimates by the decoupled recompute engine (\code{setCov()} uses the same
 path); \code{NA} otherwise.}
+
+\item{covFallback}{what each \code{covMethod} falls back to when it gives no
+usable covariance: a named list, one element per method, each the ordered
+methods to try instead (\code{"sa"}, \code{"fim"}, \code{"linFim"} or
+\code{"Ha"}, the inverse of the information matrix's theta block).  The
+default is the established behaviour: \code{"sa"}, \code{"fim"} and
+\code{"analytic"} fall to \code{"linFim"} then \code{"Ha"}, and
+\code{"linFim"} to \code{"Ha"}.  A list you give replaces the default: a
+method it does not name has no fallback.}
 
 \item{covFull}{Boolean (default \code{TRUE}) indicating the covariance
 should include every estimated population parameter -- the structural and
@@ -170,7 +188,8 @@ structural-theta-only covariance is reported.  Ignored by
 \code{covMethod="sa"}, which is always full.}
 
 \item{nSaCov}{Number of iterations in the dedicated stochastic-approximation
-covariance phase used by \code{covMethod="sa"} (default \code{500}).  These
+covariance phase used by \code{covMethod="sa"}, a whole number of at least 1
+(default \code{500}).  These
 iterations run at the converged estimate (parameters frozen) and only
 resimulate the individual parameters to build the observed Fisher
 information; a larger value gives a less noisy covariance.  Ignored by other

@@ -5,18 +5,25 @@
 #include "armahead.h"
 #include "utilc.h"
 #include <lbfgsb3ptr.h>
+#include "lbfgsbTask.h"
 #include "censEst.h"
 #include "nearPD.h"
 #include "shi21.h"
+#include "fdHess.h"
+#include "covShortcut.h"
 #include "trustHessianUpdate.h"
 #include "foceiGrad.h"
 #include "logSumExp.h"
 #include "inner.h"
 #include "nmMcmcRng.h"
 #include "nmSeqSeed.h"
+#include "nmProgress.h"
 #include <cfloat>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
+#include <map>
+#include <functional>
 #include "odeSwap.h"
 #include "nmParallel.h"
 #include "imp.h"
@@ -264,6 +271,9 @@ void restoreFromEnvironment(Environment e);
 
 #define min2( a , b )  ( (a) < (b) ? (a) : (b) )
 #define max2( a , b )  ( (a) > (b) ? (a) : (b) )
+// What oldEta is reset to so the next likInner0() re-solves: NaN never compares
+// equal to an eta (the old -42 sentinel only made a match unlikely).
+#define INNER_ETA_RESET_TO NA_REAL
 // The per-model ind_solve() macros are gone: every solve now goes through
 // odeSwapSolveInd(slot, rxId), which takes the entry points from the slot registry
 // instead of naming a global rxSolveF struct.  One solve entry, so a model that is
@@ -295,6 +305,9 @@ void restoreFromEnvironment(Environment e);
 // #define _safe_log(a) log(a)
 #define _safe_zero(a) ((a) == 0 ? DBL_EPSILON : (a))
 //#define _safe_zero(a) (a)
+// Residual-variance floor shared by the objective and the analytic outer gradient
+// (#1132): below it R is constant, so both must treat its derivatives as zero.
+static const double foceiRFloor = std::sqrt(DBL_EPSILON);
 #define _safe_sqrt(a) ((a) <= 0 ? sqrt(DBL_EPSILON) : sqrt(a))
 //#define _safe_sqrt(a) sqrt(a)
 #define _as_dbleps(a) (fabs(a) < sqrt(DBL_EPSILON) ? ((a) < 0 ? -sqrt(DBL_EPSILON)  : sqrt(DBL_EPSILON)) : a)
@@ -470,6 +483,10 @@ struct focei_options {
   int nF;
   int nF2;
   int nG;
+  // Whether foceiOfvOptim()/outerGradNumOptim() record (parHistData) and print the
+  // evaluation; off while a curvature supplier probes points the outer optimizer did not
+  // ask for (.foceiOuterRecord).
+  bool recordOuter = true;
   int derivMethod;
   int covDerivMethod;
   int covMethod;
@@ -508,8 +525,10 @@ struct focei_options {
   int normType;
   double scaleCmin;
   double scaleCmax;
-  double scaleRangeLow;  // foceiControl(scaleCband): below this a theta scaleC falls back to |init|
-  double scaleRangeHigh; // above this a theta scaleC falls back to |init|
+  int scaleCdefault = scaleCdefaultUnit; // an NA scaleC defaults to 1/|init|, 1 at init 0
+  // lower/upper are on the optimizer's scale: foceiOuter() scales them only when
+  // it optimizes, and foceiCalcCov() unscales them only when they are
+  bool boundsScaled = false;
   double c1;
   double c2;
   double scaleTo;
@@ -619,11 +638,18 @@ struct focei_options {
   // self-init).  See warmZm(), updateZm() and selfInitZm().
   int warm;
 
-  // innerOpt: 1 = n1qn1, 2 = BFGS (unimplemented -- see #927, falls back to
-  // n1qn1: lbfgsb3C's C++ wrapper keeps shared mutable Rcpp state, not
-  // reentrant under the per-subject OpenMP loop), 3 = trust (RcppTrust),
-  // 4 = auto (the default; resolved to 1 or 3 in foceiSetup_).
+  // innerOpt: 1 = n1qn1, 2 = lbfgsb3c (thread-safe lbfgsb3Cts, #1160), 3 = trust
+  // (RcppTrust), 4 = auto (the default; resolved to 1 or 3 in foceiSetup_).
   int innerOpt;
+  // innerOpt="lbfgsb3c"'s own L-BFGS-B controls, separate from the outer lmm/factr/...
+  int innerLmm;
+  double innerFactr;
+  double innerPgtol;
+  double innerAbstol;
+  double innerReltol;
+  std::atomic<int> nLbfgsInner{0};  // lbfgsb3Cts calls (test evidence)
+  std::atomic<int> nLbfgsNoConv{0}; // calls not ending in 6, 7, 8 or 27
+  std::atomic<int> nLbfgsMaxit{0};  // of those, the ones that hit maxit (28)
   double trustConf; // confidence level defining the trust-region radius
   double trustRinit;
   double trustRmax;
@@ -631,6 +657,7 @@ struct focei_options {
   // tolerances -- independently settable, NOT tied to epsilon (which is
   // shared with n1qn1's unrelated "precision of estimate" criterion).
   double trustFterm;
+  int trustPolish = 0;
   double trustMterm;
   std::atomic<int> nTrustInner{0}; // per-fit count of trust_solve_c calls (test evidence)
   std::atomic<int> nTrustRestart{0}; // Omega-draw restarts taken after the nudges
@@ -643,6 +670,7 @@ struct focei_options {
   std::atomic<int> nTrustPush{0};    // converged flag withdrawn by the Newton-decrement gate
   std::atomic<int> nTrustRetry{0};   // radius-escalation retries attempted
   std::atomic<int> nTrustWarm{0};    // same-radius re-solves from the point just found
+  std::atomic<int> nTrustPolish{0};  // accepted Newton polish steps after a converged solve
   std::atomic<int> nTrustNudge{0};   // nudge-cascade attempts
   std::atomic<int> nTrustFail{0};    // inner solves still non-converged after every retry
   // per-fit count of calcEtaHessian() calls that used the hessianMethod=
@@ -727,6 +755,12 @@ struct focei_options {
   double scaleObjectiveTo;
   int initObj;
   double initObjective;
+  // Signed objective at the starting theta (natural scale, before any
+  // scaleObjective rescaling) and at the reported final theta, as re-evaluated by
+  // foceiOuterFinal(); compared by foceiFinalOfvWorse() to refuse a silently bad
+  // fit (issue 1114).  NA until set.
+  double initOfv = NA_REAL;
+  double finalOfv = NA_REAL;
   // Confidence Interval
   double ci;
   double sigdig;
@@ -769,7 +803,7 @@ struct focei_options {
   // silent fallback to R would otherwise be indistinguishable from success.
   int nAnalyticGradDirect = 0;
   // The FIRST direct gradient of the fit, on the NATURAL parameter scale (i.e. before
-  // dUnscaleParDx), together with the theta it was taken at.  Captured so a test can
+  // scaleAdjustGradScale), together with the theta it was taken at.  Captured so a test can
   // read by .foceiGradDirect(), which re-enters estimation at a fit's converged point
   // with maxOuterIterations = 0 and takes the gradient this stashes.
   std::vector<double> firstDirectGrad;
@@ -777,6 +811,7 @@ struct focei_options {
   int firstDirectGradSet = 0;
   int nFDGradFast = 0;      // # FD fallbacks while fast was requested
   int warnedAnalyticFallback = 0; // one-time FD-fallback warning latch
+  int warnedResetNoProgress = 0; // one-time "reset back to its bound" warning latch
   int warnedContribFallback = 0;  // one-time #1051 contributor FD-fallback latch
   double cholSEtol;
   double hessEps;
@@ -812,6 +847,8 @@ struct focei_options {
   // converged on -- every candidate was a failed attempt, so the selection had
   // nothing good to choose from (#1044).
   std::atomic<int> nInnerNoGood{0};
+  // eta Hessians whose nearPD repair had to change the diagonal
+  std::atomic<int> nNearPdDiag{0};
   // Inner solves where a failed attempt's candidate was dropped from the
   // selection because a succeeded one was available.  This is the count that
   // shows the rule is doing something, rather than that it merely exists.
@@ -950,7 +987,7 @@ struct focei_options {
 
   // Almquist Eq-48 warm-start extrapolation (fast=TRUE): per-subject d eta*/d(theta)
   // in the SCALED optimizer parameterization (etaP columns pre-multiplied by
-  // dUnscaleParDx), the scaled theta snapshot at gradient time, and a validity flag.
+  // scaleAdjustGradScale), the scaled theta snapshot at gradient time, and a validity flag.
   double *getaP = NULL;      // [neta * npars * nsub], indexed by id
   double *etaPTheta = NULL;  // [npars] scaled theta at the last analytic-gradient call
   int etaPValid = 0;
@@ -1034,6 +1071,7 @@ struct focei_options {
   double impCtol = -1.0;     // windowed-convergence tolerance on the objective (<0: derive from sigdig)
   int impNconvWindow = 10;   // trailing-iteration window for the convergence check
   bool impCov = false;       // experimental: compute the MC observed-information theta covariance
+  bool impFrozen = false;    // E-steps only: the parameters stay where they were supplied
   bool impQr = false;        // quasi-random (Sobol) importance samples (QRPEM)
   bool impQrShift = true;    // Cranley-Patterson random shift of the Sobol points
   bool impQrRefresh = true;  // redraw the shift each iteration (false: one shift/subject)
@@ -1389,14 +1427,34 @@ static inline int foceiIndSetupN(rx_solve* rxl) {
   return (nIndsFocei < cur) ? nIndsFocei : cur;
 }
 
-// FOCE eta=0 population-R cache.  rPop depends only on theta, so it is constant
-// across the whole inner optimization and only needs recomputing when theta
-// changes.  Keyed by subject id (getRxNsubAndMix).  The generation counter is
-// bumped in updateTheta() (single-threaded, before the parallel inner region)
-// and only read inside that region, so no locking is needed.
+// FOCE eta=0 population-R cache.  rPop depends only on the subject's thetas, so it is
+// constant across the whole inner optimization and only needs recomputing when they
+// change.  Keyed by subject id (getRxNsubAndMix).  An entry is recomputed when
+// updateTheta() has bumped the generation counter since it was filled, and also when the
+// thetas in the subject's par_ptr differ from the ones it was filled at
+// (_foceRPopTheta): the mu-referenced regression in innerOpt() (updateMuGroups) and the
+// per-subject finite differences (shi21LikTheta) move them without updateTheta().  The
+// counter is bumped single-threaded, before the parallel inner region, and each
+// subject's entry is touched only by the thread solving that subject, so no locking is
+// needed.
 static std::vector<arma::vec> _foceRPopCache;
 static std::vector<long> _foceRPopGen;
+static std::vector<std::vector<double> > _foceRPopTheta;
 static long _foceRPopCurGen = 0;
+
+// Whether the thetas in a subject's par_ptr are the ones its cached eta=0 R was
+// computed at; with `save`, record them instead.
+static inline bool foceRPopTheta(rx_solving_options_ind *ind, std::vector<double> &key,
+                                 bool save) {
+  if (save) key.resize(op_focei.ntheta);
+  else if (key.size() != op_focei.ntheta) return false;
+  for (unsigned int t = 0; t < op_focei.ntheta; ++t) {
+    double v = getIndParPtr(ind, op_focei.thetaTrans[t]);
+    if (save) key[t] = v;
+    else if (key[t] != v) return false;
+  }
+  return true;
+}
 
 // Parameter table
 std::vector<int> niter;
@@ -1484,14 +1542,6 @@ extern "C" void rxOptionsFreeFocei() {
   gradType.clear();
   niter.clear();
   niterGrad.clear();
-}
-
-//[[Rcpp::export]]
-void freeFocei(){
-  rxOptionsFreeFocei();
-  // Drop the peer-solver registry too: its entry points point into the fit's
-  // compiled model DLLs, so it must not outlive the fit.
-  odeSwapClearAll();
 }
 
 
@@ -1624,138 +1674,6 @@ void updateZm(focei_ind *indF){
   indF->uzm = 1;
   indF->mode = usable ? 2 : 1;
 }
-
-static inline double getScaleC(int i){
-  if (ISNA(op_focei.scaleC[i])) {
-    double aInit = fabs(op_focei.initPar[i]);
-    switch (op_focei.xPar[i]){
-    case 1: // log
-      op_focei.scaleC[i]=1.0;
-      break;
-    case 2: // diag^2
-      op_focei.scaleC[i]= (aInit == 0.0) ? 1.0 : 1.0/aInit;
-      break;
-    case 3: // exp(diag)
-      op_focei.scaleC[i] = 1.0/2.0;
-      break;
-    case 4: // Identity diagonal chol(Omega ^-1)
-    case 5: // off diagonal chol(Omega^-1)
-      op_focei.scaleC[i] = (aInit == 0.0) ? 1.0 : 1.0/(2.0*aInit);
-      break;
-    default: // linear / additive theta: derivative-based 1/|init|
-      op_focei.scaleC[i]= (aInit == 0.0) ? 1.0 : 1.0/aInit;
-      break;
-    }
-  }
-  // scaleCband (foceiControl(scaleCband=)): a theta whose derivative-based scaling
-  // constant lands outside [scaleRangeLow, scaleRangeHigh] is poorly scaled -- the
-  // 1/|init| default blows up for a small init and collapses for a large one.
-  // Fall back to the parameter's native magnitude |init| (NONMEM7 Appendix K,
-  // eq 15.2; |init| == 0 uses unit scaling).  In-band constants -- the common case
-  // -- are left untouched, so existing results are preserved.  Omega scalings keep
-  // their own formula (not guarded).
-  // Only guard a genuinely-computed derivative constant (> 0): a scaleC of exactly
-  // 0 is an uninitialized/unloaded value, not a singular formula to rescue, so
-  // leave it for the min/max clamp below (writing |init| back would corrupt a
-  // scaleC that a later real load -- or a non-outer method like the VAE inner that
-  // reads op_focei.scaleC directly -- expects untouched).
-  if (i < (int)op_focei.ntheta && op_focei.scaleC[i] > 0.0 &&
-      (op_focei.scaleC[i] < op_focei.scaleRangeLow ||
-       op_focei.scaleC[i] > op_focei.scaleRangeHigh)) {
-    // linear / additive theta: fall back to native |init| at any magnitude (|init|
-    // is the correct scale for a large-init additive theta, issue #641).  The
-    // bounded-transform midpoint fallback lives in the R .guardScaleC path.
-    double aInit = fabs(op_focei.initPar[i]);
-    op_focei.scaleC[i] = (aInit == 0.0) ? 1.0 : aInit;
-  }
-  return min2(max2(op_focei.scaleC[i], op_focei.scaleCmin),op_focei.scaleCmax);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// Likelihood for inner functions
-static inline double unscalePar(double *x, int i) {
-  double scaleTo = op_focei.scaleTo, C=getScaleC(i);
-  switch(op_focei.scaleType){
-  case 1: // normalized
-    return x[i]*op_focei.c2+op_focei.c1;
-    break;
-  case 2: // log vs linear scales and/or ranges
-    if (op_focei.normType <= 5){
-      scaleTo = (op_focei.initPar[i]-op_focei.c1)/op_focei.c2;
-    } else if (scaleTo == 0){
-      scaleTo=op_focei.initPar[i];
-    }
-    return (x[i]-scaleTo)*C + op_focei.initPar[i];
-    break;
-  case 3: // simple multiplicative scaling
-    if (op_focei.scaleTo != 0){
-      return x[i]*op_focei.initPar[i]/scaleTo;
-    } else {
-      return x[i];
-    }
-    break;
-  case 4: // log non-log multiplicative scaling
-    if (op_focei.scaleTo > 0){
-      switch (op_focei.xPar[i]){
-      case 1:
-        return (x[i]-scaleTo) + op_focei.initPar[i];
-      default:
-        return x[i]*op_focei.initPar[i]/scaleTo;
-      }
-    } else {
-      return x[i];
-    }
-  default:
-    if (op_focei.scaleTo > 0){
-      return (x[i]-scaleTo)*1 + op_focei.initPar[i];
-    } else {
-      return x[i];
-    }
-  }
-  return 0;
-}
-
-static inline double scalePar(double *x, int i){
-  double scaleTo = op_focei.scaleTo, C=getScaleC(i);
-  switch(op_focei.scaleType){
-  case 1:
-    return (x[i]-op_focei.c1)/op_focei.c2;
-  case 2:
-    if (op_focei.normType <= 5){
-      scaleTo = (op_focei.initPar[i]-op_focei.c1)/op_focei.c2;
-    } else if (scaleTo == 0){
-      scaleTo=op_focei.initPar[i];
-    }
-    return (x[i]-op_focei.initPar[i])/C + scaleTo;
-    break;
-  case 3: // simple multiplicative scaling
-    if (op_focei.scaleTo > 0){
-      return x[i]/op_focei.initPar[i]*op_focei.scaleTo;
-    } else {
-      return x[i];
-    }
-    break;
-  case 4: // log non-log multiplicative scaling
-    if (op_focei.scaleTo > 0){
-      switch (op_focei.xPar[i]){
-      case 1:
-        return (x[i]-op_focei.initPar[i]) + op_focei.scaleTo;
-      default:
-        return x[i]/op_focei.initPar[i]*op_focei.scaleTo;
-      }
-    } else {
-      return x[i];
-    }
-  default:
-    if (op_focei.scaleTo > 0){
-      return (x[i]-op_focei.initPar[i]) + op_focei.scaleTo;
-    } else {
-      return x[i];
-    }
-  }
-  return 0;
-}
-
 
 // Install the Omega-derived globals from an omega block on the ESTIMATION scale (the
 // parameterization op_focei.fullTheta[ntheta..] carries).  The theta -> Omega map lives in
@@ -1926,7 +1844,26 @@ static void foceiOmegaFromTheta(const double *omBlock) {
   }
 }
 
+// Push op_focei.fullTheta into every subject's solve parameters (no R calls).
+static inline void foceiPushFullTheta() {
+  rx = getRxSolve_();
+  for (int id = getRxNsub(rx); id--;){
+    rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(id));
+    for (unsigned int j = op_focei.ntheta; j--;){
+      setIndParPtr(ind, op_focei.thetaTrans[j], op_focei.fullTheta[j]);
+    }
+  }
+}
+
+// True while the covariance step owns the start of every inner problem (CovEtaStart,
+// below): innerOpt1() then starts from the eta it finds, with no start search or reset.
+static bool _covEtaStartOn = false;
+static void covEtaStartPin();
+
 void updateTheta(double *theta){
+  // Covariance step: every move of theta starts each subject's inner problem afresh from
+  // the fit's ETAs (a no-op otherwise)
+  covEtaStartPin();
   // Theta is the acutal theta
   unsigned int j, k;
   // covFdDirect: the FD-full covariance has already written the natural-scale
@@ -1936,18 +1873,10 @@ void updateTheta(double *theta){
   if (!op_focei.covFdDirect) {
     for (k = op_focei.npars; k--;){
       j=op_focei.fixedTrans[k];
-      op_focei.fullTheta[j] = unscalePar(theta, k);
+      op_focei.fullTheta[j] = scaleUnscalePar(&op_focei, theta, k);
     }
   }
-  // Update theta parameters in each individual
-  rx = getRxSolve_();
-  // Update theta parameters
-  for (int id = getRxNsub(rx); id--;){
-    rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(id));
-    for (j = op_focei.ntheta; j--;){
-      setIndParPtr(ind, op_focei.thetaTrans[j], op_focei.fullTheta[j]);
-    }
-  }
+  foceiPushFullTheta();
   // Update the mixture probabilities
   if (op_focei.mixIdxN != 0) {
     NumericVector curTheta(op_focei.ntheta);
@@ -1990,7 +1919,7 @@ void updateTheta(double *theta){
     std::copy(&theta[0], &theta[0] + op_focei.npars, &op_focei.theta[0]);
   }
   // Theta moved -> invalidate the FOCE eta=0 population-R cache (rPop is a
-  // function of theta only).  Bumped even for FOCEI (cache simply unused there).
+  // function of the thetas only).  Bumped even for FOCEI (cache simply unused there).
   _foceRPopCurGen++;
 }
 
@@ -1999,10 +1928,10 @@ arma::mat cholSE__(arma::mat A, double tol);
 typedef void (*gill83fn_type)(double *fp, double *theta, int id, int foceiGill);
 
 void gill83fnF(double *fp, double *theta, int, int foceiGill);
-void gill83fnLik(double *fp, double *theta, int id, int);
 int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
            double *theta, int cpar, double epsR, int K, double gillStep,
-           double fTol, int cid, gill83fn_type gill83fn, int foceiGill, double gillF);
+           double fTol, int cid, gill83fn_type gill83fn, int foceiGill, double gillF,
+           double d2Seed = NA_REAL);
 
 gill83fn_type gill83fnG = &gill83fnF;
 
@@ -2059,6 +1988,18 @@ private:
   OmegaScope &operator=(const OmegaScope &);
 };
 
+// Puts a variable back to the value it held at construction on every exit path,
+// including an Rcpp exception or a user interrupt.
+template <typename T> struct ScopedRestore {
+  T &ref;
+  T saved;
+  explicit ScopedRestore(T &r) : ref(r), saved(r) {}
+  ~ScopedRestore() { ref = saved; }
+private:
+  ScopedRestore(const ScopedRestore &);
+  ScopedRestore &operator=(const ScopedRestore &);
+};
+
 struct EtaRestoreGuard {
   rx_solving_options_ind *ind;
   arma::vec saved;
@@ -2087,6 +2028,11 @@ static inline void fdSaveVec(std::vector<double> &dst, const double *src, int n)
 static inline void fdRestoreVec(const std::vector<double> &src, double *dst) {
   if (!src.empty()) std::copy(src.begin(), src.end(), dst);
 }
+
+// TRUE from the start of restoreFitSolve_()'s rebuild until it succeeds: the global
+// solve is then whatever a failed or interrupted rxSolve_ left, so the covariance
+// step's guards do not write their saved state back into its subjects.
+static bool covFitSolveLost_ = false;
 
 // Everything innerOpt1() moves that must not leak out of a differencing call.
 //
@@ -2158,7 +2104,7 @@ struct FdInnerStateGuard {
     fInd->lik[0] = lik[0]; fInd->lik[1] = lik[1]; fInd->lik[2] = lik[2];
     fInd->setup = setup; fInd->uzm = uzm; fInd->mode = mode;
     fInd->stickyRecalcN2 = stickyRecalcN2;
-    {
+    if (!covFitSolveLost_) {
       rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(cid_));
       if (ind != NULL) setIndTolFactor(ind, tolFactor);
     }
@@ -2170,7 +2116,7 @@ struct FdInnerStateGuard {
 //
 // op_focei.n/etaM/etaS are the running population eta mean and variance (Welford).
 // innerOpt1() updates them whenever _innerParallel is 0, so a differencing phase that
-// runs serially -- the TV pass, and every foceiIndLik_ call -- would fold etas evaluated
+// runs serially -- the TV pass -- would fold etas evaluated
 // at perturbed thetas into the statistics that drive the standardized-eta reset
 // thresholds.  Holding _innerParallel at 1 for the whole phase is the primary fix; this
 // guard also restores them, and restores the did* diagnostic flags, which are set
@@ -2529,9 +2475,9 @@ static thread_local std::vector<double> _fdRefEta;
 //   * likInner0() decides whether to recompute by comparing the trial eta against oldEta,
 //     and NEITHER THETA NOR OMEGA IS PART OF THAT CHECK.  Pinning the reference eta makes a
 //     match the common case, so without this the previous perturbation's likelihood is
-//     returned and the difference is silently zero.  NA_REAL rather than the -42 sentinel
-//     used elsewhere: any comparison against NaN is unequal, so the recompute is forced
-//     exactly rather than merely made unlikely.  The caller's FdInnerStateGuard restores
+//     returned and the difference is silently zero.  NA_REAL, not INNER_ETA_RESET_TO:
+//     any comparison against NaN is unequal, so the recompute is forced exactly even if
+//     that define goes back to a finite sentinel.  The caller's FdInnerStateGuard restores
 //     oldEta.
 static inline void fdPinRefEtaForce(focei_ind *fInd, rx_solving_options_ind *ind,
                                     const std::vector<double> &refEta) {
@@ -2678,6 +2624,32 @@ static void getPopR(int id, arma::vec &rPop) {
   }
 }
 
+static int npIndSolveSize(rx_solving_options* op, rx_solving_options_ind* ind);  // fwd
+
+// getPopR() for likInner0().  getPopR() solves at eta = 0 into ind->solve, which the
+// inner solve that follows replaces -- except under freezeOde, where likInner0() does not
+// solve and reads the states the caller pinned there (vae's two-stage residual step):
+// keep those across the eta = 0 solve, on every exit path.
+struct FrozenSolveRestore {
+  rx_solving_options_ind *ind;
+  std::vector<double> frozen;
+  FrozenSolveRestore(rx_solving_options_ind *i, rx_solving_options *op) : ind(i) {
+    double *sv = getIndSolve(ind);
+    frozen.assign(sv, sv + npIndSolveSize(op, ind));
+  }
+  ~FrozenSolveRestore() { std::copy(frozen.begin(), frozen.end(), getIndSolve(ind)); }
+};
+
+static void getPopRKeepFrozen(int id, rx_solving_options_ind *ind, rx_solving_options *op,
+                              arma::vec &rPop) {
+  if (!op_focei.freezeOde) {
+    getPopR(id, rPop);
+    return;
+  }
+  FrozenSolveRestore keep(ind, op);
+  getPopR(id, rPop);
+}
+
 // One external per-observation contribution for likInner0: build the cotangents,
 // cycle the registry, and fold the result into the subject's llik / llikObs / lp.
 // `a` is the base d(f)/d(eta) matrix and `llikObsK` points at this record's
@@ -2787,6 +2759,17 @@ static inline double focei_tCensDll(bool lhsOk, int dist, int cens, double dv,
   return dCensNormal1((double)cens, dv, limit, dll, fT, r, df, dr);
 }
 
+// A failed likInner0() call.  likInner0() answers a call whose eta equals oldEta from
+// what the last call left (llik, lp, llikObs, tbsLik, nObs and ind->solve) without
+// solving.  By the time it fails it has overwritten ind->solve, and a failure part-way
+// through the observations has also overwritten llik, lp, llikObs, tbsLik and nObs with
+// partial values, while oldEta still names the last eta that succeeded.  Drop the cache
+// so a later call at that eta solves again instead of returning this call's leftovers.
+static inline double likInner0Fail(focei_ind *fInd) {
+  fInd->setup = 0;
+  return NA_REAL;
+}
+
 double likInner0(double *eta, int id) {
   rx = getRxSolve_();
   rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(id));
@@ -2824,22 +2807,24 @@ double likInner0(double *eta, int id) {
       setIndParPtr(ind, op_focei.etaTrans[j], eta[j]);
     }
     // FOCE: capture eta=0 population R before the inner solve overwrites
-    // ind->solve.  rPop is a function of theta only, so it is cached across inner
-    // iterations and recomputed only when updateTheta() bumps the generation
-    // counter -- keeping FOCE at one solve per inner iteration (like FOCEI) plus
-    // one eta=0 solve per subject per outer iteration, not two solves every time.
+    // ind->solve.  rPop is a function of the thetas only, so it is cached across
+    // inner iterations and recomputed only when they may have moved (see
+    // _foceRPopCache) -- keeping FOCE at one solve per inner iteration (like FOCEI)
+    // plus one eta=0 solve per subject per outer iteration, not two solves every time.
     // Only "nonmem" FOCE freezes R at the eta=0 population value; "foce+"
     // (foceType==1) keeps the live conditional R and needs no eta=0 solve.
     if (op_focei.interaction == 0 && op_focei.neta > 0 && op_focei.fo == 0 &&
         op_focei.foceType == 0) {
       if (id >= 0 && id < (int)_foceRPopGen.size()) {
-        if (_foceRPopGen[id] != _foceRPopCurGen) {
-          getPopR(id, _foceRPopCache[id]);
+        if (_foceRPopGen[id] != _foceRPopCurGen ||
+            !foceRPopTheta(ind, _foceRPopTheta[id], false)) {
+          getPopRKeepFrozen(id, ind, op, _foceRPopCache[id]);
           _foceRPopGen[id] = _foceRPopCurGen;
+          foceRPopTheta(ind, _foceRPopTheta[id], true);
         }
         rPopVec = _foceRPopCache[id];
       } else {
-        getPopR(id, rPopVec); // cache not sized (defensive); recompute directly
+        getPopRKeepFrozen(id, ind, op, rPopVec); // cache not sized (defensive); recompute directly
       }
     }
     // Reset the sticky-recalc counter only if this subject hasn't exhausted its
@@ -2891,8 +2876,7 @@ double likInner0(double *eta, int id) {
     bool isBadSolve = odeSwapIndBadSolveSlot(op, ind,
                                              predSolve ? odeSlotPred : odeSlotInner);
     if (isBadSolve){
-      return NA_REAL;
-      //throw std::runtime_error("bad solve");
+      return likInner0Fail(fInd);
     } else {
       // Update eta.
       arma::mat lp(fInd->lp, op_focei.neta, 1, false, true);
@@ -2934,6 +2918,29 @@ double likInner0(double *eta, int id) {
         arma::vec f0 = rf0mat.col(0);
         arma::vec r0 = rf0mat.col(1);
         arma::vec curEta = getCurEta(id);
+        // The legs below solve the pred model (shi21EtaF/R), so their base point is
+        // the pred model at this eta too.  rf0mat is the inner model's solve, which
+        // passed the bad-solve check above; it stays the base point where the pred
+        // model's solve at this eta is not finite.  The base point is solved only
+        // when a step calibration, a forward difference or a one-sided fallback
+        // reads it; a central difference from both legs does not.
+        bool f0Pred = predSolve, r0Pred = predSolve;
+        auto baseF = [&]() -> arma::vec & {
+          if (!f0Pred) {
+            f0Pred = true;
+            arma::vec p0 = shi21EtaF(curEta, id);
+            if (p0.is_finite()) f0 = p0;
+          }
+          return f0;
+        };
+        auto baseR = [&]() -> arma::vec & {
+          if (!r0Pred) {
+            r0Pred = true;
+            arma::vec p0 = shi21EtaR(curEta, id);
+            if (p0.is_finite()) r0 = p0;
+          }
+          return r0;
+        };
         arma::vec hEta(curEta.size());
         arma::vec grETA(fInd->nObs);
 
@@ -2948,7 +2955,7 @@ double likInner0(double *eta, int id) {
               switch(op_focei.eventType) {
               case 2: // central
                 fInd->etahf[ii] = shi21Central(shi21EtaF, curEta, h,
-                                               f0, grETA, id, ii,
+                                               baseF(), grETA, id, ii,
                                                op_focei.hessEpsInner, // ef,
                                                1.5,//double rl = 1.5,
                                                4.5,//double ru = 4.5,
@@ -2958,7 +2965,7 @@ double likInner0(double *eta, int id) {
                 break;
               case 3: // forward
                 fInd->etahf[ii] = shi21Forward(shi21EtaF, curEta, h,
-                                               f0, grETA, id, ii,
+                                               baseF(), grETA, id, ii,
                                                op_focei.hessEpsInner, // ef,
                                                1.5,  //double rl = 1.5,
                                                6.0,  //double ru = 6.0);;
@@ -2970,7 +2977,7 @@ double likInner0(double *eta, int id) {
                 switch(op_focei.eventType) {
                 case 2: //central
                   fInd->etahr[ii] = shi21Central(shi21EtaR, curEta, h,
-                                                 r0, grETA, id, ii,
+                                                 baseR(), grETA, id, ii,
                                                  op_focei.hessEpsInner, // ef,
                                                  1.5,//double rl = 1.5,
                                                  4.5,//double ru = 4.5,
@@ -2980,7 +2987,7 @@ double likInner0(double *eta, int id) {
                   break;
                 case 3: // forward
                   fInd->etahr[ii] = shi21Forward(shi21EtaR, curEta, h,
-                                                 r0, grETA, id, ii,
+                                                 baseR(), grETA, id, ii,
                                                  op_focei.hessEpsInner, // ef,
                                                  1.5,  //double rl = 1.5,
                                                  6.0,  //double ru = 6.0);;
@@ -3000,7 +3007,7 @@ double likInner0(double *eta, int id) {
                 // if this isn't true try backward
                 if (grPH.is_finite()) {
                   useForward = true;
-                  etaGradF.col(ii) = calcGradForward(f0, grPH,  fInd->etahf[ii]);
+                  etaGradF.col(ii) = calcGradForward(baseF(), grPH,  fInd->etahf[ii]);
                 }
               }
               if (!useForward) {
@@ -3009,7 +3016,9 @@ double likInner0(double *eta, int id) {
                 hEta[ii] -= fInd->etahf[ii];
                 grMH = shi21EtaF(hEta, id);
                 // central
-                etaGradF.col(ii) = calcGradCentral(grMH, f0, grPH,  fInd->etahf[ii]);
+                etaGradF.col(ii) = (grMH.is_finite() && grPH.is_finite()) ?
+                  arma::vec((grPH - grMH)/(2.0*fInd->etahf[ii])) :
+                  calcGradCentral(grMH, baseF(), grPH,  fInd->etahf[ii]);
               }
               if (op_focei.interaction == 1) {
                 // etaGradR
@@ -3020,14 +3029,16 @@ double likInner0(double *eta, int id) {
                 if (op_focei.eventType == 3) {
                   if (grPH.is_finite()) {
                     useForward = true;
-                    etaGradR.col(ii) = calcGradForward(r0, grPH,  fInd->etahr[ii]);
+                    etaGradR.col(ii) = calcGradForward(baseR(), grPH,  fInd->etahr[ii]);
                   }
                 }
                 if (!useForward) {
                   hEta = curEta;
                   hEta[ii] -= fInd->etahr[ii];
                   grMH = shi21EtaR(hEta, id);
-                  etaGradR.col(ii) = calcGradCentral(grMH, r0, grPH,  fInd->etahr[ii]);
+                  etaGradR.col(ii) = (grMH.is_finite() && grPH.is_finite()) ?
+                    arma::vec((grPH - grMH)/(2.0*fInd->etahr[ii])) :
+                    calcGradCentral(grMH, baseR(), grPH,  fInd->etahr[ii]);
                 }
               }
             }
@@ -3125,8 +3136,7 @@ double likInner0(double *eta, int id) {
           f = lhs[op_focei.predOffset]; // TBS is performed in the rxode2 rx_pred_ statement. This allows derivatives of TBS to be propagated
           dv = tbs(dv0);
           if (ISNA(f) || std::isnan(f) || std::isinf(f)) {
-            return NA_REAL;
-            //throw std::runtime_error("bad solve");
+            return likInner0Fail(fInd);
           }
           // npag/npb: a transform-both-sides (log/boxCox) endpoint whose
           // UNtransformed prediction is non-positive is a domain error (e.g. an
@@ -3183,9 +3193,9 @@ double likInner0(double *eta, int id) {
           fInd->tbsLik+=tbsJac;
           // fInd->err(k, 0) = lhs[0] - getIndDv(ind, k); // pred-dv
           if (ISNA(lhs[op_focei.predOffset + op_focei.neta + 1])){
-            return NA_REAL;
-            //throw std::runtime_error("bad solve");
+            return likInner0Fail(fInd);
           }
+          bool rFloored = false;
           if (dist == rxDistributionNorm) {
             r = lhs[op_focei.predOffset + op_focei.neta + 1];
             // "nonmem" FOCE: use the eta=0 population R (FOCEI and "foce+" keep
@@ -3200,8 +3210,14 @@ double likInner0(double *eta, int id) {
             if (op_focei.npResidScale != 1.0) {
               r *= op_focei.npResidScale * op_focei.npResidScale;
             }
-            if (r <= sqrt(std::numeric_limits<double>::epsilon())) {
+            // Floor a tiny variance rather than replacing it: swapping in 1 put a
+            // ~+16 cliff in the objective where a prediction crossed it (#1132).
+            // An exact zero (structural-zero prediction) keeps the legacy r=1.
+            if (r <= 0.0) {
               r = 1.0;
+            } else if (r < foceiRFloor) {
+              r = foceiRFloor;
+              rFloored = true;
             }
           } else {
             r = 1.0;
@@ -3286,12 +3302,19 @@ double likInner0(double *eta, int id) {
                   fpm = a(k, i) = lhs[op_focei.predOffset + i + 1]; // Almquist uses different a (see eq #15)
                   rp  = (dist == rxDistributionNorm)*lhs[op_focei.predOffset + i + op_focei.neta + 2];
                 }
-                if (fpm == 0.0) {
-                  a(k, i) = fpm = sqrt(DBL_EPSILON);
+                // The FOCEi (f, R) kernel keeps an exactly-zero d(f)/d(eta) and d(R)/d(eta)
+                // off zero.  A log-density row has no (f, R): fpm IS d(log-density)/d(eta)
+                // and is summed into lp as it stands, so a row the eta does not reach
+                // adds exactly 0 to the eta gradient.
+                if (dist == rxDistributionNorm) {
+                  if (fpm == 0.0) {
+                    a(k, i) = fpm = sqrt(DBL_EPSILON);
+                  }
+                  if (rp == 0.0) {
+                    rp = sqrt(DBL_EPSILON);
+                  }
                 }
-                if (rp == 0.0) {
-                  rp = sqrt(DBL_EPSILON);
-                }
+                if (rFloored) rp = 0.0;   // a floored R is flat in eta
                 c(k, i) = rp/_safe_zero(r);
                 //lp is eq 12 in Almquist 2015
                 // .5*apply(eps*fp*B + .5*eps^2*B*c - c, 2, sum) - OMGAinv %*% ETA
@@ -3427,9 +3450,16 @@ double likInner0(double *eta, int id) {
   return fInd->llik;
 }
 
+// The eta gradient at eta, or NA in every component when likInner0() fails there.  A
+// failed call leaves lp at the previous evaluation's value (a failed solve) or part-way
+// accumulated (a non-finite prediction), so lp is not a gradient then; the NA marks a
+// failed finite-difference leg of the inner Hessian, or a failed Shi21 probe, as failed.
 double *lpInner(double *eta, double *g, int id){
   focei_ind *fInd = &(inds_focei[id]);
-  likInner0(eta, id);
+  if (ISNAN(likInner0(eta, id))) {
+    std::fill_n(&g[0], op_focei.neta, NA_REAL);
+    return &g[0];
+  }
   std::copy(&fInd->lp[0], &fInd->lp[0] + op_focei.neta,
             &g[0]);
   return &g[0];
@@ -3570,6 +3600,33 @@ static bool calcModelEtaHessian(double *eta, int id, focei_ind *fInd,
   return !conditional || result.isFinite();
 }
 
+// What likInner0() leaves for readers that do not call it again: the subject's
+// per-observation log-likelihoods (reported with the fit as llikObs), and tbsLik and nObs
+// (read by LikInner2() right after, and by imp's AUTO setup; they do not depend on eta,
+// but an evaluation that fails part-way leaves them partial).  Saved after the evaluation
+// at the subject's eta and put back once the evaluations at other etas are done -- the
+// finite-difference legs of the inner Hessian, the adaptive quadrature nodes.  The rest of
+// likInner0()'s state stays at the last of those evaluations, which oldEta records, so
+// the next likInner0() call at the subject's eta solves again.
+struct LikInner0OutputGuard {
+  focei_ind *fInd;
+  std::vector<double> llikObs;
+  double tbsLik;
+  int nObs;
+  LikInner0OutputGuard(focei_ind *fInd, rx_solving_options_ind *ind) :
+    fInd(fInd), llikObs(fInd->llikObs, fInd->llikObs + getIndNallTimes(ind)),
+    tbsLik(fInd->tbsLik), nObs(fInd->nObs) {}
+  // The rest of the subject's state stays at the last re-solve, so the likelihood
+  // cache key is reset too: a later likInner0() at that point must solve again
+  // rather than pair it with the restored llikObs.
+  ~LikInner0OutputGuard() {
+    std::copy(llikObs.begin(), llikObs.end(), fInd->llikObs);
+    fInd->tbsLik = tbsLik;
+    fInd->nObs = nObs;
+    std::fill_n(fInd->oldEta, op_focei.neta, INNER_ETA_RESET_TO);
+  }
+};
+
 bool calcEtaHessian(double *eta, int likId, int id,
                     focei_ind *fInd,
                     rx_solving_options_ind *ind,
@@ -3596,9 +3653,8 @@ bool calcEtaHessian(double *eta, int likId, int id,
     // hessianMethod= (default "sr1", trustHessianUpdate.h): a non-fd method
     // builds this inner Hessian from consecutive Newton-step (eta, gradient)
     // pairs instead of a fresh finite difference every call. The FIRST call
-    // for this subject still seeds from one FD pass below (matching every
-    // other calcEtaHessian() consumer's one-time, not-per-iteration, cost);
-    // every later call updates the running fInd->etaHessQN instead.
+    // for this subject still seeds from one FD pass below; every later call
+    // updates the running fInd->etaHessQN instead.
     //
     // Gated on innerOpt=="trust" (3) in addition to hessianMethod!=fd:
     // calcEtaHessian() is also called from warmZm() (n1qn1's own Hessian
@@ -3615,25 +3671,18 @@ bool calcEtaHessian(double *eta, int likId, int id,
     // where every calcEtaHessian() call for a subject happens inside that
     // same reset-per-attempt loop, this is a non-issue.
     bool hessianQNEligible = (op_focei.hessianMethod != trustHessFd) && (op_focei.innerOpt == 3);
-    bool useQN = hessianQNEligible && fInd->etaHasPrevQN;
-    bool seedQN = hessianQNEligible && !fInd->etaHasPrevQN;
-
-    if (useQN) {
-      arma::mat Hqn(fInd->etaHessQN, op_focei.neta, op_focei.neta, false, true);
-      arma::vec etaPrev(fInd->etaPrevQN, op_focei.neta, false, true);
-      arma::vec gradPrev(fInd->etaGradPrevQN, op_focei.neta, false, true);
-      arma::vec etaV(eta, op_focei.neta);
-      arma::vec s = etaV - etaPrev;
-      arma::vec y = gr0 - gradPrev;
-      trustHessianUpdate(op_focei.hessianMethod, Hqn, s, y);
-      etaPrev = etaV;
-      gradPrev = gr0;
-      H = Hqn;
+    if (hessianQNEligible && fInd->etaHasPrevQN) {
       op_focei.nHessianQN.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      arma::vec grPH(op_focei.neta, fill::zeros);
-      arma::vec grMH(op_focei.neta, fill::zeros);
-
+    }
+    arma::mat Hqn(fInd->etaHessQN, op_focei.neta, op_focei.neta, false, true);
+    arma::vec etaPrev(fInd->etaPrevQN, op_focei.neta, false, true);
+    arma::vec gradPrev(fInd->etaGradPrevQN, op_focei.neta, false, true);
+    // x is eta itself, not a copy: the finite differences perturb it in place.
+    arma::vec x(eta, op_focei.neta, false, true);
+    // Note that since the gradient includes omegaInv*etam,
+    // op_focei.omegaInv(k, l) shouldn't be added.
+    H = trustHessian(hessianQNEligible ? op_focei.hessianMethod : trustHessFd,
+                     fInd->etaHasPrevQN, Hqn, etaPrev, gradPrev, x, gr0, [&]() {
       // Floor the Shi (2021) step search relative to each eta's own scale.
       // shi21's `ef` should be the noise floor of what it differences, but
       // hessEpsInner supplies only atolSens -- the gradient comes out of a solve
@@ -3656,101 +3705,29 @@ bool calcEtaHessian(double *eta, int likId, int id,
       bool haveOmegaDiag =
         (omegaInvCur.n_rows == (arma::uword)op_focei.neta &&
          omegaInvCur.n_cols == (arma::uword)op_focei.neta);
-
-      double h = 0;
-
+      arma::vec hMin(op_focei.neta);
       for (k = op_focei.neta; k--;) {
-        h = fInd->etahh[k];
-        double hMinK = op_focei.shi21hMin;
+        hMin[k] = op_focei.shi21hMin;
         if (haveOmegaDiag) {
           double v = omegaInvCur(k, k);
           if (R_finite(v) && v > 0.0) {
             double f = op_focei.hessEtaStepMin / std::sqrt(v);
-            if (f > hMinK) hMinK = f;
+            if (f > hMin[k]) hMin[k] = f;
           }
         }
-        if (hMinK > op_focei.shi21hMax) hMinK = op_focei.shi21hMax;
-        if (op_focei.optimHessType == 3 && h <= 0) {
-          arma::vec t(eta, op_focei.neta);
-          fInd->etahh[k] = shi21Forward(getGradForOptimHess, t, h,
-                                        gr0, grPH, id, k,
-                                        op_focei.hessEpsInner, //double ef = 7e-7,
-                                        1.5,  //double rl = 1.5,
-                                        6.0,  //double ru = 6.0);;
-                                        op_focei.shi21maxInner,  //maxiter=15
-                                        op_focei.shi21hMax, hMinK);
-          H.col(k) = grPH;
-          continue;
-        }
-        if (op_focei.optimHessType == 1 && h <= 0) {
-          // Central
-          arma::vec t(eta, op_focei.neta);
-          fInd->etahh[k] = shi21Central(getGradForOptimHess, t, h,
-                                        gr0, grPH, id, k,
-                                        op_focei.hessEpsInner, // ef,
-                                        1.5,//double rl = 1.5,
-                                        4.5,//double ru = 4.5,
-                                        3.0,//double nu = 8.0);
-                                        op_focei.shi21maxInner, // maxiter
-                                        op_focei.shi21hMax, hMinK);
-          H.col(k) = grPH;
-          continue;
-        }
-        // x + h
-        eta[k] += h;
-        lpInner(eta, &grPH[0], id);
-        bool forwardFinite =  grPH.is_finite();
-        if (op_focei.optimHessType == 3 && forwardFinite) { // forward
-          H.col(k) = (grPH-gr0)/h;
-          eta[k] -= h;
-          continue;
-        }
-
-        // x - h
-        eta[k] -= 2*h;
-        lpInner(eta, &grMH[0], id);
-        bool backwardFinite = grMH.is_finite();
-        if (op_focei.optimHessType == 1 &&
-            forwardFinite && backwardFinite) {
-          // central
-          eta[k] += h;
-          H.col(k) = (grPH-grMH)/(2.0*h);
-          continue;
-        }
-        if (forwardFinite && !backwardFinite) {
-          // forward difference
-          H.col(k) = (grPH-gr0)/h;
-          eta[k] += h;
-          continue;
-        }
-        if (!forwardFinite && backwardFinite) {
-          // backward difference
-          H.col(k) = (gr0-grMH)/h;
-          eta[k] += h;
-          continue;
-        }
-        // Both forward and backward evaluations were non-finite: H.col(k) is
-        // left at its zero-initialized default (no usable column), but eta[k]
-        // is currently x-h (from the "x - h" step above) and was never
-        // restored by any of the branches above -- do so here, or it stays
-        // permanently shifted for the rest of the fit (eta is the caller's
-        // persistent per-subject buffer, not a local copy).
-        eta[k] += h;
+        if (hMin[k] > op_focei.shi21hMax) hMin[k] = op_focei.shi21hMax;
       }
-    }
-    // symmetrize
-    H = 0.5*(H + H.t());
-    // Note that since the gradient includes omegaInv*etam,
-    // op_focei.omegaInv(k, l) shouldn't be added.
-    if (seedQN) {
-      arma::mat Hqn(fInd->etaHessQN, op_focei.neta, op_focei.neta, false, true);
-      arma::vec etaPrev(fInd->etaPrevQN, op_focei.neta, false, true);
-      arma::vec gradPrev(fInd->etaGradPrevQN, op_focei.neta, false, true);
-      Hqn = H;
-      etaPrev = arma::vec(eta, op_focei.neta);
-      gradPrev = gr0;
-      fInd->etaHasPrevQN = 1;
-    }
+      // Every leg re-solves the subject; put back what the caller's evaluation at
+      // eta left.
+      LikInner0OutputGuard _outputs(fInd, ind);
+      // optimHessType: 3 = forward, 1 = central.
+      return shi21Hessian(getGradForOptimHess, x, gr0, id,
+                          op_focei.optimHessType == 3 ? shi21HessForward :
+                          (op_focei.optimHessType == 1 ? shi21HessCentral : 0),
+                          fInd->etahh, op_focei.hessEpsInner,
+                          op_focei.shi21maxInner, op_focei.shi21hMax,
+                          hMin.memptr());
+    });
   } else if (op_focei.interaction) {
     int nO = getIndNallTimes(ind) - getIndNdoses(ind) - getIndNevid2(ind);
     arma::mat a(fInd->a, nO, op_focei.neta, false, true);
@@ -3805,8 +3782,11 @@ bool calcEtaHessian(double *eta, int likId, int id,
   if (conditional && forOptimization && op_focei.innerOpt == 3) return H.is_finite();
   if (!H.is_sympd()) {
     arma::mat H2;
-    if (nmNearPD(H2, H)) {
+    int how = nmNearPDKeepDiag(H2, H);
+    if (how > 0) {
       H=H2;
+      // reported after the fit; this can run on any thread
+      if (how == 2) op_focei.nNearPdDiag.fetch_add(1, std::memory_order_relaxed);
     }
   }
   if (fInd->doChol) {
@@ -3989,6 +3969,9 @@ double LikInner2(double *eta, int likId, int id) {
           }
         }
         arma::vec etahat(eta, op_focei.neta);
+        // Every node re-solves the subject; put back what the evaluation at the mode
+        // (above) left, or the fit reports the last node's llikObs.
+        LikInner0OutputGuard _outputs(fInd, ind);
         for (; curi < _aqn; curi++) {
           // Get the x and w for the current iteration
           arma::vec x = aqx.row(curi).t();
@@ -4061,7 +4044,7 @@ extern "C" double innerOptimF(int n, double *x, void *ex){
   focei_ind *fInd = &(inds_focei[*id]);
   if (fInd->badSolve == 1) return NA_REAL;
   double f = likInner0(x, *id);
-  if (ISNA(f)) {
+  if (ISNAN(f)) {
     fInd->badSolve = 1;
   }
   fInd->nInnerF++;
@@ -4087,7 +4070,7 @@ void innerCost(int *ind, int *n, double *x, double *f, double *g, int *ti, float
     // Function
     // Make sure ID remains installed
     *f = likInner0(x, *id);
-    if (ISNA(*f))  {
+    if (ISNAN(*f))  {
       fInd->badSolve=1;
     }
     fInd->nInnerF++;
@@ -4097,9 +4080,9 @@ void innerCost(int *ind, int *n, double *x, double *f, double *g, int *ti, float
     // RSprintf(" (nG: %d)\n", fInd->nInnerG);
     // }
   }
-  if (*ind==3 || *ind==4) {
-    // Gradient
-
+  // Gradient, unless the objective at this x just failed: then n1qn1 keeps the gradient
+  // it has, as it does on every later call once badSolve is set (see the top).
+  if ((*ind==3 || *ind==4) && fInd->badSolve != 1) {
     lpInner(x, g, *id);
     fInd->nInnerG++;
   }
@@ -4140,10 +4123,54 @@ static inline int innerEval(int id){
   focei_ind *fInd = &(inds_focei[id]);
   // Use eta
   double lik0 = likInner0(fInd->eta, id);
-  if (ISNA(lik0)) return 0;
+  if (ISNAN(lik0)) return 0;
   lik0 = LikInner2(fInd->eta, 0, id);
-  if (ISNA(lik0)) return 0;
+  if (ISNAN(lik0)) return 0;
   return 1;
+}
+
+// The trust arm's Newton-decrement gate leaves eta up to sqrt(trustFterm) short of the
+// mode, and the FOCEi log|H| term carries that to the objective to FIRST order, so the
+// outer objective depended on the warm start (#1152).  Finish a converged solve with
+// Newton steps down to trustFterm, each kept only if it does not ascend.  The gradient is
+// the exact sensitivity but the matrix is Gauss-Newton + Omega^-1, so convergence is
+// linear; past trustFterm the steps chase ODE solve noise and the fit gets worse.
+// `step`/`dist` are the Newton step and its parscale length at fInd->x; on
+// return fInd->x, fInd->g and `f` describe the last accepted point.  True if any step
+// was accepted.
+static bool trustPolishEta(int id, focei_ind *fInd, int npar, const std::vector<double> &parscale,
+                           arma::vec step, double dist, double &f) {
+  std::vector<double> x0(npar), x1(npar), g1(npar), h1((size_t)npar * npar);
+  bool accepted = false;
+  for (int k = 0; k < 4 && dist > op_focei.trustFterm; k++) {
+    std::copy(fInd->x, fInd->x + npar, x0.begin());
+    for (int i = 0; i < npar; i++) x1[i] = x0[i] + step[i];
+    double f1 = R_PosInf;
+    if (trustInnerObjfun(npar, x1.data(), &f1, g1.data(), h1.data(), (void*)(&id)) != 0 ||
+        !R_FINITE(f1) || f1 > f) {
+      std::copy(x0.begin(), x0.end(), fInd->x);
+      fInd->badSolve = 0;
+      break;
+    }
+    f = f1;
+    std::copy(g1.begin(), g1.end(), fInd->g);
+    accepted = true;
+    op_focei.nTrustPolish.fetch_add(1, std::memory_order_relaxed);
+    arma::mat Hk(h1.data(), npar, npar, false, true);
+    arma::vec gk(g1.data(), npar, false, true);
+    if (!arma::solve(step, Hk, -gk, arma::solve_opts::no_approx) ||
+        arma::dot(gk, step) >= 0) break;
+    double d2 = 0.0;
+    for (int i = 0; i < npar; i++) {
+      double si = step[i] * parscale[i];
+      d2 += si * si;
+    }
+    double distNew = std::sqrt(d2);
+    // a step that stops shrinking is at the solve's noise floor
+    if (!(distNew < 0.5 * dist)) break;
+    dist = distNew;
+  }
+  return accepted;
 }
 
 static inline int innerOpt1(int id, int likId) {
@@ -4151,9 +4178,9 @@ static inline int innerOpt1(int id, int likId) {
   focei_options *fop = &op_focei;
   if (op_focei.neta == 0) {
     double lik = likInner0(NULL, id);
-    if (ISNA(lik)) return 0;
+    if (ISNAN(lik)) return 0;
     lik = LikInner2(NULL, 0, id);
-    if (ISNA(lik)) return 0;
+    if (ISNAN(lik)) return 0;
     return 1;
   }
   fInd->nInnerF=0;
@@ -4176,18 +4203,18 @@ static inline int innerOpt1(int id, int likId) {
       fInd->setup = 0;
     }
   }
-  // innerOpt==2 ("BFGS") is intentionally left mapped to n1qn1: lbfgsb3C's C++
-  // wrapper (lbfgsb3x.cpp) writes a file-scope global Rcpp::List on every call,
-  // which is not reentrant under this per-subject OpenMP loop (#927) -- do not
-  // route it there without first fixing that.
   bool trustInner = (op_focei.innerOpt == 3);
-  bool n1qn1Inner = !trustInner;
+  bool n1qn1Inner = !trustInner && op_focei.innerOpt != 2;
   // mceta>=1: true when a sampled eta (not eta=0) was chosen as the starting point.
   bool mcetaSampleStart = false;
   // Use eta
   // Convert Zm to Hessian, if applicable.
   mat etaMat(fop->neta, 1, fill::zeros);
-  if (op_focei.mceta == -2 || op_focei.mceta == -1) {
+  if (_covEtaStartOn) {
+    // A covariance leg: start where CovEtaStart put the eta (the fit's EBE, or the reset
+    // point of an innerOptId() retry).  The searches and resets below would start the legs
+    // of one difference from different points.
+  } else if (op_focei.mceta == -2 || op_focei.mceta == -1) {
     // Almquist Eq-48 warm-start: extrapolate the next starting eta from the last
     // analytic gradient's EBE sensitivity, eta^0 = eta*_s + (d eta*/d theta)
     // (theta_now - theta_grad) (scaled space).  Only when the analytic gradient
@@ -4275,7 +4302,7 @@ static inline int innerOpt1(int id, int likId) {
       op_focei.nMcetaZero.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  if (!op_focei.calcGrad) {
+  if (!op_focei.calcGrad && !_covEtaStartOn) {
     if (op_focei.resetEtaSize <= 0) {
       if (op_focei.resetHessianAndEta){
         fInd->mode = 1;
@@ -4464,7 +4491,7 @@ static inline int innerOpt1(int id, int likId) {
            fInd->var, &epsilon,
            &mode, &maxInnerIterations, &nsim,
            &imp, fInd->zm, &izs, &rzs, &dzs, &id);
-    if (ISNA(f)) {
+    if (ISNAN(f)) {
       if (haveBest) { restoreBest(); break; }
       // No usable result in THIS pass; an earlier one may still have a
       // candidate, and the selection below will take it.
@@ -4514,7 +4541,7 @@ static inline int innerOpt1(int id, int likId) {
                &mode, &maxInnerIterations, &nsim,
                &imp, fInd->zm,
                &izs, &rzs, &dzs, &id);
-        if (ISNA(f)) {
+        if (ISNAN(f)) {
           if (!haveBest) {
             // Nothing usable in THIS pass.  haveBest is pass-local, so that is
             // not "nothing usable for this subject": an earlier starting point
@@ -4552,7 +4579,7 @@ static inline int innerOpt1(int id, int likId) {
                  fInd->var, &epsilon,
                  &mode, &maxInnerIterations, &nsim,
                  &imp, fInd->zm, &izs, &rzs, &dzs, &id);
-          if (ISNA(f)) {
+          if (ISNAN(f)) {
             if (!haveBest) {
               // Nothing usable in THIS pass.  haveBest is pass-local, so that is
               // not "nothing usable for this subject": an earlier starting point
@@ -4586,7 +4613,7 @@ static inline int innerOpt1(int id, int likId) {
                    fInd->var, &epsilon,
                    &mode, &maxInnerIterations, &nsim,
                    &imp, fInd->zm, &izs, &rzs, &dzs, &id);
-            if (ISNA(f)) {
+            if (ISNAN(f)) {
               if (!haveBest) {
                 // Nothing usable in THIS pass.  haveBest is pass-local, so that is
                 // not "nothing usable for this subject": an earlier starting point
@@ -4620,7 +4647,7 @@ static inline int innerOpt1(int id, int likId) {
                      fInd->var, &epsilon,
                      &mode, &maxInnerIterations, &nsim,
                      &imp, fInd->zm, &izs, &rzs, &dzs, &id);
-              if (ISNA(f)) {
+              if (ISNAN(f)) {
                 if (!haveBest) {
                   // Nothing usable in THIS pass.  haveBest is pass-local, so that is
                   // not "nothing usable for this subject": an earlier starting point
@@ -4652,7 +4679,7 @@ static inline int innerOpt1(int id, int likId) {
                        &mode, &maxInnerIterations, &nsim,
                        &imp, fInd->zm,
                        &izs, &rzs, &dzs, &id);
-                if (ISNA(f)) {
+                if (ISNAN(f)) {
                   if (!haveBest) {
                     // Nothing usable in THIS pass.  haveBest is pass-local, so that is
                     // not "nothing usable for this subject": an earlier starting point
@@ -4889,6 +4916,9 @@ static inline int innerOpt1(int id, int likId) {
               if (conv && pushDist > pushTol) {
                 conv = false;
                 op_focei.nTrustPush.fetch_add(1, std::memory_order_relaxed);
+              } else if (op_focei.trustPolish && conv && pushDist > 0.0 &&
+                         trustPolishEta(id, fInd, npar, parscale, step, pushDist, f)) {
+                keepBest();
               }
             }
             // Newton estimate unusable (singular/indefinite H, or not a
@@ -5020,49 +5050,78 @@ static inline int innerOpt1(int id, int likId) {
       }
     }
   } else {
-    int fail=0, fncount=0, grcount=0;
-    char msg[100];
-    fInd->badSolve = 0;
-    lbfgsb3C(npar, op_focei.lmm, fInd->x, op_focei.etaLower,
-             op_focei.etaUpper, op_focei.nbdInner, &f, innerOptimF, innerOptimG,
-             &fail, (void*)(&id), op_focei.factr,
-             op_focei.pgtol, &fncount, &grcount,
-             op_focei.maxInnerIterations, msg, 0, -1,
-             op_focei.abstol, op_focei.reltol, fInd->g);
-    if (ISNA(f)) {
-      if (haveBest) { restoreBest(); break; }
-      // No usable result in THIS pass; an earlier one may still have a
-      // candidate, and the selection below will take it.
-      if (!candEta.empty()) break;
-      if (_lastStart) return 0;
-      continue;
+    // innerOpt="lbfgsb3c": thread-safe L-BFGS-B (lbfgsb3Cts, #1160).  As in the trust
+    // arm, no exception may cross this OpenMP loop body.  The eta bounds are
+    // inactive (nbdInner is all 0).
+    // Where a failed attempt leaves the starting-point loop, mirroring the n1qn1 arm:
+    // 1 = break, 2 = continue, 3 = return 0.
+    int lbfgsExit = 0;
+    auto lbfgsFailExit = [&]() -> int {
+      if (!candEta.empty()) return 1;
+      return _lastStart ? 3 : 2;
+    };
+    // One solve from fInd->x; true when it converged without a bad solve.
+    auto lbfgsSolve = [&]() -> bool {
+      int fail = 0, fncount = 0, grcount = 0;
+      fInd->badSolve = 0;
+      op_focei.nLbfgsInner.fetch_add(1, std::memory_order_relaxed);
+      lbfgsb3Cts(npar, op_focei.innerLmm, fInd->x, op_focei.etaLower,
+                 op_focei.etaUpper, op_focei.nbdInner, &f, innerOptimF, innerOptimG,
+                 &fail, (void*)(&id), op_focei.innerFactr, op_focei.innerPgtol,
+                 &fncount, &grcount, op_focei.maxInnerIterations, NULL, 0, -1,
+                 op_focei.innerAbstol, op_focei.innerReltol, fInd->g);
+      // 6, 7, 8 = CONVERGENCE, 27 = x tolerance; 28 = maxit, 29 = invalid lmm
+      bool conv = (fail == 6 || fail == 7 || fail == 8 || fail == 27);
+      if (!conv) {
+        op_focei.nLbfgsNoConv.fetch_add(1, std::memory_order_relaxed);
+        if (fail == 28) op_focei.nLbfgsMaxit.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (!conv || fInd->badSolve == 1) {
+        // A latched NA, or an input error (13/29) that never calls fn, leaves f
+        // from an evaluation that may not be at x; re-evaluate at x.
+        fInd->badSolve = 0;
+        f = likInner0(fInd->x, id);
+        fInd->badSolve = ISNAN(f) ? 1 : 0;
+        conv = false;
+      }
+      return conv;
+    };
+    try {
+      bool ok = lbfgsSolve();
+      if (ISNAN(f)) {
+        lbfgsExit = lbfgsFailExit(); // haveBest is pass-local, so still false here
+      } else {
+        keepBest(); keepCand(ok);
+        // Same nudge cascade as n1qn1: retry while the eta did not leave its start.
+        if (fInd->doEtaNudge == 1 && op_focei.etaNudge != 0.0) {
+          const double nudge[4] = {op_focei.etaNudge, -op_focei.etaNudge,
+                                   -op_focei.etaNudge2, op_focei.etaNudge2};
+          double start = 0.0;
+          for (int k = 0; k < 4 && lbfgsExit == 0; k++) {
+            bool stuck = true;
+            for (int i = fop->neta; i--;) {
+              if (fInd->x[i] != start) { stuck = false; break; }
+            }
+            if (!stuck) break;
+            op_focei.didEtaNudge.store(1, std::memory_order_relaxed);
+            std::fill_n(fInd->x, fop->neta, nudge[k]);
+            start = nudge[k];
+            ok = lbfgsSolve();
+            if (ISNAN(f)) {
+              if (!haveBest) lbfgsExit = lbfgsFailExit();
+              else restoreBest();
+            } else { keepBest(); keepCand(ok); }
+          }
+        }
+      }
+    } catch (...) {
+      fInd->badSolve = 1;
+      if (haveBest) restoreBest();
+      else lbfgsExit = lbfgsFailExit();
     }
-    keepBest(); keepCand(fInd->badSolve == 0);
-    // if (fail != 6 && fail != 7 && fail != 8 && fail != 27){
-    //   // did not converge
-    //   if (fInd->doEtaNudge == 1 && op_focei.etaNudge != 0.0){
-    //  std::fill_n(fInd->x, fop->neta, op_focei.etaNudge);
-    //  fail=0;
-    //  lbfgsb3C(npar, op_focei.lmm, fInd->x, op_focei.etaLower,
-    //       op_focei.etaUpper, op_focei.nbdInner, &f, innerOptimF, innerOptimG,
-    //       &fail, (void*)(&id), op_focei.factr,
-    //       op_focei.pgtol, &fncount, &grcount,
-    //       op_focei.maxInnerIterations, msg, 0, -1,
-    //       op_focei.abstol, op_focei.reltol, fInd->g);
-    //  if (fail != 6 && fail != 7 && fail != 8 && fail != 27){
-    //    std::fill_n(fInd->x, fop->neta, -op_focei.etaNudge);
-    //    lbfgsb3C(npar, op_focei.lmm, fInd->x, op_focei.etaLower,
-    //       op_focei.etaUpper, op_focei.nbdInner, &f, innerOptimF, innerOptimG,
-    //       &fail, (void*)(&id), op_focei.factr,
-    //       op_focei.pgtol, &fncount, &grcount,
-    //       op_focei.maxInnerIterations, msg, 0, -1,
-    //       op_focei.abstol, op_focei.reltol, fInd->g);
-    //    if (fail != 6 && fail != 7 && fail != 8 && fail != 27){
-    //      std::fill_n(fInd->x, fop->neta, 0);
-    //    }
-    //  }
-    //   }
-    // }
+    if (lbfgsExit == 1) break;
+    if (lbfgsExit == 2) continue;
+    if (lbfgsExit == 3) return 0;
   }
   } // end of the starting-point loop (body deliberately not re-indented)
   // Apply the best candidate the restarts produced.  This is what makes the
@@ -5214,57 +5273,12 @@ static inline int innerOpt1(int id, int likId) {
     fInd->doChol = 0;
     double lik = LikInner2(fInd->eta, likId, id);
     fInd->doChol = doCholSave;
-    if (ISNA(lik)) return 0;
+    if (ISNAN(lik)) return 0;
   }
   return 1;
 }
 
 void parHistData(Environment e, bool focei);
-
-void foceiPrintInfo() {
-  arma::Row<int> etaTrans(op_focei.etaTrans, op_focei.neta);
-  arma::Row<int> nbdInner(op_focei.nbdInner, op_focei.neta);
-  arma::Row<int> xPar(op_focei.xPar, op_focei.ntheta + op_focei.omegan);
-  arma::Row<int> thetaTrans(op_focei.thetaTrans, op_focei.ntheta + op_focei.omegan);
-  arma::Row<int> fixedTrans(op_focei.fixedTrans, op_focei.ntheta + op_focei.omegan);
-  arma::Row<int> etaFD(op_focei.etaFD, op_focei.neta);
-
-  arma::rowvec fullTheta(op_focei.fullTheta, op_focei.ntheta+op_focei.omegan);
-  arma::rowvec theta(op_focei.theta, op_focei.ntheta+op_focei.omegan);
-  arma::rowvec initPar(op_focei.initPar, op_focei.ntheta+op_focei.omegan);
-  arma::rowvec scaleC(op_focei.scaleC, op_focei.ntheta+op_focei.omegan);
-
-  REprintf("etaTrans\n");
-  print(wrap(etaTrans));
-
-  REprintf("nbdInner\n");
-  print(wrap(nbdInner));
-
-  REprintf("xPar\n");
-  print(wrap(xPar));
-
-  REprintf("thetaTrans\n");
-  print(wrap(thetaTrans));
-
-  REprintf("fixedTrans\n");
-  print(wrap(fixedTrans));
-
-  REprintf("etaFD\n");
-  print(wrap(etaFD));
-
-  REprintf("fullTheta\n");
-  print(wrap(fullTheta));
-
-  REprintf("theta\n");
-  print(wrap(theta));
-
-  REprintf("initPar\n");
-  print(wrap(initPar));
-
-  REprintf("scaleC\n");
-  print(wrap(scaleC));
-}
-
 
 static inline void thetaReset00(NumericVector &thetaIni, NumericVector &omegaTheta, arma::mat &etaMat) {
   Function loadNamespace("loadNamespace", R_BaseNamespace);
@@ -5306,7 +5320,6 @@ static inline void thetaReset00(NumericVector &thetaIni, NumericVector &omegaThe
   thetaReset["aEpsC"] = aEpsC;
   thetaReset["c1"] = op_focei.c1;
   thetaReset["c2"] = op_focei.c2;
-  //foceiPrintInfo();
   parHistData(thetaReset, true);
   saveIntoEnvironment(thetaReset);
 }
@@ -5320,7 +5333,11 @@ static inline bool isFixedTheta(int m) {
   return true; // here the parameter is fixed
 }
 
-static inline bool thetaReset0(bool forceReset = false) {
+// trig: the etas whose drift fired the reset (NULL for a forced reset).  The
+// reset goes ahead only if it moves the theta of one of them: shifting only the
+// others leaves the drift that fired it (its theta pinned at a bound), and the
+// next check fires the reset again.
+static inline bool thetaReset0(bool forceReset = false, const std::vector<bool> *trig = NULL) {
   if (op_focei.isSaem) return false;
   NumericVector thetaIni(op_focei.ntheta);
   NumericVector thetaUp(op_focei.ntheta);
@@ -5331,17 +5348,30 @@ static inline bool thetaReset0(bool forceReset = false) {
   // matching eta re-centering must use the applied shift, not etaM (issue #454).
   NumericVector appliedShift(op_focei.muRefN, 0.0);
   bool doAdjust = false;
-  for (int ii = (int)op_focei.ntheta; ii--;) {
-    thetaIni[ii] = unscalePar(op_focei.fullTheta, ii);
-    if (R_FINITE(op_focei.lower[ii])) {
-      thetaDown[ii] = unscalePar(op_focei.lower, ii);
-    } else {
-      thetaDown[ii] = R_NegInf;
+  Function loadNamespace2("loadNamespace", R_BaseNamespace);
+  Environment nlmixr2b = loadNamespace2("nlmixr2est");
+  Environment thetaResetEnv = nlmixr2b[".thetaReset"];
+  // where an earlier reset of this fit clamped each theta to a bound (NA: not
+  // clamped); a reset that would clamp it there again makes no progress
+  NumericVector clampedAt(op_focei.ntheta, NA_REAL);
+  if (thetaResetEnv.exists("clampedAt") && TYPEOF(thetaResetEnv["clampedAt"]) == REALSXP) {
+    NumericVector ca = thetaResetEnv["clampedAt"];
+    if (ca.size() == (R_xlen_t)op_focei.ntheta) std::copy(ca.begin(), ca.end(), clampedAt.begin());
+  }
+  int noProgress = -1;
+  // fullTheta holds the thetas on their own scale; the bounds are kept by
+  // optimizer index, on the optimizer's scale only while boundsScaled
+  std::copy(&op_focei.fullTheta[0], &op_focei.fullTheta[0] + op_focei.ntheta, thetaIni.begin());
+  std::fill(thetaDown.begin(), thetaDown.end(), R_NegInf);
+  std::fill(thetaUp.begin(), thetaUp.end(), R_PosInf);
+  for (unsigned int k = op_focei.npars; k--;) {
+    int j = op_focei.fixedTrans[k];
+    if (j >= (int)op_focei.ntheta) continue;
+    if (R_FINITE(op_focei.lower[k])) {
+      thetaDown[j] = op_focei.boundsScaled ? scaleUnscalePar(&op_focei, op_focei.lower, k) : op_focei.lower[k];
     }
-    if (R_FINITE(op_focei.upper[ii])) {
-      thetaUp[ii]= unscalePar(op_focei.upper, ii);
-    } else {
-      thetaUp[ii] = std::numeric_limits<double>::infinity();
+    if (R_FINITE(op_focei.upper[k])) {
+      thetaUp[j] = op_focei.boundsScaled ? scaleUnscalePar(&op_focei, op_focei.upper, k) : op_focei.upper[k];
     }
   }
   double ref=0;
@@ -5370,11 +5400,20 @@ static inline bool thetaReset0(bool forceReset = false) {
             clamped = true;
           }
           double shift = ref - thetaIni[ij];
-          if (!clamped || fabs(shift) > 1e-8 * (1.0 + fabs(thetaIni[ij]))) {
+          bool again = clamped && R_FINITE(clampedAt[ij]) &&
+            fabs(ref - clampedAt[ij]) <= 1e-8 * (1.0 + fabs(ref));
+          if (again) {
+            // An earlier reset already put it at this bound and the drift came
+            // back once the optimizer moved it inward: resetting again only
+            // repeats that reset, so let the optimizer go on.
+            adjustEta[ii] = false;
+            noProgress = ij;
+          } else if (!clamped || fabs(shift) > 1e-8 * (1.0 + fabs(thetaIni[ij]))) {
             appliedShift[ii] = shift;
             thetaIni[ij] = ref;
             adjustEta[ii] = true;
-            doAdjust = true;
+            clampedAt[ij] = clamped ? ref : NA_REAL;
+            if (trig == NULL || (ii < trig->size() && (*trig)[ii])) doAdjust = true;
           } else {
             // Already pinned at the bound: leave it be so a parameter that
             // wants to move past its bound does not force an endless reset.
@@ -5388,9 +5427,26 @@ static inline bool thetaReset0(bool forceReset = false) {
       adjustEta[ii] = false;
     }
   }
+  CharacterVector thetaNames;
+  bool haveNames = false;
+  if (thetaResetEnv.exists("thetaNames") &&
+      TYPEOF(thetaResetEnv["thetaNames"]) == STRSXP) {
+    thetaNames = as<CharacterVector>(thetaResetEnv["thetaNames"]);
+    haveNames = (thetaNames.size() >= (R_xlen_t)op_focei.ntheta);
+  }
+  if (noProgress >= 0 && !op_focei.warnedResetNoProgress) {
+    op_focei.warnedResetNoProgress = 1;
+    if (haveNames) {
+      std::string nm = as<std::string>(thetaNames[noProgress]);
+      warning(_("reset of '%s' skipped: back at its bound"), nm.c_str());
+    } else {
+      warning(_("reset of theta %d skipped: back at its bound"), noProgress + 1);
+    }
+  }
   if (!doAdjust && !forceReset) {
     return false;
   }
+  thetaResetEnv["clampedAt"] = clampedAt;
 
   arma::mat etaMat(getRxNsubAndMix(rx), op_focei.neta);
 
@@ -5417,18 +5473,6 @@ static inline bool thetaReset0(bool forceReset = false) {
   // begins out of range; if the bounds are themselves infeasible (lower >=
   // upper) stop with an informative error rather than continue silently.
   bool didClamp = false;
-  CharacterVector thetaNames;
-  bool haveNames = false;
-  {
-    Function loadNamespace2("loadNamespace", R_BaseNamespace);
-    Environment nlmixr2b = loadNamespace2("nlmixr2est");
-    Environment thetaResetEnv = nlmixr2b[".thetaReset"];
-    if (thetaResetEnv.exists("thetaNames") &&
-        TYPEOF(thetaResetEnv["thetaNames"]) == STRSXP) {
-      thetaNames = as<CharacterVector>(thetaResetEnv["thetaNames"]);
-      haveNames = (thetaNames.size() >= (R_xlen_t)op_focei.ntheta);
-    }
-  }
   for (int ii = (int)op_focei.ntheta; ii--;) {
     if (isFixedTheta(ii)) continue;
     if (thetaDown[ii] >= thetaUp[ii]) {
@@ -5467,19 +5511,17 @@ void thetaReset(double size, double n){
   // the 1/sqrt(etaS) scaling (etaS is the Welford sum of squares, not
   // the variance).
   mat etaRes = std::sqrt(n) * (op_focei.eta1SDmean % op_focei.etaM); //op_focei.cholOmegaInv * etaMat;
-  double res=0;
+  std::vector<bool> trig(etaRes.n_rows, false);
+  bool fire = false;
   for (unsigned int j = etaRes.n_rows; j--;) {
     if (isMuRefCovProtected(j)) continue; // mu-ref-covariate etas never trigger a theta reset
-    res = etaRes(j, 0);
-    res = res < 0 ? -res : res;
-    if (res >= size) { // Says reset;
-      if (thetaReset0()) {
-        if (op_focei.didEtaReset==1) {
-          warning(_("mu-referenced Thetas were reset during optimization; (Can control by foceiControl(resetThetaP=.,resetThetaCheckPer=.,resetThetaFinalP=.))"));
-        }
-        stop("theta reset");
-      }
+    if (std::fabs(etaRes(j, 0)) >= size) trig[j] = fire = true;
+  }
+  if (fire && thetaReset0(false, &trig)) {
+    if (op_focei.didEtaReset==1) {
+      warning(_("mu-referenced Thetas were reset during optimization; (Can control by foceiControl(resetThetaP=.,resetThetaCheckPer=.,resetThetaFinalP=.))"));
     }
+    stop("theta reset");
   }
 }
 
@@ -5942,7 +5984,13 @@ static void fillEtaRestartSamples(rx_solve *rx) {
   }
 }
 
+// The (optimizer-coordinate) theta of the last foceiLik0() evaluation: each subject's
+// lik[0] and mixture responsibilities are that evaluation's.  Emptied by innerOpt(),
+// which rewrites lik[0], and refilled by foceiLik0() after it.
+static std::vector<double> _foceiLik0Theta;
+
 void innerOpt() {
+  _foceiLik0Theta.clear();
   rx = getRxSolve_();
   rx_solving_options *op = getSolvingOptions(rx);
   int cores = getOpCores(op);
@@ -6009,7 +6057,7 @@ void innerOpt() {
   // freezeOde: evaluate each subject's density at its (restored) base EBE with a
   // single innerEval -- no eta re-optimization -- reusing the frozen ODE states.
   if (op_focei.maxInnerIterations <= 0 || op_focei.freezeOde){
-    std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0); // All etas = -42;  Unlikely if normal
+    std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
     for (int id = 0; id < getRxNsubAndMix(rx); id++){
       focei_ind *indF = &(inds_focei[id]);
       indF->doChol = 1;
@@ -6223,9 +6271,10 @@ static inline double foceiLik0(double *theta) {
   }
   // Now reset the saved ETAs
   if (op_focei.neta !=0) {
-    // All etas = -42;  Unlikely if normal
-    std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0);
+   
+    std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
   }
+  _foceiLik0Theta.assign(theta, theta + op_focei.npars);
   return lik;
 }
 
@@ -6625,7 +6674,59 @@ static void priorGradHessFor(const std::vector<int> &idx, arma::vec &grad, arma:
   Hp = 0.5 * (Hp + Hp.t());
 }
 
+// Is the final (re-evaluated) objective `finalOfv` worse than the starting
+// objective `initOfv`?  True when the final value is not finite, or exceeds the
+// initial one by more than 1% of its magnitude (with an absolute floor of 0.1
+// objective units so an initial objective near 0 still has a band).  The band
+// absorbs the small drift a final re-evaluation carries (its inner solve runs at
+// the covariance-step tolerances), while any real optimizer or inner-problem
+// failure is orders of magnitude outside it.  A non-finite initOfv cannot happen
+// after foceiOfv0()'s initial-evaluation stop()s, so it is treated as "not worse"
+// rather than raising a second, less specific condition.
+static inline bool foceiFinalOfvWorse(double initOfv, double finalOfv) {
+  if (!R_FINITE(initOfv)) return false;
+  if (!R_FINITE(finalOfv)) return true;
+  double band = max2(0.01 * std::fabs(initOfv), 0.1);
+  return finalOfv > initOfv + band;
+}
+
+//[[Rcpp::export(".foceiFinalOfvWorse")]]
+bool foceiFinalOfvWorseR(double initOfv, double finalOfv) {
+  return foceiFinalOfvWorse(initOfv, finalOfv);
+}
+
+// The "this evaluation is a gradient leg" flag, for tests: it must be 0 whenever no
+// gradient or covariance computation is in progress, in particular after a fit
+// returns (issue 1114 and its covariance-step sibling both left it set).
+//[[Rcpp::export(".foceiCalcGrad")]]
+int foceiCalcGradGet() {
+  return op_focei.calcGrad;
+}
+
+// Whether the covariance step may reuse objective evaluations it already made (the
+// environment variable NLMIXR2EST_COV_NO_REUSE turns it off, so tests can show the
+// reuse gives the numbers a recomputation does).
+static bool covReuseOn() {
+  const char *v = std::getenv("NLMIXR2EST_COV_NO_REUSE");
+  return v == NULL || v[0] == '\0' || v[0] == '0';
+}
+
+// Objective evaluations of the covariance step, counted by stage (e$covEvals); a
+// diagnostic of what each stage costs.  _covStage is -1 outside the step.
+enum CovStage { covStCenter = 0, covStGill, covStR, covStS, covStFullCenter, covStFullGill,
+                covStFullR, covStFullS, covStN };
+static const char *covStageNames[covStN] = {"center", "gill", "r", "s", "fullCenter",
+                                             "fullGill", "fullR", "fullS"};
+static int _covStage = -1;
+static int _covEvals[covStN] = {0};
+struct CovStageScope {
+  int saved;
+  explicit CovStageScope(int s) : saved(_covStage) { _covStage = s; }
+  ~CovStageScope() { _covStage = saved; }
+};
+
 static inline double foceiOfv0(double *theta){
+  if (_covStage >= 0) _covEvals[_covStage]++;
   if (op_focei.objfRecalN != 0 && !op_focei.calcGrad) {
     op_focei.stickyRecalcN1++;
     if (op_focei.indTolRelax) {
@@ -6680,6 +6781,7 @@ static inline double foceiOfv0(double *theta){
   if (!op_focei.initObj){
     op_focei.initObj=1;
     op_focei.initObjective=std::fabs(ret);
+    op_focei.initOfv = ret;
     if (std::isnan(ret)){
       stop(_("NaN while evaluating initial objective function"));
     } else if (std::isinf(ret)) {
@@ -6712,16 +6814,6 @@ static inline double foceiOfv0(double *theta){
   }
   nnOuterStep(ret);
   return ret;
-}
-
-//[[Rcpp::export]]
-double foceiLik(NumericVector theta){
-  return foceiLik0(&theta[0]);
-}
-
-//[[Rcpp::export]]
-double foceiOfv(NumericVector theta){
-  return foceiOfv0(&theta[0]);
 }
 
 void foceiPhiOne(Environment e, List &retC, List &retH, int mixest) {
@@ -6837,11 +6929,6 @@ SEXP foceiEtas(Environment e, bool bestMixEst=false) {
 }
 
 
-// R style optimfn
-extern "C" double outerLikOpim(int n, double *par, void *ex){
-  return(foceiOfv0(par));
-}
-
 // Gill 1983 Chat
 static inline double Chat(double phi, double h, double epsA){
   if (phi == 0) return 2*epsA/(h*h);
@@ -6867,13 +6954,12 @@ static inline double phiB(double f, double fn, double h){
 }
 
 // Call R function for gill83
-double gillF=NA_REAL;
 int gillThetaN=0;
 Environment gillRfnE_;
 // Fit environment + gate for the analytic ("fast") outer gradient.  The gate is
 // TRUE only while the outer optimizer's gradient callback is live (set in
-// foceiOuter around the optimizer switch), so foceiS's own numericGrad use and
-// the exported foceiNumericGrad are unaffected.
+// foceiOuter around the optimizer switch), so foceiS's own numericGrad use is
+// unaffected.
 Environment op_foceiFitEnv;
 bool op_foceiFitEnvSet = false;
 bool op_foceiUseAnalyticGrad = false;
@@ -6882,13 +6968,28 @@ extern "C" int nlmixr2FoceiOuterHessian(const double*, int, double, double*);
 Environment baseEnv = Environment::base_env();
 Function doCall = baseEnv["do.call"];
 Function gillRfn_ = baseEnv["invisible"];
+NumericVector gillRlike_; // the caller's parameter vector, for its attributes
 int gillPar = 0;
-double gillLong = false;
+// x (length n) as a copy of the caller's vector `like` (its names and other
+// attributes), so the objective never holds a vector that is later perturbed.
+static NumericVector nlmixr2RObjArg(SEXP like, const double *x, int n) {
+  NumericVector xc = (!Rf_isNull(like) && Rf_xlength(like) == n) ?
+    NumericVector(clone(like)) : NumericVector(n);
+  std::copy(x, x + n, xc.begin());
+  return xc;
+}
+
+// what(x) by do.call on nlmixr2RObjArg(like, x, n).
+static double nlmixr2RObjAt(Function what, SEXP envir, const double *x, int n,
+                            SEXP like) {
+  List par(1);
+  par[0] = nlmixr2RObjArg(like, x, n);
+  return as<double>(doCall(_["what"] = what, _["args"]=par, _["envir"]=envir));
+}
+
 double gillRfn(double *theta){
   List par(1);
-  NumericVector par0(gillThetaN);
-  std::copy(&theta[0], &theta[0]+gillThetaN,par0.begin());
-  par[0] = par0;
+  par[0] = nlmixr2RObjArg(gillRlike_, theta, gillThetaN);
   NumericVector ret = as<NumericVector>(doCall(_["what"] = gillRfn_, _["args"]=par, _["envir"]=gillRfnE_));
   if (ret.size() == 1){
     return(ret[0]);
@@ -6934,6 +7035,11 @@ void gill83fnF(double *fp, double *theta, int, int foceiGill) {
 // cpar is the parameter we are considering
 // epsR is the relative error for the problem
 // K is the maximum number of iterations before giving up on searching for the best interval.
+// d2Seed, when a positive number, is an estimate of the second derivative along cpar: the
+// search starts from the step whose condition error Ch would be 0.05.  A search that
+// grows its step by gillStep = 2 from gillStep*hbar stops with Ch in (0.025, 0.1], so
+// the seed lands mid-range, inside the window [0.001, 0.1] by a factor of 2.  The
+// acceptance test is the same either way.
 // Returns 1 -- Success
 //         2 -- Large error; Derivative estimate error 50% or more of the derivative
 //         3 -- Function constant or nearly constant for this parameter
@@ -6942,11 +7048,19 @@ void gill83fnF(double *fp, double *theta, int, int foceiGill) {
 int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
            double *theta, int cpar, double epsR, int K, double gillStep,
            double fTol, int cid, gill83fn_type gill83fn, int foceiGill,
-           double gillF) {
+           double gillF, double d2Seed) {
   if (foceiGill == 1) op_focei.calcGrad=1;
   double f , x, hbar, h0, fp, fn=NA_REAL, phif, phib, phic, phicc = 0, phi, Chf, Chb,
-    Ch, hs, hphi, hk, tmp, ehat, lasth, lastht=NA_REAL, lastfpt=NA_REAL, phict=NA_REAL;
+    Ch, hs, hphi, hk, tmp, tmpPhi, ehat, lasth, lastht=NA_REAL, lastfpt=NA_REAL, phit=NA_REAL;
 
+  // the fallback trial: the last one with |phif| < fTol not dominated by roundoff
+  auto saveTrial = [&]() {
+    if (fTol != 0 && fabs(phif) < fTol && Ch <= 0.1) {
+      lastfpt = fp;
+      lastht = lasth;
+      phit = phi;
+    }
+  };
   f = gillF;
   int k = 0;
   // Relative error should be given by the tolerances, I believe.
@@ -6955,6 +7069,15 @@ int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
   // FD1: // Initialization
   hbar = 2*(1+std::fabs(x))*_safe_sqrt(epsA/(1+std::fabs(f)));
   h0 = gillStep*hbar;
+  // Ch = 4*epsA/(h^2*|f''|) = 0.05
+  if (R_FINITE(d2Seed) && d2Seed > 0 && epsA > 0) h0 = std::sqrt(80.0*epsA/d2Seed);
+  if (K <= 0) {
+    // no optimal interval is determined: report the one the search would start
+    // from, not assessed (no derivative estimate)
+    *hf = *hphif = h0;
+    *df = *df2 = *ef = NA_REAL;
+    return 0;
+  }
   lasth=h0;
   theta[cpar] = x + h0;
   gill83fn(&fp, theta, cid, foceiGill);
@@ -6969,6 +7092,7 @@ int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
   Chf = Chat(phif, h0, epsA);
   Chb = Chat(phib, h0, epsA);
   Ch  = ChatP(phi, h0, epsA);
+  saveTrial();
   hs  = -1;
   hphi=hbar; // Not defined in Gill, but used for central difference switch if there are problems
   // FD2:  // Decide if to accept the interval
@@ -6979,17 +7103,7 @@ int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
   if (0.001 <= Ch && Ch <= 0.1){
     phicc=phic;
     hphi=h0;
-    if (fTol != 0 && fabs(phif) < fTol){
-      lastfpt = fp;
-      phict=phic;
-      lastht  = lasth;
-    }
     goto FD5;
-  }
-  if (fTol != 0 && fabs(phif) < fTol){
-    lastfpt = fp;
-    lastht  = lasth;
-    phict=phic;
   }
   if (Ch < 0.001){
     goto FD4;
@@ -7011,25 +7125,17 @@ int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
   Chf = Chat(phif, hk, epsA);
   Chb = Chat(phib, hk, epsA);
   Ch = ChatP(phi, hk, epsA);
+  saveTrial();
   if (hs < 0 && max2(Chf, Chb) <= 0.1){
     hs = hk;
   }
   if (Ch <= 0.1){
     phicc=phic;
     hphi = hk;
-    if (fTol != 0 && fabs(phif) < fTol){
-      lastfpt = fp;
-      lastht  = lasth;
-      phict=phic;
-    }
     goto FD5;
   }
-  if (fTol != 0 && fabs(phif) < fTol){
-    lastfpt = fp;
-    lastht  = lasth;
-    phict=phic;
-  }
-  if (k == K) goto FD6;
+  // >=, not ==: k is incremented before this test, so K = 0 would never stop
+  if (k >= K) goto FD6;
   goto FD3;
  FD4: // Decrease h
   k++;
@@ -7044,39 +7150,29 @@ int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
   phif = phiF(f, fp, hk);
   phib = phiB(f, fn, hk);
   tmp=phic;
+  tmpPhi=phi;
   phic = phiC(fp, fn, hk);
   phi = Phi(fp, f, fn, hk);
   Chf = Chat(phif, hk, epsA);
   Chb = Chat(phib, hk, epsA);
   Ch = ChatP(phi, hk, epsA);
+  saveTrial();
   if (Ch > .1){
+    // back off to h_{k-1}: FD5 uses its curvature, not the rejected step's
     phicc=tmp;
+    phi=tmpPhi;
     hphi=hk*gillStep; // hphi = h_k-1
-    if (fTol != 0 && fabs(phif) < fTol){
-      lastfpt = fp;
-      lastht  = lasth;
-      phict=phic;
-    }
     goto FD5;
   }
   if (max2(Chf, Chb) <= 0.1){
     hs = hk;
   }
   if (0.001 <= Ch && Ch <= 1){
+    phicc=phic;
     hphi = hk;
-    if (fTol != 0 && fabs(phif) < fTol){
-      lastfpt = fp;
-      lastht  = lasth;
-      phict=phic;
-    }
     goto FD5;
   }
-  if (fTol != 0 && fabs(phif) < fTol){
-    lastfpt = fp;
-    lastht  = lasth;
-    phict=phic;
-  }
-  if (k == K) goto FD6;
+  if (k >= K) goto FD6;
   goto FD4;
  FD5: // Compute the estimate of the optimal interval
   *df2 = phi;
@@ -7090,31 +7186,25 @@ int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
   *ef = (*hf)*fabs(phi)/2+2*epsA/(*hf);
   *hphif=hphi;
   ehat = fabs(*df-phicc);
-  if (max2(*ef, ehat) <= 0.5*(*df)){
+  if (max2(*ef, ehat) <= 0.5*fabs(*df)){
     gill83tickStep(k, K, foceiGill);
     return 1;
   } else {
     // warning("The finite difference derivative err more than 50%% of the slope; Consider a different starting point.");
     if (!ISNA(lastht)){
-      // Could be used;  Stick with the last below Ftol
-      // *hf = lasth;
-      // fp = lastfp;
-      // *df = phiF(f, fp, *hf);
-      // *df2=0;
-      // // *df = 0.0; // Doesn't move.
-      // *hphif=2*(*hf);
-      // } else {
+      // fall back to the last trial with |phif| < fTol: its step and curvature
       *hf = lastht;
       fp = lastfpt;
       *df = phiF(f, fp, *hf);
-      *df2=phic;
-      // *df = 0.0; // Doesn't move.
-      *hphif=phict;
+      *df2 = phit;
+      *ef = (*hf)*fabs(phit)/2+2*epsA/(*hf);
+      *hphif = lastht;
     }
     gill83tickStep(k, K, foceiGill);
     return 2;
   }
  FD6: // Check unsatisfactory cases
+  int ret;
   if (hs < 0){
     // F nearly constant.
     // Use sqrt(h0) as a last ditch effort.
@@ -7124,53 +7214,198 @@ int gill83(double *hf, double *hphif, double *df, double *df2, double *ef,
     gill83fn(&fp, theta, cid, foceiGill);
     *df = phiF(f, fp, *hf);
     *df2=0;
-    // *df = 0.0; // Doesn't move.
+    *ef = 2*epsA/(*hf);
     *hphif=_safe_sqrt(h0);
     // warning("The surface around the initial estimate is nearly constant in one parameter grad=0.  Consider a different starting point.");
-    gill83tickStep(k, K, foceiGill);
-    return 3;
-  }
-  if (Ch > 0.1){ // Odd or nearly linear.
+    ret = 3;
+  } else if (Ch > 0.1){ // Odd or nearly linear.
     *hf = h0;
     *df = phic;
     *df2 = 0;
     *ef = 2*epsA/(*hf);
     *hphif=hphi;
     // warning("The surface odd or nearly linear for one parameter; Check your function.");
-    gill83tickStep(k, K, foceiGill);
-    return 4;
+    ret = 4;
+  } else {
+    // f'' is increasing rapidly as h decreases
+    *hf = h0;
+    *df = phic;
+    *df2 = phi;
+    *hphif=hphi;
+    *ef = (*hf)*fabs(phi)/2+2*epsA/(*hf);
+    // warning("The surface around the initial estimate is highly irregular in at least one parameter.  Consider a different starting point.");
+    ret = 5;
   }
-  // f'' is increasing rapidly as h decreases
-  *hf = h0;
-  *df = phic;
-  *df2 = phi;
-  *hphif=hphi;
-  *ef = (*hf)*fabs(phi)/2+2*epsA/(*hf);
-  // warning("The surface around the initial estimate is highly irregular in at least one parameter.  Consider a different starting point.");
+  // Restore theta as FD5 does: the last leg left it at x+hf or x-hk, and theta is
+  // often the caller's live iterate or the base point of the next search.
+  theta[cpar] = x;
+  if (foceiGill == 1) updateTheta(theta);
   gill83tickStep(k, K, foceiGill);
-  return 5;
+  return ret;
+}
+
+// gill83's forward interval hf and central-switch interval hphif as the steps the
+// finite differences take, |x|*rEps + aEps (forward) and |x|*rEpsC + aEpsC
+// (central), with aEps = rEps; err = 1/(|x|+1) makes the step hf itself.  The
+// central pair comes from hf when optGillF, else from hphif.
+static inline void gill83Eps(double hf, double hphif, double err, bool optGillF,
+                             double *aEps, double *rEps, double *aEpsC, double *rEpsC) {
+  *aEps = *rEps = hf*err;
+  *aEpsC = *rEpsC = (optGillF ? hf : hphif)*err;
+}
+
+// 5-point central second difference along i about x (f0 = f(x)) at step h,
+// times fac; NA_REAL at the first non-finite probe when naStop.
+static double fdHessDiag(FdHessObj &obj, double *x, int i, double f0, double h,
+                         double fac, bool naStop) {
+  static const double off[4] = {2, 1, -1, -2};
+  double fv[4], xi = x[i];
+  for (int k = 0; k < 4; ++k) {
+    x[i] = xi + off[k]*h;
+    fv[k] = obj.f(x);
+    if (naStop && !R_FINITE(fv[k])) {
+      x[i] = xi;
+      return NA_REAL;
+    }
+  }
+  x[i] = xi;
+  return fac*(-fv[0] + 16*fv[1] - 30*f0 + 16*fv[2] - fv[3])/(12*h*h);
+}
+
+// 4-point mixed second difference along i and j at steps hi and hj, times fac.
+static double fdHessOff(FdHessObj &obj, double *x, int i, int j, double hi, double hj,
+                        double fac, bool naStop) {
+  static const double si[4] = {1, 1, -1, -1}, sj[4] = {1, -1, 1, -1};
+  double fv[4], xi = x[i], xj = x[j];
+  for (int k = 0; k < 4; ++k) {
+    x[i] = xi + si[k]*hi;
+    x[j] = xj + sj[k]*hj;
+    fv[k] = obj.f(x);
+    if (naStop && !R_FINITE(fv[k])) {
+      x[i] = xi;
+      x[j] = xj;
+      return NA_REAL;
+    }
+  }
+  x[i] = xi;
+  x[j] = xj;
+  return fac*(fv[0] - fv[1] - fv[2] + fv[3])/(4*hi*hj);
+}
+
+// 3-point diagonal with the step doubled until the second difference settles
+// (below that it is round-off dominated); the step it settles on goes to *h.
+static double fdHessDiagDoubling(FdHessObj &obj, double *x, int i, double f0, double fac,
+                                 double *h) {
+  double xi = x[i], base = std::max(std::fabs(xi), 1e-3);
+  double d2prev = NA_REAL, hi = base * 5e-4, d2Use = NA_REAL;
+  *h = base * 1.6e-2;
+  for (int s = 0; s < 6; ++s) {
+    x[i] = xi + hi;
+    double fp = obj.f(x);
+    x[i] = xi - hi;
+    double fm = obj.f(x);
+    if (R_FINITE(fp) && R_FINITE(fm)) {
+      double d2 = (fp - 2*f0 + fm) / (hi*hi);
+      *h = hi; d2Use = d2;
+      if (R_FINITE(d2prev) && std::fabs(d2 - d2prev) <= 0.01 * std::fabs(d2)) break;
+      d2prev = d2;
+    }
+    hi *= 2.0;
+  }
+  x[i] = xi;
+  return fac*d2Use;
+}
+
+// Central finite-difference Hessian of obj about x (f0 = f(x)), times fac (1/2
+// turns the Hessian of -2LL into R): 5-point diagonal and 4-point off-diagonal
+// stencils at the steps h, taken i = n-1..0, each diagonal followed by its
+// off-diagonals j < i.  naStop gives up (false) at the first non-finite probe.
+// fallback (the full FD): a coordinate whose step or 5-point diagonal is not
+// finite takes the step-doubling diagonal and its step instead, so all the
+// diagonals are settled first, and afterDiag, when given, sees H with only its
+// diagonal filled: returning true means it has filled the off-diagonals itself (the
+// verified shortcut) and none are measured.  On every exit x is as it was and
+// obj.restore(x) has re-installed it.
+static bool fdHessian(FdHessObj &obj, double *x, int n, double f0, double *h,
+                      arma::mat &H, double fac, bool naStop, bool fallback,
+                      const std::function<bool(arma::mat &)> *afterDiag = nullptr) {
+  H.zeros(n, n);
+  bool ok = true;
+  for (int i = 0; fallback && ok && i < n; ++i) {
+    double d = R_FINITE(h[i]) ? fdHessDiag(obj, x, i, f0, h[i], fac, true) : NA_REAL;
+    if (!R_FINITE(d)) d = fdHessDiagDoubling(obj, x, i, f0, fac, &h[i]);
+    H(i, i) = d;
+    ok = R_FINITE(d);
+  }
+  if (fallback && ok && afterDiag != nullptr && (*afterDiag)(H)) {
+    obj.restore(x);
+    return true;
+  }
+  naStop = naStop || fallback;
+  for (int i = n; ok && i--;) {
+    if (!fallback) {
+      H(i, i) = fdHessDiag(obj, x, i, f0, h[i], fac, naStop);
+      ok = !naStop || R_FINITE(H(i, i));
+    }
+    for (int j = i; ok && j--;) {
+      H(i, j) = H(j, i) = fdHessOff(obj, x, i, j, h[i], h[j], fac, naStop);
+      ok = !naStop || R_FINITE(H(i, j));
+    }
+  }
+  obj.restore(x);
+  return ok;
+}
+
+static bool foceiFdLikById(arma::vec &out);
+
+// Each subject's -2LL at the theta-only R stencil's points that move one coordinate k
+// from the estimates, keyed by (k, theta[k]); foceiS() reads its legs from here when
+// they are the same points.  Cleared before every covariance step.
+static std::map<std::pair<int, double>, arma::vec> _covThetaAxis;
+
+// The FOCEi objective at theta for the covariance step's R matrix.  With keep set, a
+// point that moves one coordinate from x0 also records each subject's -2LL there
+// (_covThetaAxis); every probe starts its ETAs from eta-hat (CovEtaStart), so the
+// values do not depend on when the point was evaluated.
+struct FoceiHessObj : FdHessObj {
+  std::vector<double> x0;
+  bool keep = false;
+  double f(double *x) {
+    updateTheta(x);
+    double ret = foceiOfv0(x);
+    if (keep && R_FINITE(ret) && ret < 5e100) {
+      int k = -1, nd = 0;
+      for (int i = 0; i < (int)x0.size(); ++i) {
+        if (x[i] != x0[i]) { ++nd; k = i; }
+      }
+      arma::vec l;
+      if (nd == 1 && foceiFdLikById(l)) _covThetaAxis[std::make_pair(k, x[k])] = l;
+    }
+    op_focei.cur++;
+    op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
+    return ret;
+  }
+  void restore(double *x0) { updateTheta(x0); }
+};
+
+// Leave each subject's lik[0] and mixture responsibilities at theta: evaluate the
+// objective there, as a derivative leg, unless the last evaluation already was at theta.
+// A finite-difference leg evaluates at a perturbed theta and leaves its own, and what
+// reads them as the base point's (mixGrad, foceiS) would otherwise mix the two points.
+static void foceiLik0At(double *theta) {
+  if (_foceiLik0Theta.size() == (size_t)op_focei.npars &&
+      std::equal(theta, theta + op_focei.npars, _foceiLik0Theta.begin())) return;
+  ScopedRestore<int> calcGrad(op_focei.calcGrad);
+  op_focei.calcGrad = 1;
+  foceiOfv0(theta);
+}
+
+static inline bool foceiIsMixPar(int cpar) {
+  return op_focei.mixTrans != NULL && op_focei.mixTrans[cpar] != -1;
 }
 
 // Calculate the mixture parameter gradient
 //
-// d(unscalePar)/d(x_i): the finite-difference outer gradient is d(OFV)/d(scaled
-// par), so an analytic d(OFV)/d(theta) must be multiplied by this factor to land
-// in the same optimizer scale.  Mirrors the linear coefficient of unscalePar().
-static inline double dUnscaleParDx(int i) {
-  double scaleTo = op_focei.scaleTo, C = getScaleC(i);
-  switch (op_focei.scaleType) {
-  case 1: return op_focei.c2;
-  case 2: return C;
-  case 3: return (op_focei.scaleTo != 0) ? op_focei.initPar[i]/scaleTo : 1.0;
-  case 4:
-    if (op_focei.scaleTo > 0) {
-      return (op_focei.xPar[i] == 1) ? 1.0 : op_focei.initPar[i]/scaleTo;
-    }
-    return 1.0;
-  default: return 1.0;
-  }
-}
-
 // This notes that the mixture gradient does not need to be numerically, but
 // can be calculated directly from the mixture probabilities, the translation from
 // the by the mexpit, and the scaling factors.
@@ -7225,10 +7460,26 @@ int mixGrad(double *g, int cpar) {
     // and into the optimizer's scale, the same chain rule every other analytic
     // gradient applies -- the finite-difference paths get it for free by
     // differencing in the scaled space
-    g[cpar] = gr*dUnscaleParDx(cpar);
+    g[cpar] = gr*scaleAdjustGradScale(&op_focei, 1.0, cpar);
     return 1;
   }
   return 0;
+}
+
+// Every mixture proportion's gradient (mixGrad), from the responsibilities at theta.
+// Taken before the finite-difference legs of the other parameters, which leave the
+// responsibilities of the last leg.
+static void numericGradMix(double *theta, double *g) {
+  bool any = false;
+  for (int cpar = (int)op_focei.npars; cpar--;) {
+    if (foceiIsMixPar(cpar)) {
+      any = true;
+      break;
+    }
+  }
+  if (!any) return;
+  foceiLik0At(theta);
+  for (int cpar = (int)op_focei.npars; cpar--;) mixGrad(g, cpar);
 }
 
 
@@ -7514,6 +7765,10 @@ static bool analyticOuterGrad(double *theta, double *g) {
   return false;
 }
 
+// The progress-bar style, read once per fit so the gradient (an optimizer
+// callback) evaluates no R.
+static bool _foceiProgInPlace = false;
+
 void numericGrad(double *theta, double *g){
   op_focei.mixDeriv=0;
   op_focei.reducedTol2=0;
@@ -7558,6 +7813,7 @@ void numericGrad(double *theta, double *g){
     return;
   }
   if (op_foceiUseAnalyticGrad) op_focei.nFDGradFast++;
+  numericGradMix(theta, g);
   if (op_focei.shi21maxOuter != 0 && op_focei.nF == 1) {
     clock_t t = clock() - op_focei.t0;
     int finalSlow = (op_focei.scale.every == 1) &&
@@ -7571,7 +7827,7 @@ void numericGrad(double *theta, double *g){
       RSprintf(_("calculate Shi21 Difference and optimize forward difference step size:\n"));
       op_focei.t0 = clock();
       op_focei.cur=0;
-      op_focei.curTick=0;
+      op_focei.curTick = nmProgressStart(op_focei.totTick, op_focei.t0);
     }
     arma::vec grFinal(1);
     arma::vec f0(1);
@@ -7580,7 +7836,7 @@ void numericGrad(double *theta, double *g){
     std::copy(theta, theta+op_focei.npars, armaTheta.begin());
     double h = 0;
     for (int cpar = (int)op_focei.npars; cpar--;) {
-      if (mixGrad(g, cpar) == 1) {
+      if (foceiIsMixPar(cpar)) {
         continue;
       } else {
         op_focei.calcGrad=1;
@@ -7597,8 +7853,8 @@ void numericGrad(double *theta, double *g){
     }
     if (op_focei.slow) {
       op_focei.cur=op_focei.totTick;
-      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-      RSprintf("\n");
+      op_focei.curTick = nmProgressEnd(op_focei.totTick, op_focei.curTick, op_focei.t0,
+                                       _foceiProgInPlace);
     }
     op_focei.calcGrad=0;
     op_focei.curGill=2;
@@ -7617,6 +7873,7 @@ void numericGrad(double *theta, double *g){
       op_focei.cur = 0;
       op_focei.totTick = op_focei.npars * op_focei.gillK;
       op_focei.t0 = clock();
+      op_focei.curTick = nmProgressStart(op_focei.totTick, op_focei.t0);
       if (op_focei.repeatGillN != 0){
         RSprintf(_("repeat %d Gill diff/forward difference step size:\n"),
                  op_focei.repeatGillN);
@@ -7625,49 +7882,46 @@ void numericGrad(double *theta, double *g){
       }
     }
     for (int cpar = (int)op_focei.npars; cpar--;) {
-      if (mixGrad(g, cpar) == 1) {
+      if (foceiIsMixPar(cpar)) {
         continue;
       } else {
-        op_focei.gillRet[cpar] = gill83(&hf, &hphif, &op_focei.gillDf[cpar], &op_focei.gillDf2[cpar], &op_focei.gillErr[cpar],
-                                        theta, cpar, op_focei.gillRtol, op_focei.gillK, op_focei.gillStep, op_focei.gillFtol,
-                                        -1, gill83fnG, 1, op_focei.lastOfv);
         err = 1/(std::fabs(theta[cpar])+1);
-        if (op_focei.gillDf[cpar] == 0){
-          op_focei.scaleC[cpar]=op_focei.scaleC0;
+        // A zero derivative is searched again with scaleC set to scaleC0, then
+        // 1/scaleC0.  Only scaleType "nlmixr2" reads scaleC, and only at the
+        // scale's anchor (the scaled initial estimate) is the parameter left
+        // where it is when scaleC changes.  Anywhere else the new scale would
+        // move it under the optimizer, and the search would difference about
+        // lastOfv, the objective at the old point.
+        // When neither retry finds a slope, the parameter keeps its own scaleC and
+        // the first search's results.
+        int nSearch = (op_focei.scaleType == scaleTypeNlmixr2 &&
+                       theta[cpar] == scaleScalePar(&op_focei, op_focei.initPar, cpar)) ? 3 : 1;
+        double scaleC1 = op_focei.scaleC[cpar], hf1 = 0, hphif1 = 0, df21 = 0, ef1 = 0;
+        int ret1 = 0;
+        for (int r = 0; r < nSearch; ++r) {
+          if (r > 0) op_focei.scaleC[cpar] = (r == 1) ? op_focei.scaleC0 : 1/op_focei.scaleC0;
           op_focei.gillRet[cpar] = gill83(&hf, &hphif, &op_focei.gillDf[cpar], &op_focei.gillDf2[cpar], &op_focei.gillErr[cpar],
                                           theta, cpar, op_focei.gillRtol, op_focei.gillK, op_focei.gillStep, op_focei.gillFtol,
                                           -1, gill83fnG, 1, op_focei.lastOfv);
-          if (op_focei.gillDf[cpar] == 0){
-            op_focei.scaleC[cpar]=1/op_focei.scaleC0;
-            op_focei.gillRet[cpar] = gill83(&hf, &hphif, &op_focei.gillDf[cpar], &op_focei.gillDf2[cpar], &op_focei.gillErr[cpar],
-                                            theta, cpar, op_focei.gillRtol, op_focei.gillK, op_focei.gillStep, op_focei.gillFtol,
-                                            -1, gill83fnG, 1, op_focei.lastOfv);
+          if (op_focei.gillDf[cpar] != 0) break;
+          if (r == 0) {
+            ret1 = op_focei.gillRet[cpar]; hf1 = hf; hphif1 = hphif;
+            df21 = op_focei.gillDf2[cpar]; ef1 = op_focei.gillErr[cpar];
+          } else if (r == nSearch - 1) {
+            op_focei.scaleC[cpar] = scaleC1;
+            op_focei.gillRet[cpar] = ret1; hf = hf1; hphif = hphif1;
+            op_focei.gillDf2[cpar] = df21; op_focei.gillErr[cpar] = ef1;
           }
         }
-        // h=aEps*(|x|+1)/sqrt(1+fabs(f));
-        // h*sqrt(1+fabs(f))/(|x|+1) = aEps
-        // let err=2*sqrt(epsA/(1+f))
-        // err*(aEps+|x|rEps) = h
-        // Let aEps = rEps (could be a different ratio)
-        // h/err = aEps(1+|x|)
-        // aEps=h/err/(1+|x|)
-        //
-        op_focei.aEps[cpar]  = hf*err;
-        op_focei.rEps[cpar]  = hf*err;
-        if(op_focei.optGillF){
-          op_focei.aEpsC[cpar] = hf*err;
-          op_focei.rEpsC[cpar] = hf*err;
-        } else {
-          op_focei.aEpsC[cpar] = hphif*err;
-          op_focei.rEpsC[cpar] = hphif*err;
-        }
+        gill83Eps(hf, hphif, err, op_focei.optGillF, &op_focei.aEps[cpar], &op_focei.rEps[cpar],
+                  &op_focei.aEpsC[cpar], &op_focei.rEpsC[cpar]);
         g[cpar] = op_focei.gillDf[cpar];
       }
     }
     if(op_focei.slow){
       op_focei.cur=op_focei.totTick;
-      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-      RSprintf("\n");
+      op_focei.curTick = nmProgressEnd(op_focei.totTick, op_focei.curTick, op_focei.t0,
+                                       _foceiProgInPlace);
     }
     op_focei.didGill=1;
     if (op_focei.reducedTol2 && op_focei.repeatGillN < op_focei.repeatGillMax){
@@ -7677,12 +7931,23 @@ void numericGrad(double *theta, double *g){
     }
     op_focei.curGill=1;
     op_focei.slow = finalSlow;
+    // gill83() sets calcGrad=1 for its own objective evaluations; clear it like the
+    // shi21 and forward/central branches do.  Left set, every objective-only
+    // evaluation until the next gradient -- the optimizer's line search after
+    // the FIRST gradient, which is always this branch, and the final
+    // re-evaluation when the optimizer never reaches a second gradient -- ran
+    // as a gradient leg: innerOpt1() skipped the standardized-eta reset and the
+    // mceta start search, and foceiOfv0() skipped the ODE-tolerance retry and
+    // the lastOfv/checkTheta bookkeeping.  A trial step that blew the etas up
+    // then had no way back (issue 1114: the fit reported ~2e244 at the untouched
+    // initial estimates).
+    op_focei.calcGrad=0;
   } else {
     if(op_focei.slow){
       op_focei.t0 = clock();
       op_focei.cur=0;
-      op_focei.curTick=0;
       op_focei.totTick = op_focei.npars * 2;
+      op_focei.curTick = nmProgressStart(op_focei.totTick, op_focei.t0);
     }
     op_focei.calcGrad=1;
     rx = getRxSolve_();
@@ -7717,7 +7982,7 @@ void numericGrad(double *theta, double *g){
       haveF=true;
     }
     for (cpar = npars; cpar--;) {
-      if (mixGrad(g, cpar) == 1) {
+      if (foceiIsMixPar(cpar)) {
         continue;
       } else {
         if (doForward){
@@ -7862,18 +8127,11 @@ void numericGrad(double *theta, double *g){
     }
     if(op_focei.slow) {
       op_focei.cur=op_focei.totTick;
-      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-      RSprintf("\n");
+      op_focei.curTick = nmProgressEnd(op_focei.totTick, op_focei.curTick, op_focei.t0,
+                                       _foceiProgInPlace);
     }
     op_focei.calcGrad=0;
   }
-}
-
-//[[Rcpp::export]]
-NumericVector foceiNumericGrad(NumericVector theta){
-  NumericVector ret(theta.size());
-  numericGrad(&theta[0], &ret[0]);
-  return ret;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -8107,7 +8365,6 @@ static inline void foceiSetupTheta_(List mvi,
 }
 
 static inline void foceiSetupNoEta_(){
-
   // Mixtures only work in population only models;
   rx = getRxSolve_();
   foceiCheckIndCounts(rx);
@@ -8175,6 +8432,7 @@ static inline void foceiSetupEta_(NumericMatrix etaMat0){
   // here); gen = -1 forces a compute on each subject's first inner call.
   _foceRPopCache.assign(getRxNsubAndMix(rx), arma::vec());
   _foceRPopGen.assign(getRxNsubAndMix(rx), -1L);
+  _foceRPopTheta.assign(getRxNsubAndMix(rx), std::vector<double>());
   _foceRPopCurGen = 0;
   RObject etaMat0s = transpose(etaMat0);
   double *etaMat0d = REAL(etaMat0s);
@@ -8263,7 +8521,7 @@ static inline void foceiSetupEta_(NumericMatrix etaMat0){
 
   // Prefill to 0.1 or 10%
   std::fill_n(&op_focei.gVar[0], op_focei.gEtaGTransN, 0.1);
-  std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0); // All etas = -42;  Unlikely if normal
+  std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
 
 
   // The offset accumulators are size_t, not unsigned int: iVid advances by
@@ -8426,7 +8684,9 @@ static bool restoreFitSolve_() {
     // restores the solve in the middle of.  Carry the live tolerance across the rebuild.
     double liveAtol = NA_REAL, liveRtol = NA_REAL;
     rxGetSolveAtolRtol(&liveAtol, &liveRtol);
+    covFitSolveLost_ = true;
     rxode2::rxSolve_(obj, rxControl, R_NilValue, R_NilValue, params, data, R_NilValue, 1);
+    covFitSolveLost_ = false;
     rx = getRxSolve_();
     // Straight off the fit's own rxControl, so this is the most authoritative reading of
     // the fit tolerance there is -- better than any guard's capture of whatever was live.
@@ -8489,36 +8749,455 @@ struct OdeFitTolGuard {
   ~OdeFitTolGuard() { if (active) rxSetSolveAtolRtol(savAtol, savRtol); }
 };
 
-// RAII: tighten the ODE solve tolerances to covSolveTol for the covariance-step
-// finite-difference solves, restoring the fit's tolerances on exit.  No-op unless the
-// user set foceiControl(covSolveTol=); the analytic R-matrix applies covSolveTol on its
-// own augmented solves (.foceiAnalyticSolveTol).
+// Tolerances of the covariance step's finite-difference probes.  Each probe differences
+// marginal objectives that differ in their last few digits, so the solves and the inner
+// problems behind them run tighter than the estimation's: each tolerance is the fit's
+// times covProbeTolFactor, capped at covProbeOdeTolMax (ODE atol/rtol) or
+// covProbeInnerTolMax (the inner optimizer's convergence tolerances).  At the default
+// sigdig = 3 that is rtol 1e-7, atol 1e-9 and trustFterm = trustMterm 1e-9; a fit that
+// tightens its own tolerances tightens these with them, down to covProbeTolMin (the floor
+// of the analytic covariance's solves) unless the fit's own is already below it.  A
+// tolerance that is not a positive number is left as the fit has it.
+static const double covProbeTolFactor = 1e-3;
+static const double covProbeOdeTolMax = 1e-7;
+static const double covProbeInnerTolMax = 1e-9;
+static const double covProbeTolMin = 1e-12;
+
+static inline double covProbeTol(double fitTol, double tolMax) {
+  if (!R_FINITE(fitTol) || fitTol <= 0) return fitTol;
+  return std::max(std::min(fitTol, covProbeTolMin), std::min(fitTol * covProbeTolFactor, tolMax));
+}
+
+// The covariance probe tolerances (covProbeTol) on the live solve, for a covariance
+// computed outside the FOCEi covariance step (the nlm family's nlmixr2Hess(), imp's
+// impComputeCov()).  sav receives the tolerances it replaced, NA when there is no live
+// solve to retune; covProbeSolveTolPop() puts them back.
+void covProbeSolveTolPush(double *sav) {
+  sav[0] = sav[1] = NA_REAL;
+  rxGetSolveAtolRtol(&sav[0], &sav[1]);
+  if (!R_FINITE(sav[0]) || !R_FINITE(sav[1])) {
+    sav[0] = sav[1] = NA_REAL;
+    return;
+  }
+  rxSetSolveAtolRtol(covProbeTol(sav[0], covProbeOdeTolMax), covProbeTol(sav[1], covProbeOdeTolMax));
+}
+
+void covProbeSolveTolPop(const double *sav) {
+  if (R_FINITE(sav[0]) && R_FINITE(sav[1])) rxSetSolveAtolRtol(sav[0], sav[1]);
+}
+
+//[[Rcpp::export]]
+NumericVector covProbeSolveTolSet_() {
+  double sav[2];
+  covProbeSolveTolPush(sav);
+  return NumericVector::create(sav[0], sav[1]);
+}
+
+//[[Rcpp::export]]
+RObject covProbeSolveTolRestore_(NumericVector tol) {
+  if (tol.size() == 2) {
+    double sav[2] = {tol[0], tol[1]};
+    covProbeSolveTolPop(sav);
+  }
+  return R_NilValue;
+}
+
+// A positive number the control holds under `name`, else NA (NULL, absent, or not one)
+static double covControlTol(Environment e, const char* name) {
+  if (!e.exists("control")) return NA_REAL;
+  List ctl = as<List>(e["control"]);
+  if (!ctl.containsElementNamed(name)) return NA_REAL;
+  RObject v = ctl[name];
+  if (v.isNULL() || Rf_length(v) != 1) return NA_REAL;
+  double tol = as<double>(v);
+  return (R_FINITE(tol) && tol > 0) ? tol : NA_REAL;
+}
+
+// RAII: the ODE tolerances of the covariance step's solves (the finite-difference
+// probes, their stencil centre and the ETA warm-up of a refit), restored on exit.
+// foceiControl(covSolveTol=) sets atol and rtol to that number; NULL derives each from
+// the fit's (covProbeTol).  The analytic R-matrix applies its own tolerance to its
+// augmented solves (.foceiAnalyticSolveTol).  A fit without a covariance step is
+// untouched.
 struct CovSolveTolGuard {
   bool active = false;
   double savAtol = NA_REAL, savRtol = NA_REAL;
   CovSolveTolGuard(Environment e) {
-    if (!e.exists("control")) return;
-    List ctl = as<List>(e["control"]);
-    if (!ctl.containsElementNamed("covSolveTol")) return;
-    RObject cst = ctl["covSolveTol"];
-    if (cst.isNULL() || Rf_length(cst) < 1) return;
-    double tol = as<double>(cst);
-    if (!R_FINITE(tol) || tol <= 0) return;
+    if (op_focei.covMethod == 0) return;
     rxGetSolveAtolRtol(&savAtol, &savRtol);
     if (!R_FINITE(savAtol) || !R_FINITE(savRtol)) return;   // no live solve to retune
     // This guard wraps the WHOLE covariance step, so on a fit that never ran an analytic
     // gradient it is the first to touch the tolerances -- record the fit's before
-    // tightening, or vaeOuterSolve_ inside it captures covSolveTol as the fit's.
+    // tightening, or vaeOuterSolve_ inside it captures the probe tolerance as the fit's.
     foceiNoteFitTol(savAtol, savRtol);
-    rxSetSolveAtolRtol(tol, tol);
+    double tol = covControlTol(e, "covSolveTol");
+    if (R_FINITE(tol)) {
+      rxSetSolveAtolRtol(tol, tol);
+    } else {
+      double fitAtol = R_FINITE(op_focei.fitAtol) ? op_focei.fitAtol : savAtol;
+      double fitRtol = R_FINITE(op_focei.fitRtol) ? op_focei.fitRtol : savRtol;
+      rxSetSolveAtolRtol(covProbeTol(fitAtol, covProbeOdeTolMax),
+                         covProbeTol(fitRtol, covProbeOdeTolMax));
+    }
     active = true;
   }
   ~CovSolveTolGuard() {
-    if (active) rxSetSolveAtolRtol(savAtol, savRtol);
+    if (active && !covFitSolveLost_) rxSetSolveAtolRtol(savAtol, savRtol);
   }
 };
 
-// [[Rcpp::export]]
+// Every subject's ODE tolerance factor as the estimation left it: the fit reports it
+// (e["tolFactor"]) and its tables solve with it.  The covariance step changes it --
+// covSolveTol and the analytic covariance's rebuild of the solve set every subject's to 1
+// (rxSetSolveAtolRtol), and its finite-difference legs loosen it on hard solves -- so it
+// is put back on the way out, unless the fit's solve could not be rebuilt
+// (covFitSolveLost_) or has no subjects.
+struct CovTolFactorGuard {
+  std::vector<double> tf;
+  CovTolFactorGuard() {
+    covFitSolveLost_ = false;
+    rx = getRxSolve_();
+    tf.resize((size_t)getRxNsub(rx));
+    for (size_t i = 0; i < tf.size(); ++i) tf[i] = getIndTolFactor(getSolvingOptionsInd(rx, (int)i));
+  }
+  ~CovTolFactorGuard() {
+    if (covFitSolveLost_) return;
+    rx = getRxSolve_();
+    if (rx == NULL || rx->subjects == NULL) return;
+    size_t n = std::min(tf.size(), (size_t)getRxNsub(rx));
+    for (size_t i = 0; i < n; ++i) setIndTolFactor(getSolvingOptionsInd(rx, (int)i), tf[i]);
+  }
+};
+
+// RAII: the inner optimizers' convergence tolerances during the covariance step, restored
+// on exit: trust's trustFterm/trustMterm, n1qn1's epsilon and lbfgsb3c's pgtol, abstol,
+// reltol and factr (a multiple of the machine epsilon, so tightened through the relative
+// tolerance it stands for).  Only the active optimizer reads its own, so all of them are
+// set.  The internal control element covInnerTol sets every one; NULL derives each from
+// the fit's (covProbeTol).  A fit without a covariance step is untouched.
+struct CovInnerTolGuard {
+  bool active = false;
+  double savFterm = NA_REAL, savMterm = NA_REAL, savEpsilon = NA_REAL;
+  double savFactr = NA_REAL, savPgtol = NA_REAL, savAbstol = NA_REAL, savReltol = NA_REAL;
+  static double tighten(double fitTol, double tol) {
+    return R_FINITE(tol) ? tol : covProbeTol(fitTol, covProbeInnerTolMax);
+  }
+  explicit CovInnerTolGuard(Environment e) {
+    if (op_focei.covMethod == 0) return;
+    savFterm = op_focei.trustFterm;
+    savMterm = op_focei.trustMterm;
+    savEpsilon = op_focei.epsilon;
+    savFactr = op_focei.innerFactr;
+    savPgtol = op_focei.innerPgtol;
+    savAbstol = op_focei.innerAbstol;
+    savReltol = op_focei.innerReltol;
+    double tol = covControlTol(e, "covInnerTol");
+    op_focei.trustFterm = tighten(savFterm, tol);
+    op_focei.trustMterm = tighten(savMterm, tol);
+    op_focei.epsilon = tighten(savEpsilon, tol);
+    op_focei.innerPgtol = tighten(savPgtol, tol);
+    op_focei.innerAbstol = tighten(savAbstol, tol);
+    op_focei.innerReltol = tighten(savReltol, tol);
+    if (R_FINITE(savFactr) && savFactr > 0) {
+      op_focei.innerFactr = std::max(1.0, tighten(savFactr * DBL_EPSILON, tol) / DBL_EPSILON);
+    }
+    active = true;
+  }
+  ~CovInnerTolGuard() {
+    if (active) {
+      op_focei.trustFterm = savFterm;
+      op_focei.trustMterm = savMterm;
+      op_focei.epsilon = savEpsilon;
+      op_focei.innerFactr = savFactr;
+      op_focei.innerPgtol = savPgtol;
+      op_focei.innerAbstol = savAbstol;
+      op_focei.innerReltol = savReltol;
+    }
+  }
+};
+
+// CovLlikObsGuard (declared in imp.h, which the importance-sampling covariance
+// shares): the per-observation log-likelihoods the fit reports (addLlikObs) are
+// those of the final objective at the estimates; every covariance leg rewrites them.
+CovLlikObsGuard::CovLlikObsGuard() {
+  rx = getRxSolve_();
+  if (op_focei.llikObsFull != NULL) {
+    sav.assign(op_focei.llikObsFull, op_focei.llikObsFull + getRxNall(rx));
+  }
+}
+CovLlikObsGuard::~CovLlikObsGuard() {
+  if (op_focei.llikObsFull != NULL) std::copy(sav.begin(), sav.end(), op_focei.llikObsFull);
+}
+
+// Where every finite-difference leg of the covariance step starts its inner problems.
+//
+// Each leg -- the step search, the R stencil, the S legs and the full FD -- differences the
+// MARGINAL objective, so every probe re-optimizes each subject's ETAs at its own theta.  A
+// probe starts from the ETAs the fit converged to at the estimates (eta-hat): not from
+// eta = 0 and not from wherever the previous probe left them, which would make a
+// difference depend on the order the probes ran in.  The centre value f0 is taken the same
+// way (settle()), so the centre and a probe differ through theta alone.  An f0 whose ETAs
+// were converged less far than the probes' biases every 5-point diagonal by -2.5*delta/h^2.
+//
+// Lives for the covariance block of foceiFitCpp_ (the native step and the full FD):
+//   * the constructor saves every pseudo-subject's inner state and the destructor puts it
+//     back, so nothing a leg leaves behind reaches the fit;
+//   * settle(), called by foceiCalcCov at the estimates, takes eta-hat and arms the pin;
+//   * pin(), called by updateTheta(), puts eta-hat back before every probe.  innerOptId()'s
+//     retries within one probe do not move theta, so they keep their own restart points.
+// eta-hat is the fit's ETAs optimized again at the estimates at the covariance step's
+// tolerances, by the final-objective procedure (settle()).  A fit that evaluates its ETAs
+// without optimizing them (maxInnerIterations = 0) keeps them fixed in the legs too, as its
+// control says.  A refit that holds the ETAs only to report them asks for marginal legs
+// with the control element covMaxInnerIterations (.covInnerIterations(), R/cov.R): the
+// legs get that inner budget, and its supplied ETAs give eta-hat the same way.
+// The per-subject inner fields covInnerFresh() resets that FdInnerStateGuard does not keep
+struct CovInnerExtra {
+  int doEtaNudge = 0, doChol = 0, doFD = 0, badSolve = 0, nInnerF = 0, nInnerG = 0, etaHasPrevQN = 0;
+  std::vector<double> etaHessQN, etaGradPrevQN, etaPrevQN;
+  void save(focei_ind *f, int ne) {
+    doEtaNudge = f->doEtaNudge; doChol = f->doChol; doFD = f->doFD; badSolve = f->badSolve;
+    nInnerF = f->nInnerF; nInnerG = f->nInnerG; etaHasPrevQN = f->etaHasPrevQN;
+    fdSaveVec(etaHessQN, f->etaHessQN, ne*ne);
+    fdSaveVec(etaGradPrevQN, f->etaGradPrevQN, ne);
+    fdSaveVec(etaPrevQN, f->etaPrevQN, ne);
+  }
+  void restore(focei_ind *f) const {
+    f->doEtaNudge = doEtaNudge; f->doChol = doChol; f->doFD = doFD; f->badSolve = badSolve;
+    f->nInnerF = nInnerF; f->nInnerG = nInnerG; f->etaHasPrevQN = etaHasPrevQN;
+    fdRestoreVec(etaHessQN, f->etaHessQN);
+    fdRestoreVec(etaGradPrevQN, f->etaGradPrevQN);
+    fdRestoreVec(etaPrevQN, f->etaPrevQN);
+  }
+};
+
+// Every inner problem as a fresh setup leaves it (warm Hessian off, eta nudging on, no
+// quasi-Newton memory, step caches or restart points, tolerance factor 1), so the
+// covariance step does not depend on what estimation left; CovEtaStart puts it back.
+static void covInnerFresh(int nId) {
+  int ne = op_focei.neta;
+  op_focei.etaRestartSamples.reset();
+  for (int id = 0; id < nId; ++id) {
+    focei_ind *fInd = &(inds_focei[id]);
+    fInd->mode = 1;
+    fInd->uzm = 1;
+    fInd->doEtaNudge = 1;
+    fInd->doChol = !(op_focei.cholSEOpt);
+    fInd->doFD = 0;
+    fInd->badSolve = 0;
+    fInd->stickyRecalcN2 = 0;
+    fInd->nInnerF = 0;
+    fInd->nInnerG = 0;
+    fInd->etaHasPrevQN = 0;
+    if (fInd->zm != NULL) std::fill_n(fInd->zm, op_focei.nzm, 0.0);
+    if (fInd->etaHessQN != NULL) std::fill_n(fInd->etaHessQN, ne*ne, 0.0);
+    if (fInd->etaGradPrevQN != NULL) std::fill_n(fInd->etaGradPrevQN, ne, 0.0);
+    if (fInd->etaPrevQN != NULL) std::fill_n(fInd->etaPrevQN, ne, 0.0);
+    if (fInd->etahf != NULL) std::fill_n(fInd->etahf, ne, 0.0);
+    if (fInd->etahr != NULL) std::fill_n(fInd->etahr, ne, 0.0);
+    if (fInd->etahh != NULL) std::fill_n(fInd->etahh, ne, 0.0);
+  }
+  int nsub = (int)getRxNsub(rx);
+  for (int i = 0; i < nsub; ++i) {
+    rx_solving_options_ind *ind = getSolvingOptionsInd(rx, i);
+    if (ind != NULL) setIndTolFactor(ind, 1.0);
+  }
+}
+
+// Record the covariance step's natural theta and Omega parameters (e$covHandoff); a setCov()
+// refit installs its fit's record when it matches to the last few places, since Omega
+// rebuilt from the reported matrix can differ in the last place.
+static void covHandoffInstall(Environment e) {
+  int nt = (int)op_focei.ntheta, no = (int)op_focei.omegan;
+  double *ft = op_focei.fullTheta;
+  if (e.exists("covHandoff")) {
+    List h = as<List>(e["covHandoff"]);
+    NumericVector th = h.containsElementNamed("theta") ? as<NumericVector>(h["theta"]) : NumericVector(0);
+    NumericVector om = h.containsElementNamed("omega") ? as<NumericVector>(h["omega"]) : NumericVector(0);
+    bool same = th.size() == nt && om.size() == no;
+    for (int k = 0; same && k < nt + no; ++k) {
+      double v = (k < nt) ? th[k] : om[k - nt];
+      same = std::fabs(v - ft[k]) <= 1e-12 * std::max(1.0, std::fabs(v));
+    }
+    if (same) {
+      std::copy(th.begin(), th.end(), ft);
+      std::copy(om.begin(), om.end(), ft + nt);
+      if (op_focei.neta > 0 && no > 0) {
+        foceiOmegaFromTheta(ft + nt);
+        _updateThetaOmegaTail.assign(ft + nt, ft + nt + no);
+      }
+      foceiPushFullTheta();
+    }
+  }
+  e["covHandoff"] = List::create(_["theta"] = NumericVector(ft, ft + nt),
+                                 _["omega"] = NumericVector(ft + nt, ft + nt + no));
+}
+
+struct CovEtaStart;
+static CovEtaStart *_covEtaStart = NULL;
+struct CovEtaStart {
+  std::vector< std::unique_ptr<FdInnerStateGuard> > entry;
+  std::vector<double> eta, zm;
+  std::vector<int> mode;
+  std::vector<unsigned int> uzm;
+  arma::cube restartSave;
+  std::vector<CovInnerExtra> extraSave, extraPin;
+  std::vector<double> stepPin;
+  int nId = 0, savedMaxInner;
+  bool raised = false, restartSaved = false;
+  explicit CovEtaStart(Environment e) : savedMaxInner(op_focei.maxInnerIterations) {
+    // a fit without a covariance step keeps its inner state as it is
+    if (op_focei.covMethod == 0) return;
+    rx = getRxSolve_();
+    if (op_focei.neta <= 0 || rx == NULL || inds_focei == NULL || getRxNsub(rx) <= 0) {
+      _covEtaStart = this;
+      return;
+    }
+    nId = foceiIndSetupN(rx);   // a mixture has one inner problem per subject and component
+    entry.reserve((size_t)nId);
+    for (int id = 0; id < nId; ++id) {
+      entry.push_back(std::unique_ptr<FdInnerStateGuard>(new FdInnerStateGuard(id)));
+    }
+    int cap = 0;
+    if (e.exists("control")) {
+      List ctl = as<List>(e["control"]);
+      if (ctl.containsElementNamed("covMaxInnerIterations") &&
+          !Rf_isNull(ctl["covMaxInnerIterations"])) {
+        cap = as<int>(ctl["covMaxInnerIterations"]);
+      }
+    }
+    if (op_focei.maxInnerIterations <= 0 && cap > 0) {
+      op_focei.maxInnerIterations = cap;
+      raised = true;
+    }
+    restartSave = op_focei.etaRestartSamples;
+    restartSaved = true;
+    extraSave.resize((size_t)nId);
+    for (int id = 0; id < nId; ++id) extraSave[(size_t)id].save(&inds_focei[id], op_focei.neta);
+    covInnerFresh(nId);
+    // set last, so a constructor that throws leaves no pointer to a dead object
+    _covEtaStart = this;
+  }
+  ~CovEtaStart() {
+    _covEtaStartOn = false;
+    if (_covEtaStart == this) _covEtaStart = NULL;
+    if (raised) op_focei.maxInnerIterations = savedMaxInner;
+    if (restartSaved) op_focei.etaRestartSamples = restartSave;
+    if (entry.empty()) return;
+    // Restoring each subject's inner state puts fInd->setup and oldEta back, the state
+    // in which likInner0() answers from its cache, while ind->solve still holds the
+    // last probe's solution at another theta.  Force the next evaluation to solve (as
+    // after the outer gradient's guards).
+    entry.clear();
+    for (int id = 0; id < (int)extraSave.size(); ++id) extraSave[(size_t)id].restore(&inds_focei[id]);
+    for (int id = 0; id < nId; ++id) {
+      inds_focei[id].setup = 0;
+      if (covFitSolveLost_) continue;
+      rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(id));
+      if (ind != NULL) setIndSolve(ind, -1);
+    }
+  }
+  // f0: the objective at theta (the estimates) by the legs' procedure, from eta-hat
+  double settle(double *theta) {
+    if (nId > 0) {
+      if (op_focei.maxInnerIterations > 0) {
+        // eta-hat is the mode of the objective the legs evaluate, at the covariance step's
+        // tolerances (CovSolveTolGuard, CovInnerTolGuard): optimize the ETAs the fit
+        // reports (or, for a refit that held them, was given) again at the estimates, by
+        // the procedure foceiOuterFinal() takes a fit's final objective with (its eta
+        // searches and resets included, and the eta step caches cleared).  A native fit
+        // and a refit started from its ETAs then start their legs from the same eta-hat.
+        // The pass runs foceiOfv0()'s ODE-tolerance retries; their flags and counters
+        // describe the estimation (the "tolerances were temporarily increased" warning),
+        // so they are put back afterwards.
+        struct FinalObjGuard {
+          int calcGrad, objfRecalN, stickyRecalcN1, stickyTol, reducedTol;
+          FinalObjGuard() : calcGrad(op_focei.calcGrad), objfRecalN(op_focei.objfRecalN),
+                            stickyRecalcN1(op_focei.stickyRecalcN1),
+                            stickyTol(op_focei.stickyTol.load()),
+                            reducedTol(op_focei.reducedTol.load()) {
+            op_focei.calcGrad = 0;
+            _finalObfCalc = true;
+          }
+          ~FinalObjGuard() {
+            _finalObfCalc = false;
+            op_focei.calcGrad = calcGrad;
+            op_focei.objfRecalN = objfRecalN;
+            op_focei.stickyRecalcN1 = stickyRecalcN1;
+            op_focei.stickyTol.store(stickyTol);
+            op_focei.reducedTol.store(reducedTol);
+          }
+        } _finalObj;
+        std::fill_n(op_focei.getahh, op_focei.gEtaGTransN, 0.0);
+        std::fill_n(op_focei.getahf, op_focei.gEtaGTransN, 0.0);
+        std::fill_n(op_focei.getahr, op_focei.gEtaGTransN, 0.0);
+        updateTheta(theta);
+        foceiOfv0(theta);
+      }
+      int ne = op_focei.neta, nz = (int)op_focei.nzm;
+      eta.assign((size_t)nId * ne, 0.0);
+      zm.assign((size_t)nId * nz, 0.0);
+      mode.assign((size_t)nId, 1);
+      uzm.assign((size_t)nId, 1);
+      for (int id = 0; id < nId; ++id) {
+        focei_ind *fInd = &(inds_focei[id]);
+        std::copy(fInd->eta, fInd->eta + ne, &eta[(size_t)id * ne]);
+        if (nz > 0 && fInd->zm != NULL) std::copy(fInd->zm, fInd->zm + nz, &zm[(size_t)id * nz]);
+        mode[id] = fInd->mode;
+        uzm[id] = fInd->uzm;
+      }
+      // the rest of each inner problem's state, so every probe starts from the same one
+      extraPin.resize((size_t)nId);
+      stepPin.assign((size_t)nId * 3 * ne, 0.0);
+      for (int id = 0; id < nId; ++id) {
+        focei_ind *fInd = &(inds_focei[id]);
+        extraPin[(size_t)id].save(fInd, ne);
+        double *sp = &stepPin[(size_t)id * 3 * ne];
+        if (fInd->etahf != NULL) std::copy(fInd->etahf, fInd->etahf + ne, sp);
+        if (fInd->etahr != NULL) std::copy(fInd->etahr, fInd->etahr + ne, sp + ne);
+        if (fInd->etahh != NULL) std::copy(fInd->etahh, fInd->etahh + ne, sp + 2*ne);
+      }
+      _covEtaStartOn = true;
+    }
+    updateTheta(theta);
+    return foceiOfv0(theta);
+  }
+  void pin() {
+    int ne = op_focei.neta, nz = (int)op_focei.nzm;
+    for (int id = 0; id < nId; ++id) {
+      focei_ind *fInd = &(inds_focei[id]);
+      std::copy(&eta[(size_t)id * ne], &eta[(size_t)id * ne] + ne, fInd->eta);
+      if (nz > 0 && fInd->zm != NULL) std::copy(&zm[(size_t)id * nz], &zm[(size_t)id * nz] + nz, fInd->zm);
+      fInd->mode = mode[id];
+      fInd->uzm = uzm[id];
+      if ((size_t)id < extraPin.size()) {
+        extraPin[(size_t)id].restore(fInd);
+        const double *sp = &stepPin[(size_t)id * 3 * ne];
+        if (fInd->etahf != NULL) std::copy(sp, sp + ne, fInd->etahf);
+        if (fInd->etahr != NULL) std::copy(sp + ne, sp + 2*ne, fInd->etahr);
+        if (fInd->etahh != NULL) std::copy(sp + 2*ne, sp + 3*ne, fInd->etahh);
+      }
+      // theta moved, so likInner0() must not answer from the previous probe's cache
+      if (fInd->oldEta != NULL) std::fill_n(fInd->oldEta, ne, NA_REAL);
+    }
+  }
+
+private:
+  CovEtaStart(const CovEtaStart &);
+  CovEtaStart &operator=(const CovEtaStart &);
+};
+
+static void covEtaStartPin() {
+  if (_covEtaStartOn && _covEtaStart != NULL) _covEtaStart->pin();
+}
+
+// The centre value of the covariance step's stencils (see CovEtaStart::settle())
+static double covEtaStartF0(double *theta) {
+  if (_covEtaStart != NULL) return _covEtaStart->settle(theta);
+  updateTheta(theta);
+  return foceiOfv0(theta);
+}
+
 NumericVector foceiSetup_(const RObject &obj,
                           const RObject &data,
                           NumericVector theta,
@@ -8632,6 +9311,8 @@ NumericVector foceiSetup_(const RObject &obj,
       op_focei.impCtol = as<double>(foceiO["ctol"]);
     if (foceiO.containsElementNamed("nConvWindow")) op_focei.impNconvWindow = as<int>(foceiO["nConvWindow"]);
     if (foceiO.containsElementNamed("impCov")) op_focei.impCov = as<bool>(foceiO["impCov"]);
+    // set on every imp fit, so a frozen recompute does not carry over to the next one
+    op_focei.impFrozen = foceiO.containsElementNamed("impFrozen") && as<bool>(foceiO["impFrozen"]);
     if (foceiO.containsElementNamed("qr")) op_focei.impQr = as<bool>(foceiO["qr"]);
     if (foceiO.containsElementNamed("qrShift")) op_focei.impQrShift = as<bool>(foceiO["qrShift"]);
     if (foceiO.containsElementNamed("qrRefresh")) op_focei.impQrRefresh = as<bool>(foceiO["qrRefresh"]);
@@ -8747,6 +9428,7 @@ NumericVector foceiSetup_(const RObject &obj,
   op_focei.nInnerRanked.store(0, std::memory_order_relaxed);
   op_focei.nInnerReranked.store(0, std::memory_order_relaxed);
   op_focei.nInnerNoGood.store(0, std::memory_order_relaxed);
+  op_focei.nNearPdDiag.store(0, std::memory_order_relaxed);
   op_focei.nInnerDropped.store(0, std::memory_order_relaxed);
   // Fallback 2 ("none") for a control list that predates/omits warm=: 0 ("save")
   // used to BE self-init because updateZm() was a no-op (#1043), so "none" is what
@@ -9109,6 +9791,8 @@ NumericVector foceiSetup_(const RObject &obj,
                      R_NilValue, // inits
                      1);//const int setupOnly = 0
     rx = getRxSolve_();
+    // a failed restore in an earlier fit's covariance step says nothing about this solve
+    covFitSolveLost_ = false;
     // per-subject outer-retry counters, now that nsub is known
     op_focei.outerStickyRecalcN2Per.assign((size_t)getRxNsub(rx), 0);
     if (op_focei.neta == 0) foceiSetupNoEta_();
@@ -9116,6 +9800,22 @@ NumericVector foceiSetup_(const RObject &obj,
   }
   op_focei.epsilon=as<double>(foceiO["epsilon"]);
   op_focei.innerOpt = foceiO.containsElementNamed("innerOpt") ? as<int>(foceiO["innerOpt"]) : 1;
+  if (op_focei.innerOpt == 2) {
+    if (lbfgsb3Cts == NULL) {
+      stop(_("innerOpt=\"lbfgsb3c\" needs lbfgsb3c >= 2024-3.6 (thread-safe lbfgsb3Cts)"));
+    }
+    // Fallbacks are foceiControl()'s sigdig=3 defaults.
+    op_focei.innerLmm = foceiO.containsElementNamed("innerLbfgsLmm") ?
+      as<int>(foceiO["innerLbfgsLmm"]) : 5;
+    op_focei.innerFactr = foceiO.containsElementNamed("innerLbfgsFactr") ?
+      as<double>(foceiO["innerLbfgsFactr"]) : 1e-5 / DBL_EPSILON;
+    op_focei.innerPgtol = foceiO.containsElementNamed("innerLbfgsPgtol") ?
+      as<double>(foceiO["innerLbfgsPgtol"]) : 1e-5;
+    op_focei.innerAbstol = foceiO.containsElementNamed("innerLbfgsAbstol") ?
+      as<double>(foceiO["innerLbfgsAbstol"]) : 1e-5;
+    op_focei.innerReltol = foceiO.containsElementNamed("innerLbfgsReltol") ?
+      as<double>(foceiO["innerLbfgsReltol"]) : 1e-5;
+  }
   op_focei.trustConf = foceiO.containsElementNamed("trustConf") ? as<double>(foceiO["trustConf"]) : 0.975;
   {
     // rmax: radius (in sqrt(diag(Omega))-scaled units) of the trustConf-level eta
@@ -9191,6 +9891,8 @@ NumericVector foceiSetup_(const RObject &obj,
     // epsilon itself is, so no NULL fallback is needed here.
     op_focei.trustFterm = as<double>(foceiO["trustFterm"]);
     op_focei.trustMterm = as<double>(foceiO["trustMterm"]);
+    op_focei.trustPolish = foceiO.containsElementNamed("trustPolish") ?
+      (int)as<bool>(foceiO["trustPolish"]) : 0;
   }
   op_focei.nEtaRestart = foceiO.containsElementNamed("etaRestart") ?
     as<int>(foceiO["etaRestart"]) : 0;
@@ -9221,6 +9923,9 @@ NumericVector foceiSetup_(const RObject &obj,
                    (uint64_t)getRxNsubAndMix(getRxSolve_()) * (uint64_t)op_focei.nEtaRestart);
   }
   op_focei.nTrustInner.store(0, std::memory_order_relaxed);
+  op_focei.nLbfgsInner.store(0, std::memory_order_relaxed);
+  op_focei.nLbfgsNoConv.store(0, std::memory_order_relaxed);
+  op_focei.nLbfgsMaxit.store(0, std::memory_order_relaxed);
   op_focei.nWarmSaveZm.store(0, std::memory_order_relaxed);
   op_focei.nWarmSaveSelfInit.store(0, std::memory_order_relaxed);
   op_focei.nWarmSaveFloor.store(0, std::memory_order_relaxed);
@@ -9231,6 +9936,7 @@ NumericVector foceiSetup_(const RObject &obj,
   op_focei.nTrustPush.store(0, std::memory_order_relaxed);
   op_focei.nTrustRetry.store(0, std::memory_order_relaxed);
   op_focei.nTrustWarm.store(0, std::memory_order_relaxed);
+  op_focei.nTrustPolish.store(0, std::memory_order_relaxed);
   op_focei.nTrustNudge.store(0, std::memory_order_relaxed);
   op_focei.nTrustRestart.store(0, std::memory_order_relaxed);
   op_focei.nTrustFail.store(0, std::memory_order_relaxed);
@@ -9298,7 +10004,7 @@ NumericVector foceiSetup_(const RObject &obj,
 
   op_focei.muRef   = op_focei.nbd + op_focei.npars; //[op_focei.muRefN]
   if (op_focei.muRefN) {
-    std::copy(&op_focei.muRef[0], &op_focei.muRef[0]+op_focei.muRefN, muRef.begin());
+    std::copy(muRef.begin(), muRef.end(), &op_focei.muRef[0]);
   }
 
   op_focei.muRefEtaCovSkipReset = op_focei.muRef + op_focei.muRefN; //[op_focei.muRefN]
@@ -9542,14 +10248,6 @@ NumericVector foceiSetup_(const RObject &obj,
   op_focei.scaleC0=as<double>(foceiO["scaleC0"]);
   op_focei.scaleCmin=as<double>(foceiO["scaleCmin"]);
   op_focei.scaleCmax=as<double>(foceiO["scaleCmax"]);
-  if (foceiO.containsElementNamed("scaleCband")) {
-    NumericVector scb = as<NumericVector>(foceiO["scaleCband"]);
-    op_focei.scaleRangeLow = scb[0];
-    op_focei.scaleRangeHigh = scb[1];
-  } else {
-    op_focei.scaleRangeLow = 0.1;
-    op_focei.scaleRangeHigh = 10.0;
-  }
   op_focei.abstol=as<double>(foceiO["abstol"]);
   op_focei.reltol=as<double>(foceiO["reltol"]);
   op_focei.smatNorm=as<int>(foceiO["smatNorm"]);
@@ -9580,7 +10278,10 @@ NumericVector foceiSetup_(const RObject &obj,
   op_focei.fallbackFD = as<int>(foceiO["fallbackFD"]);
   op_focei.smatPer = as<double>(foceiO["smatPer"]);
   op_focei.initObj=0;
+  op_focei.initOfv = NA_REAL;
+  op_focei.finalOfv = NA_REAL;
   op_focei.lastOfv=std::numeric_limits<double>::max();
+  op_focei.boundsScaled = false;
   for (unsigned int k = op_focei.npars; k--;){
     j=op_focei.fixedTrans[k];
     ret[k] = op_focei.fullTheta[j];
@@ -9597,115 +10298,18 @@ NumericVector foceiSetup_(const RObject &obj,
       op_focei.upper[k] -= 2*(op_focei.upper[k]*op_focei.rEps[k] - op_focei.aEps[k]);
       // Upper bound only = 3
       // Upper and lower bound = 2
-      op_focei.nbd[k]= 3 - op_focei.nbd[j];
+      op_focei.nbd[k]= 3 - op_focei.nbd[k];
     } else {
       op_focei.upper[k] = std::numeric_limits<double>::infinity();//std::numeric_limits<double>::max();
     }
   }
-  double mn = (op_focei.npars > 0) ? op_focei.initPar[op_focei.npars-1] : 0.0;
-  double mx = mn, mean=0, oN=0, oM=0, s=0;
-  double len=0;
-  unsigned int k;
   if (op_focei.nF2 > 0 && foceiO.containsElementNamed("c1") && foceiO.containsElementNamed("c2")){
+    // a theta-reset restart keeps the first attempt's normalization
     op_focei.c1 = foceiO["c1"];
     op_focei.c2 = foceiO["c2"];
   } else {
-    switch (op_focei.normType){
-    case 1:
-      // OptdesX
-      // http://apmonitor.com/me575/uploads/Main/optimization_book.pdf
-      for (k = op_focei.npars-1; k--;){
-        mn = min2(op_focei.initPar[k],mn);
-        mx = max2(op_focei.initPar[k],mx);
-      }
-      if (mx == mn) {
-        warning(_("all parameters are the same value, switch to length normType"));
-        for (unsigned int k = op_focei.npars-1; k--;){
-          len += op_focei.initPar[k]*op_focei.initPar[k];
-        }
-        op_focei.c1 = 0;
-        op_focei.c2 = _safe_sqrt(len);
-        op_focei.normType = 5;
-      } else {
-        op_focei.c1 = (mx+mn)/2;
-        op_focei.c2 = (mx-mn)/2;
-      }
-      break;
-    case 2: // Rescaling (min-max normalization)
-      for (k = op_focei.npars-1; k--;){
-        mn = min2(op_focei.initPar[k],mn);
-        mx = max2(op_focei.initPar[k],mx);
-      }
-      if (mx == mn) {
-        warning(_("all parameters are the same value, switch to length normType"));
-        for (unsigned int k = op_focei.npars-1; k--;){
-          len += op_focei.initPar[k]*op_focei.initPar[k];
-        }
-        op_focei.c1 = 0;
-        op_focei.c2 = _safe_sqrt(len);
-        op_focei.normType = 5;
-      } else {
-        op_focei.c1 = mn;
-        op_focei.c2 = (mx-mn);
-      }
-      break;
-    case 3: // Mean normalization
-      for (k = op_focei.npars-1; k--;){
-        mn = min2(op_focei.initPar[k],mn);
-        mx = max2(op_focei.initPar[k],mx);
-        oN++;
-        mean += (op_focei.initPar[k]-mean)/oN;
-      }
-      if (mx == mn) {
-        warning(_("all parameters are the same value, switch to length normType"));
-        for (unsigned int k = op_focei.npars-1; k--;){
-          len += op_focei.initPar[k]*op_focei.initPar[k];
-        }
-        op_focei.c1 = 0;
-        op_focei.c2 = _safe_sqrt(len);
-        op_focei.normType = 5;
-      } else {
-        op_focei.c1 = mean;
-        op_focei.c2 = (mx-mn);
-      }
-      break;
-    case 4: // Standardization
-      for (k = op_focei.npars-1; k--;){
-        mn = min2(op_focei.initPar[k],mn);
-        mx = max2(op_focei.initPar[k],mx);
-        oM= mean;
-        oN++;
-        mean += (op_focei.initPar[k]-mean)/oN;
-        s += (op_focei.initPar[k]-mean)*(op_focei.initPar[k]-oM);
-      }
-      if (mx == mn) {
-        warning("all parameters are the same value, switch to length norm type");
-        for (unsigned int k = op_focei.npars-1; k--;){
-          len += op_focei.initPar[k]*op_focei.initPar[k];
-        }
-        op_focei.c1 = 0;
-        op_focei.c2 = _safe_sqrt(len);
-        op_focei.normType = 5;
-      } else {
-        op_focei.c1 = mean;
-        op_focei.c2 = _safe_sqrt(s/(oN-1));
-      }
-      break;
-    case 5: // Normalize to length.
-      for (unsigned int k = op_focei.npars-1; k--;){
-        len += op_focei.initPar[k]*op_focei.initPar[k];
-      }
-      op_focei.c1 = 0;
-      op_focei.c2 = _safe_sqrt(len);
-      break;
-    case 6:
-      // No Normalization
-      op_focei.c1 = 0;
-      op_focei.c2 = 1;
-      break;
-    default:
-      stop("unrecognized normalization (normType=%d)",op_focei.normType);
-    }
+    scaleNormalize(op_focei.initPar, (int)op_focei.npars, &op_focei.normType,
+                   &op_focei.c1, &op_focei.c2);
   }
   return ret;
 }
@@ -9796,9 +10400,18 @@ void foceiOuterFinal(double *x, Environment e){
   op_focei.outerFdStepPerNsub=0;
   op_focei.optimHessType = op_focei.optimHessCovType;
   op_focei.shi21maxInner = op_focei.shi21maxInnerCov;
+  // The reported objective is an objective evaluation, never a gradient leg,
+  // whatever state the optimizer's last call left behind: with calcGrad set,
+  // innerOpt1() would keep a warm-start eta it should have reset and foceiOfv0()
+  // would skip its ODE-tolerance retry (issue 1114).
+  op_focei.calcGrad = 0;
   _finalObfCalc = true;
   double fmin = foceiOfv0(x);
   _finalObfCalc = false;
+  // Natural-scale final objective for the worse-than-initial guard; the same
+  // un-scaling nlmixr2EnvSetup() applies before reporting.
+  op_focei.finalOfv = op_focei.scaleObjective ?
+    fmin * op_focei.initObjective / op_focei.scaleObjectiveTo : fmin;
   NumericVector theta(op_focei.ntheta);
   std::copy(&op_focei.fullTheta[0],  &op_focei.fullTheta[0] + op_focei.ntheta,
             theta.begin());
@@ -9841,22 +10454,13 @@ void foceiOuterFinal(double *x, Environment e){
   nlmixr2EnvSetup(e, fmin);
 }
 
-static inline void foceiPrintLine(int ncol){
-  RSprintf("|-----+---------------+");
-  for (int i = 0; i < ncol; i++){
-    if (i == ncol-1)
-      RSprintf("-----------|");
-    else
-      RSprintf("-----------+");
-  }
-  RSprintf("\n");
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Outer l-BFGS-b from R
 extern "C" double foceiOfvOptim(int n, double *x, void *ex){
   double ret = foceiOfv0(x);
-  niter.push_back(op_focei.nF2+(++op_focei.nF));
+  ++op_focei.nF;
+  if (!op_focei.recordOuter) return ret;
+  niter.push_back(op_focei.nF2+op_focei.nF);
   // The mu-family records/prints nparsPrint columns: optimizer values
   // interleaved with the current regression-updated mu thetas (raw estimation
   // scale, fresh from the foceiOfv0 inner/updateMuGroups cycle above);
@@ -9870,7 +10474,7 @@ extern "C" double foceiOfvOptim(int n, double *x, void *ex){
       int ko = _printOptIdx[p];
       if (ko >= 0) {
         _printX[p] = x[ko];
-        getScaleC(ko); // resolve any lazily-cached scaleC before copying
+        scaleGetScaleC(&op_focei, ko); // resolve any lazily-cached scaleC before copying
         _printScaleC[p]  = op_focei.scaleC[ko];
         _printInitPar[p] = op_focei.initPar[ko];
       } else {
@@ -9896,7 +10500,7 @@ extern "C" double foceiOfvOptim(int n, double *x, void *ex){
   }
   for (i = 0; i < np; i++){
     int ko = muPrintActive() ? _printOptIdx[i] : i;
-    vPar.push_back(ko >= 0 ? unscalePar(x, ko) : xp[i]);
+    vPar.push_back(ko >= 0 ? scaleUnscalePar(&op_focei, x, ko) : xp[i]);
   }
   // Back-transformed (7)
   iterType.push_back(7);
@@ -9910,7 +10514,7 @@ extern "C" double foceiOfvOptim(int n, double *x, void *ex){
     int ko = muPrintActive() ? _printOptIdx[i] : i;
     double u; int xc, pc;
     if (ko >= 0) {
-      u = unscalePar(x, ko);
+      u = scaleUnscalePar(&op_focei, x, ko);
       xc = op_focei.xPar[ko];
       // op_focei.probitIdxArr (not scale.probitIdx) -- the scale pointer is
       // in print-map order for the mu family, ko is an optimizer index
@@ -9939,6 +10543,49 @@ extern "C" double foceiOfvOptim(int n, double *x, void *ex){
   return ret;
 }
 
+// Turn recording of the outer evaluations (parHistData, the iteration print) on or off;
+// returns the previous setting.  The evaluations still count.  .trustOuterFd switches it
+// off for its finite-difference probes, which the outer optimizer did not ask for.
+//[[Rcpp::export(".foceiOuterRecord")]]
+bool foceiOuterRecord_(bool record) {
+  bool was = op_focei.recordOuter;
+  op_focei.recordOuter = record;
+  return was;
+}
+
+// The inner state held across outer evaluations the optimizer did not ask for
+// (.bobyqaStationary's probe), so a probe that finds nothing leaves the fit as the
+// search did (#1196), the way the fast= posthoc gradient's guards do (#1057).
+static std::vector< std::unique_ptr<FdInnerStateGuard> > _outerHoldInner;
+static std::unique_ptr<FdPhaseStateGuard> _outerHoldPhase;
+
+// hold=TRUE saves the per-subject inner state and the fit-wide eta statistics;
+// hold=FALSE puts them back.  Returns whether a hold was released.
+//[[Rcpp::export(".foceiOuterHold")]]
+bool foceiOuterHold_(bool hold) {
+  const bool was = (_outerHoldPhase != nullptr);
+  const int nHeld = (int)_outerHoldInner.size();
+  _outerHoldInner.clear();
+  _outerHoldPhase.reset();
+  // As after CovEtaStart: the restored setup/oldEta would answer from the cache while
+  // ind->solve holds the last probe's solution, so force the next evaluation to solve.
+  for (int i = 0; i < nHeld; ++i) {
+    inds_focei[i].setup = 0;
+    if (covFitSolveLost_) continue;
+    rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(i));
+    if (ind != NULL) setIndSolve(ind, -1);
+  }
+  if (!hold) return was;
+  rx = getRxSolve_();
+  const int ns = (rx == NULL || inds_focei == NULL || getRxNsub(rx) <= 0) ? 0 : nIndsFocei;
+  _outerHoldPhase.reset(new FdPhaseStateGuard());
+  _outerHoldInner.reserve((size_t)ns);
+  for (int i = 0; i < ns; ++i) {
+    _outerHoldInner.push_back(std::unique_ptr<FdInnerStateGuard>(new FdInnerStateGuard(i)));
+  }
+  return was;
+}
+
 //[[Rcpp::export]]
 double foceiOuterF(NumericVector &theta){
   int n = theta.size();
@@ -9950,39 +10597,44 @@ extern "C" void outerGradNumOptim(int n, double *par, double *gr, void *ex){
   numericGrad(par, gr);
   op_focei.nG++;
   int finalize=0, i = 0;
-  niterGrad.push_back(niter.back());
+  int gType;
   if (op_focei.curAnalytic){
     // Most-degraded wins: Chartrand implies the FD fallback ran, which implies the
     // analytic solve did not cover every subject.
-    if (op_focei.curAnalyticChartrand) gradType.push_back(12);
-    else if (op_focei.curAnalyticFd) gradType.push_back(11);
-    else if (op_focei.curAnalyticRelax.load(std::memory_order_relaxed)) gradType.push_back(10);
-    else gradType.push_back(9);
+    if (op_focei.curAnalyticChartrand) gType = 12;
+    else if (op_focei.curAnalyticFd) gType = 11;
+    else if (op_focei.curAnalyticRelax.load(std::memory_order_relaxed)) gType = 10;
+    else gType = 9;
   } else if (op_focei.derivMethod == 0){
     if (op_focei.curGill == 1){
-      gradType.push_back(1);
+      gType = 1;
     } else if (op_focei.curGill == 2){
-      gradType.push_back(5);
+      gType = 5;
     } else if (op_focei.mixDeriv){
-      gradType.push_back(2);
+      gType = 2;
     } else{
-      gradType.push_back(3);
+      gType = 3;
     }
   } else {
-    gradType.push_back(4);
+    gType = 4;
   }
   // gradType convention: 1=Gill, 2=Mixed, 3=Forward, 4=Central, 5=Shi21,
   // 8=nlm forward sensitivity, 9=analytic outer gradient (fast=TRUE).
-  double *grp = gr;
-  if (muPrintActive()) {
-    _printGr.resize(op_focei.nparsPrint);
-    for (unsigned int p = 0; p < op_focei.nparsPrint; p++) {
-      int ko = _printOptIdx[p];
-      _printGr[p] = (ko >= 0) ? gr[ko] : R_NaN;
+  const bool record = op_focei.recordOuter;
+  if (record) {
+    niterGrad.push_back(niter.back());
+    gradType.push_back(gType);
+    double *grp = gr;
+    if (muPrintActive()) {
+      _printGr.resize(op_focei.nparsPrint);
+      for (unsigned int p = 0; p < op_focei.nparsPrint; p++) {
+        int ko = _printOptIdx[p];
+        _printGr[p] = (ko >= 0) ? gr[ko] : R_NaN;
+      }
+      grp = _printGr.data();
     }
-    grp = _printGr.data();
+    scalePrintGrad(&op_focei.scale, grp, gType);
   }
-  scalePrintGrad(&op_focei.scale, grp, gradType.back());
   for (i = 0; i < n; i++){
     if (gr[i] == 0){
       if (op_focei.nF+op_focei.nF2 == 1) {
@@ -10012,6 +10664,7 @@ extern "C" void outerGradNumOptim(int n, double *par, double *gr, void *ex){
   }
   // Record after the zero-gradient fix-ups so the history holds the values the
   // optimizer sees; mu columns record NaN (regression-updated, no gradient).
+  if (!record) return;
   vGrad.push_back(NA_REAL); // Gradient doesn't record objf
   if (muPrintActive()) {
     for (unsigned int p = 0; p < op_focei.nparsPrint; p++) {
@@ -10034,30 +10687,43 @@ NumericVector foceiOuterG(NumericVector &theta){
   return gr;
 }
 
+// The outer optimizer's starting point: each parameter's current value on the
+// optimizer's scale.  That is initPar, except on the restart after a theta reset,
+// which keeps the first attempt's scaling and starts from the reset's values.
+static inline void foceiOuterStart(double *x) {
+  std::vector<double> cur(op_focei.npars);
+  for (unsigned int k = op_focei.npars; k--;) {
+    cur[k] = op_focei.fullTheta[op_focei.fixedTrans[k]];
+  }
+  for (unsigned int k = op_focei.npars; k--;) {
+    x[k] = scaleScalePar(&op_focei, cur.data(), k);
+  }
+}
+
 void foceiLbfgsb3(Environment e){
   void *ex = NULL;
   double Fmin;
   int fail, fncount=0, grcount=0;
   NumericVector x(op_focei.npars);
   NumericVector g(op_focei.npars);
-  for (unsigned int k = op_focei.npars; k--;){
-    x[k]=scalePar(op_focei.initPar, k);
+  foceiOuterStart(x.begin());
+  if (lbfgsb3Cts == NULL) {
+    stop(_("outerOpt=\"lbfgsb3c\" needs lbfgsb3c >= 2024-3.6 (thread-safe lbfgsb3Cts)"));
   }
-  char msg[100];
-  std::fill_n(msg, 100, 0);
-  lbfgsb3C(op_focei.npars, op_focei.lmm, x.begin(), op_focei.lower,
-           op_focei.upper, op_focei.nbd, &Fmin, foceiOfvOptim,
-           outerGradNumOptim, &fail, ex, op_focei.factr,
-           op_focei.pgtol, &fncount, &grcount,
-           op_focei.maxOuterIterations, msg, 0, -1,
-           op_focei.abstol, op_focei.reltol, g.begin());
+  // The C++ port: same iterates as the Fortran lbfgsb3C, no R printing.
+  lbfgsb3Cts(op_focei.npars, op_focei.lmm, x.begin(), op_focei.lower,
+             op_focei.upper, op_focei.nbd, &Fmin, foceiOfvOptim,
+             outerGradNumOptim, &fail, ex, op_focei.factr,
+             op_focei.pgtol, &fncount, &grcount,
+             op_focei.maxOuterIterations, NULL, 0, -1,
+             op_focei.abstol, op_focei.reltol, g.begin());
   // Recalculate OFV in case the last calculated OFV isn't at the minimum....
   // Otherwise ETAs may be off
-  std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0); // All etas = -42;  Unlikely if normal
+  std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
   // Finalize environment
   foceiOuterFinal(x.begin(), e);
   e["convergence"] = fail;
-  e["message"] = msg;
+  e["message"] = lbfgsbTaskName(fail);
   e["lastGrad"] = g;
 }
 
@@ -10066,9 +10732,7 @@ void foceiLbfgsb(Environment e){
   double Fmin;
   int fail, fncount=0, grcount=0;
   NumericVector x(op_focei.npars);
-  for (unsigned int k = op_focei.npars; k--;){
-    x[k]=scalePar(op_focei.initPar, k);
-  }
+  foceiOuterStart(x.begin());
   char msg[100];
   lbfgsbRX(op_focei.npars, op_focei.lmm, x.begin(), op_focei.lower,
            op_focei.upper, op_focei.nbd, &Fmin, foceiOfvOptim,
@@ -10077,7 +10741,7 @@ void foceiLbfgsb(Environment e){
            op_focei.maxOuterIterations, msg, 0, op_focei.maxOuterIterations+1);
   // Recalculate OFV in case the last calculated OFV isn't at the minimum....
   // Otherwise ETAs may be off
-  std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0); // All etas = -42;  Unlikely if normal
+  std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
   // Finalize environment
   foceiOuterFinal(x.begin(), e);
   e["convergence"] = fail;
@@ -10088,9 +10752,7 @@ void foceiCustomFun(Environment e){
   NumericVector x(op_focei.npars);
   NumericVector lower(op_focei.npars);
   NumericVector upper(op_focei.npars);
-  for (unsigned int k = op_focei.npars; k--;){
-    x[k]=scalePar(op_focei.initPar, k);
-  }
+  foceiOuterStart(x.begin());
   std::copy(&op_focei.upper[0], &op_focei.upper[0]+op_focei.npars, &upper[0]);
   std::copy(&op_focei.lower[0], &op_focei.lower[0]+op_focei.npars, &lower[0]);
   Function loadNamespace("loadNamespace", R_BaseNamespace);
@@ -10099,14 +10761,17 @@ void foceiCustomFun(Environment e){
   Function g = as<Function>(nlmixr2["foceiOuterG"]);
   List ctl = clone(as<List>(e["control"]));
   ctl["hessian"] = nlmixr2["foceiOuterH"];
+  ctl["outerRecord"] = nlmixr2[".foceiOuterRecord"];
+  ctl["outerHold"] = nlmixr2[".foceiOuterHold"];
   Function opt = as<Function>(ctl["outerOptFun"]);
   //.bobyqa <- function(par, fn, gr, lower = -Inf, upper = Inf, control = list(), ...)
   List ret = as<List>(opt(_["par"]=x, _["fn"]=f, _["gr"]=g, _["lower"]=lower,
                           _["upper"]=upper,_["control"]=ctl));
+  foceiOuterHold_(false);
   x = ret["x"];
   // Recalculate OFV in case the last calculated OFV isn't at the minimum....
   // Otherwise ETAs may be off
-  if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0); // All etas = -42;  Unlikely if normal
+  if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
   // Finalize environment
   foceiOuterFinal(x.begin(), e);
   e["convergence"] = ret["convergence"];
@@ -10127,6 +10792,7 @@ Environment foceiOuter(Environment e){
   } activeScope;
   op_focei.nF=0;
   op_focei.nG=0;
+  op_focei.recordOuter = true;
   op_focei.curAnalytic=0;
   op_focei.nAnalyticGrad=0;
   op_focei.nAnalyticGradDirect=0;
@@ -10135,6 +10801,7 @@ Environment foceiOuter(Environment e){
   op_focei.nInnerRanked.store(0, std::memory_order_relaxed);
   op_focei.nInnerReranked.store(0, std::memory_order_relaxed);
   op_focei.nInnerNoGood.store(0, std::memory_order_relaxed);
+  op_focei.nNearPdDiag.store(0, std::memory_order_relaxed);
   op_focei.nInnerDropped.store(0, std::memory_order_relaxed);
   op_focei.nDeclineNewton=0;
   op_focei.nDeclineE0=0;
@@ -10165,16 +10832,18 @@ Environment foceiOuter(Environment e){
   op_focei.firstDirectGradSet=0;
   op_focei.nFDGradFast=0;
   op_focei.warnedAnalyticFallback=0;
+  op_focei.warnedResetNoProgress=0;
   op_focei.warnedContribFallback=0;
   if (op_focei.maxOuterIterations > 0){
     for (unsigned int k = op_focei.npars; k--;){
       if (R_FINITE(op_focei.lower[k])){
-        op_focei.lower[k]=scalePar(op_focei.lower, k);
+        op_focei.lower[k]=scaleScalePar(&op_focei, op_focei.lower, k);
       }
       if (R_FINITE(op_focei.upper[k])) {
-        op_focei.upper[k]=scalePar(op_focei.upper,k);
+        op_focei.upper[k]=scaleScalePar(&op_focei, op_focei.upper,k);
       }
     }
+    op_focei.boundsScaled = true;
 
     // Enable the analytic outer gradient only for the duration of the outer
     // optimizer's gradient callbacks; foceiS's own numericGrad use runs later
@@ -10198,9 +10867,7 @@ Environment foceiOuter(Environment e){
     op_foceiUseAnalyticGrad = false;
   } else {
     NumericVector x(op_focei.npars);
-    for (unsigned int k = op_focei.npars; k--;){
-      x[k]=scalePar(op_focei.initPar, k);
-    }
+    foceiOuterStart(x.begin());
     // fast=TRUE with no outer iterations (a posthoc fit): evaluate the analytic gradient
     // ONCE at the reported estimates and stash it.  Without this there is no way to get
     // the gradient the fit's own machinery produces at a known point -- the outer
@@ -10215,7 +10882,7 @@ Environment foceiOuter(Environment e){
     // state.  Running it afterwards would hand the tables the augmented solve.
     //
     // This branch sets scaleObjective = 0 and does no parameter scaling, so
-    // dUnscaleParDx is the identity and the stashed gradient is on the NATURAL scale --
+    // scaleAdjustGradScale is the identity and the stashed gradient is on the NATURAL scale --
     // the same scale .foceiGradDirect() reports.
     //
     // The evaluation is DIAGNOSTIC, so it must not move the fit's own state.
@@ -10295,9 +10962,12 @@ List nlmixr2Gill83_(Function what, NumericVector args, Environment envir,
   if (args.size()!=which.size()) stop("'args' must have same size as 'which'");
   gillRfn_=what;
   gillThetaN=args.size();
+  gillRlike_=args;
   gillRfnE_=envir;
-  double *theta;
-  theta = &args[0];
+  // search a copy: args is the caller's own vector (no copy on the way in), and an
+  // error part-way through a search would leave it at the probe
+  std::vector<double> x(args.begin(), args.end());
+  double *theta = x.data();
   NumericVector hfN(args.size());
   NumericVector hphifN(args.size());
   NumericVector gillDfN(args.size());
@@ -10308,43 +10978,31 @@ List nlmixr2Gill83_(Function what, NumericVector args, Environment envir,
   NumericVector aEpsC(args.size());
   NumericVector rEpsC(args.size());
   IntegerVector retN(args.size());
-  gillLong=false;
   NumericVector fN(args.size());
-  double gillF;
+  // f at the base point, taken once at the first searched parameter and reported
+  // on every row; NA when no parameter is searched
+  double f0 = NA_REAL;
+  bool haveF0 = false;
   for (int i = args.size(); i--;){
     if (which[i]){
       gillPar=i;
-      if (i == args.size()-1 || gillLong){
-        gillF = gillRfn(theta);
+      if (!haveF0){
+        f0 = gillRfn(theta);
+        haveF0 = true;
       }
-      fN[i] = gillF;
       retN[i] = gill83(&hfN[i], &hphifN[i], &gillDfN[i], &gillDf2N[i], &gillErrN[i],
                        theta, i, gillRtol, gillK, gillStep,
                        gillFtol,
-                       -1, gill83fnG, 0, gillF) + 1;
-      double err=1/(std::fabs(theta[i])+1);
-      aEps[i]  = hfN[i]*err;
-      rEps[i]  = hfN[i]*err;
-      if(optGillF){
-        aEpsC[i] = hfN[i]*err;
-        rEpsC[i] = hfN[i]*err;
-      } else {
-        aEpsC[i] = hphifN[i]*err;
-        rEpsC[i] = hphifN[i]*err;
-      }
+                       -1, gill83fnG, 0, f0) + 1;
+      gill83Eps(hfN[i], hphifN[i], 1/(std::fabs(theta[i])+1), optGillF,
+                &aEps[i], &rEps[i], &aEpsC[i], &rEpsC[i]);
     } else {
       retN[i] = 1;
-      hfN[i] = NA_REAL;
-      hphifN[i] = NA_REAL;
-      gillDfN[i] = NA_REAL;
-      gillDf2N[i] = NA_REAL;
-      gillErrN[i] = NA_REAL;
-      aEps[i]  = NA_REAL;
-      rEps[i]  = NA_REAL;
-      aEpsC[i]  = NA_REAL;
-      rEpsC[i]  = NA_REAL;
+      hfN[i] = hphifN[i] = gillDfN[i] = gillDf2N[i] = gillErrN[i] = NA_REAL;
+      aEps[i] = rEps[i] = aEpsC[i] = rEpsC[i] = NA_REAL;
     }
   }
+  std::fill(fN.begin(), fN.end(), f0);
   List df(11);
   retN.attr("levels") = CharacterVector::create("Not Assessed","Good","High Grad Error",
                                                 "Constant Grad","Odd/Linear Grad",
@@ -10379,6 +11037,52 @@ List nlmixr2Gill83_(Function what, NumericVector args, Environment envir,
   df.attr("class") = cls;
   return df;
 }
+// Default theta names t1, t2, ... for an nlmixr2GradFun() objective
+static CharacterVector nlmixr2EvalDefaultNames(int n) {
+  CharacterVector tn(n);
+  for (int i = 0; i < n; i++){
+    tn[i] = "t" + std::to_string(i+1);
+  }
+  return tn;
+}
+
+// First evaluation: reset the recorded history and print the header
+static void nlmixr2EvalStart(Environment &gradInfo, int nEW, int n, int printN,
+                             int printNcol, bool useColor) {
+  vGrad.clear();
+  vPar.clear();
+  iterType.clear();
+  gradType.clear();
+  niter.clear();
+  niterGrad.clear();
+  if (printN == 0) return;
+  scalePrintLine(1, min2(n, printNcol));
+  if (!gradInfo.exists("thetaNames") ||
+      as<CharacterVector>(gradInfo["thetaNames"]).size() != nEW){
+    gradInfo["thetaNames"] = nlmixr2EvalDefaultNames(nEW);
+  }
+  CharacterVector thetaNames = gradInfo["thetaNames"];
+  RSprintf("|    #| Objective Fun |");
+  int i=0, finalize=0;
+  std::string tmpS;
+  for (i = 0; i < n; i++){
+    tmpS = thetaNames[i];
+    RSprintf("%#10s |", tmpS.c_str());
+    finalize |= scalePrintWrap(1, i, n, printNcol, useColor && printNcol + i >= n);
+  }
+  scalePrintRowEnd(finalize, i, printNcol, useColor);
+}
+
+// The parameter columns of one printed iteration row
+static void nlmixr2EvalPrintVals(const double *v, int n, int printNcol, bool useColor) {
+  int i, finalize=0;
+  for (i = 0; i < n; i++){
+    RSprintf("%#10.4g |", v[i]);
+    finalize |= scalePrintWrap(1, i, n, printNcol, useColor && printNcol + i > n);
+  }
+  scalePrintRowEnd(finalize, i, printNcol, useColor);
+}
+
 //' @rdname nlmixr2GradFun
 //' @export
 //[[Rcpp::export]]
@@ -10401,169 +11105,50 @@ double nlmixr2Eval_(NumericVector theta, std::string md5){
   if (lEW.size() != theta.size()) stop("invalid theta size");
   Function cFun = as<Function>(gradInfo[EF]);
   Environment cEnvir = as<Environment>(gradInfo[EE]);
-  double f0;
-  List par(1);
-  par[0] = theta;
-  f0 = as<double>(doCall(_["what"] = cFun, _["args"]=par, _["envir"]=cEnvir));
+  double f0 = nlmixr2RObjAt(cFun, cEnvir, theta.begin(), theta.size(), theta);
   std::string f0s = md5 + ".fc";
   std::string f0t = md5 + ".ft";
   std::string cns = md5 + ".n";
-  f0 = as<double>(doCall(_["what"] = cFun, _["args"]=par, _["envir"]=cEnvir));
   gradInfo[f0s] = f0;
-  gradInfo[f0t] = theta;
+  gradInfo[f0t] = clone(theta); // the key must not alias the caller's vector
   int cn = gradInfo[cns]; cn++;
   gradInfo[cns] = cn;
   bool useColor = as<bool>(gradInfo["useColor"]);
   int printNcol=as<int>(gradInfo["printNcol"]);
   int printN=as<int>(gradInfo["print"]);
-  int i, finalize=0, n=theta.size();
+  int n=theta.size();
   bool isRstudio=as<bool>(gradInfo["isRstudio"]);
-  if (cn == 1){
-    vGrad.clear();
-    vPar.clear();
-    iterType.clear();
-    gradType.clear();
-    niter.clear();
-    niterGrad.clear();
-    if (printN != 0){
-      foceiPrintLine(min2(n, printNcol));
-      if (gradInfo.exists("thetaNames")){
-        CharacterVector tn;
-        tn = gradInfo["thetaNames"];
-        if (tn.size()!=lEW.size()){
-          CharacterVector tn2(lEW.size());
-          for (int i = 0; i < lEW.size(); i++){
-            tn2[i] = "t" + std::to_string(i+1);
-          }
-          gradInfo["thetaNames"]=tn2;
-        }
-      } else {
-        CharacterVector tn(lEW.size());
-        for (int i = 0; i < lEW.size(); i++){
-          tn[i] = "t" + std::to_string(i+1);
-        }
-        gradInfo["thetaNames"]=tn;
-      }
-      CharacterVector thetaNames = gradInfo["thetaNames"];
-      RSprintf("|    #| Objective Fun |");
-      int i=0, finalize=0;
-      std::string tmpS;
-      for (i = 0; i < n; i++){
-        tmpS = thetaNames[i];
-        RSprintf("%#10s |", tmpS.c_str());
-        if ((i + 1) != n && (i + 1) % printNcol == 0){
-          if (useColor && printNcol + i  >= n){
-            RSprintf("\n\033[4m|.....................|");
-          } else {
-            RSprintf("\n|.....................|");
-          }
-          finalize=1;
-        }
-      }
-      if (finalize){
-        while(true){
-          if ((i++) % printNcol == 0){
-            if (useColor) RSprintf("\033[0m");
-            RSprintf("\n");
-            break;
-          } else {
-            RSprintf("...........|");
-          }
-        }
-      } else {
-        RSprintf("\n");
-      }
-    }
-  }
-  bool doUnscaled = false;
+  if (cn == 1) nlmixr2EvalStart(gradInfo, lEW.size(), n, printN, printNcol, useColor);
   std::string unscaledPar = md5 + ".uPar";
   NumericVector thetaU;
   niter.push_back(cn);
   // Scaled
   vPar.push_back(f0);
-  if (gradInfo.exists(unscaledPar)){
+  bool doUnscaled = gradInfo.exists(unscaledPar);
+  if (doUnscaled){
     thetaU=as<NumericVector>(gradInfo[unscaledPar]);
-    if (thetaU.size() != theta.size()){
-      iterType.push_back(6);
-    } else {
-      doUnscaled=true;
-      iterType.push_back(5);
-    }
-  } else {
-    // Actually unscaled
-    iterType.push_back(6);
+    doUnscaled = thetaU.size() == theta.size();
   }
-  for (i = 0; i < n; i++){
-    vPar.push_back(theta[i]);
-  }
-  if (printN != 0 && cn % printN == 0){
+  // 5: scaled with an unscaled row to follow; 6: actually unscaled
+  iterType.push_back(doUnscaled ? 5 : 6);
+  vPar.insert(vPar.end(), theta.begin(), theta.end());
+  bool doPrint = printN != 0 && cn % printN == 0;
+  if (doPrint){
     if (useColor && isRstudio)
       RSprintf("|\033[1m%5d\033[0m|%#14.8g |", cn, f0);
     else
       RSprintf("|%5d|%#14.8g |", cn, f0);
-    for (i = 0; i < n; i++){
-      RSprintf("%#10.4g |", theta[i]);
-      if ((i + 1) != n && (i + 1) % printNcol == 0){
-        if (useColor && printNcol + i  > n){
-          RSprintf("\n\033[4m|.....................|");
-        } else {
-          RSprintf("\n|.....................|");
-        }
-        finalize=1;
-      }
-    }
-    if (finalize){
-      while(true){
-        if ((i++) % printNcol == 0){
-          if (useColor) RSprintf("\033[0m");
-          RSprintf("\n");
-          break;
-        } else {
-          RSprintf("...........|");
-        }
-      }
-    } else {
-      RSprintf("\n");
-    }
+    nlmixr2EvalPrintVals(theta.begin(), n, printNcol, useColor);
   }
   if (doUnscaled){
     iterType.push_back(6);
     niter.push_back(niter.back());
-    finalize=0;
     // No obj scaling currently
     vPar.push_back(f0);
-    for (i = 0; i < n; i++){
-      vPar.push_back(thetaU[i]);
-    }
-    if (printN != 0 && cn % printN == 0){
-      if (useColor && isRstudio)
-        RSprintf("|    U|%#14.8g |", f0);
-      else
-        RSprintf("|    U|%#14.8g |", f0);
-      for (i = 0; i < n; i++){
-        RSprintf("%#10.4g |", thetaU[i]);
-        if ((i + 1) != n && (i + 1) % printNcol == 0){
-          if (useColor && printNcol + i  > n){
-            RSprintf("\n\033[4m|.....................|");
-          } else {
-            RSprintf("\n|.....................|");
-          }
-          finalize=1;
-        }
-      }
-      if (finalize){
-        while(true){
-          if ((i++) % printNcol == 0){
-            if (useColor) RSprintf("\033[0m");
-            RSprintf("\n");
-            break;
-          } else {
-            RSprintf("...........|");
-          }
-        }
-      } else {
-        RSprintf("\n");
-      }
+    vPar.insert(vPar.end(), thetaU.begin(), thetaU.end());
+    if (doPrint){
+      RSprintf("|    U|%#14.8g |", f0);
+      nlmixr2EvalPrintVals(thetaU.begin(), n, printNcol, useColor);
     }
   }
   return f0;
@@ -10573,36 +11158,10 @@ void nlmixr2GradPrint(NumericVector gr, int gradType, int cn, bool useColor,
                       int printNcol, int printN, bool isRstudio){
   int n = gr.size(), finalize=0, i;
   if (printN != 0 && cn % printN == 0){
-    if (useColor && printNcol >= n){
-      switch(gradType){
-      case 1:
-        RSprintf("|\033[4m    G|    Gill Diff. |");
-        break;
-      case 2:
-        RSprintf("|\033[4m    M|   Mixed Diff. |");
-        break;
-      case 3:
-        RSprintf("|\033[4m    F| Forward Diff. |");
-        break;
-      case 4:
-        RSprintf("|\033[4m    C| Central Diff. |");
-        break;
-      }
-    } else {
-      switch(gradType){
-      case 1:
-        RSprintf("|    G|    Gill Diff. |");
-        break;
-      case 2:
-        RSprintf("|    M|   Mixed Diff. |");
-        break;
-      case 3:
-        RSprintf("|    F| Forward Diff. |");
-        break;
-      case 4:
-        RSprintf("|    C| Central Diff. |");
-        break;
-      }
+    static const char *label[] = {"    G|    Gill Diff. |", "    M|   Mixed Diff. |",
+                                  "    F| Forward Diff. |", "    C| Central Diff. |"};
+    if (gradType >= 1 && gradType <= 4) {
+      RSprintf("|%s%s", (useColor && printNcol >= n) ? "\033[4m" : "", label[gradType - 1]);
     }
     for (i = 0; i < n; i++){
       RSprintf("%#10.4g ", gr[i]);
@@ -10610,30 +11169,11 @@ void nlmixr2GradPrint(NumericVector gr, int gradType, int cn, bool useColor,
         RSprintf("\033[0m");
       }
       RSprintf("|");
-      if ((i + 1) != n && (i + 1) % printNcol == 0){
-        if (useColor && printNcol + i  >= n){
-          RSprintf("\n\033[4m|.....................|");
-        } else {
-          RSprintf("\n|.....................|");
-        }
-        finalize=1;
-      }
+      finalize |= scalePrintWrap(1, i, n, printNcol, useColor && printNcol + i >= n);
     }
-    if (finalize){
-      while(true){
-        if ((i++) % printNcol == 0){
-          if (useColor) RSprintf("\033[0m");
-          RSprintf("\n");
-          break;
-        } else {
-          RSprintf("...........|");
-        }
-      }
-    } else {
-      RSprintf("\n");
-    }
+    scalePrintRowEnd(finalize, i, printNcol, useColor);
     if (!useColor){
-      foceiPrintLine(min2(n, printNcol));
+      scalePrintLine(1, min2(n, printNcol));
     }
   }
 }
@@ -10699,30 +11239,28 @@ NumericVector nlmixr2Grad_(NumericVector theta, std::string md5){
                            gradInfo[EK], gradInfo[Estep],
                            gradInfo[EFtol]);
     gradInfo[Egill]=Lgill;
-    niterGrad.push_back(niter.back());
-    gradType.push_back(1);
-    vGrad.push_back(NA_REAL); // Gradient doesn't record objf
-    NumericVector gr = as<NumericVector>(Lgill["df"]);
-    for (int i = 0; i < gr.size(); i++){
-      if (gr[i] == 0){
-        stop("On initial gradient evaluation, one or more parameters have a zero gradient\nChange model, try different initial estimates or try derivative free optimization)");
+    // the first gradient is the Gill search's own; gillK = 0 runs no search and so
+    // gives no derivative, and differences with its starting interval below
+    if (as<int>(gradInfo[EK]) != 0) {
+      niterGrad.push_back(niter.back());
+      gradType.push_back(1);
+      vGrad.push_back(NA_REAL); // Gradient doesn't record objf
+      NumericVector gr = as<NumericVector>(Lgill["df"]);
+      for (int i = 0; i < gr.size(); i++){
+        if (gr[i] == 0){
+          stop("On initial gradient evaluation, one or more parameters have a zero gradient\nChange model, try different initial estimates or try derivative free optimization)");
+        }
+        vGrad.push_back(gr[i]);
       }
-      vGrad.push_back(gr[i]);
+      nlmixr2GradPrint(gr, gradType.back(), niter.back(), useColor,
+                       printNcol, printN, isRstudio);
+      return gr;
     }
-    nlmixr2GradPrint(gr, gradType.back(), niter.back(), useColor,
-                     printNcol, printN, isRstudio);
-    return gr;
   }
   NumericVector aEps = as<NumericVector>(Lgill["aEps"]);
   NumericVector rEps = as<NumericVector>(Lgill["rEps"]);
-  NumericVector aEpsC = as<NumericVector>(Lgill["aEpsC"]);
-  NumericVector rEpsC = as<NumericVector>(Lgill["rEpsC"]);
   NumericVector g(theta.size());
-  double f0, delta, cur, tmp=0, tmp0;
-  bool doForward=true;
-  // FIXME
-  List par(1);
-  par[0] = theta;
+  double f0, delta, cur;
   std::string f0s = md5 + ".fc";
   std::string f0t = md5 + ".ft";
   bool reEval = true;
@@ -10747,67 +11285,30 @@ NumericVector nlmixr2Grad_(NumericVector theta, std::string md5){
     }
   }
   if (reEval){
-    f0 = as<double>(doCall(_["what"] = cFun, _["args"]=par, _["envir"]=cEnvir));
+    f0 = nlmixr2RObjAt(cFun, cEnvir, theta.begin(), theta.size(), theta);
   }
   niterGrad.push_back(niter.back());
   vGrad.push_back(NA_REAL); // Gradient doesn't record objf
+  // Forward differences on a copy (theta is the caller's own vector); a non-finite
+  // forward leg switches to a backward one.
+  NumericVector th = clone(theta);
   bool isMixed=false;
-  for (int i = theta.size(); i--;){
-    cur = theta[i];
-    if (doForward){
-      delta = (std::fabs(theta[i])*rEps[i] + aEps[i]);
-      theta[i] = cur + delta;
-      par[0] = theta;
-      tmp = as<double>(doCall(_["what"] = cFun, _["args"]=par, _["envir"]=cEnvir));
-      g[i] = (tmp-f0)/delta;
-      theta[i] = cur;
-    } else {
-      delta = (std::fabs(theta[i])*rEpsC[i] + aEpsC[i]);
-      theta[i] = cur + delta;
-      par[0] = theta;
-      tmp0 = as<double>(doCall(_["what"] = cFun, _["args"]=par, _["envir"]=cEnvir));
-      theta[i] = cur - delta;
-      par[0] = theta;
-      tmp = as<double>(doCall(_["what"] = cFun, _["args"]=par, _["envir"]=cEnvir));
-      g[i] = (tmp0-tmp)/(2*delta);
-      theta[i] = cur;
+  for (int i = th.size(); i--;){
+    cur = th[i];
+    delta = (std::fabs(cur)*rEps[i] + aEps[i]);
+    th[i] = cur + delta;
+    g[i] = (nlmixr2RObjAt(cFun, cEnvir, th.begin(), th.size(), theta)-f0)/delta;
+    if (!R_FINITE(g[i])){
+      th[i] = cur - delta;
+      g[i] = (f0-nlmixr2RObjAt(cFun, cEnvir, th.begin(), th.size(), theta))/(delta);
+      isMixed=true;
     }
-
-    // Check for bad grad
-    if (std::isnan(g[i]) ||  ISNA(g[i]) || !R_FINITE(g[i])){
-      if (doForward){
-        // Switch to Backward difference method
-        // op_focei.mixDeriv=1;
-        theta[i] = cur - delta;
-        par[0] = theta;
-        tmp0 = as<double>(doCall(_["what"] = cFun, _["args"]=par, _["envir"]=cEnvir));
-        g[i] = (f0-tmp0)/(delta);
-        isMixed=true;
-      } else {
-        // We are using the central difference AND there is an NA in one of the terms
-        // g[cpar] = (tmp0-tmp)/(2*delta);
-        // op_focei.mixDeriv=1;
-        isMixed=true;
-        if (std::isnan(tmp0) || ISNA(tmp0) || !R_FINITE(tmp0)){
-          // Backward
-          g[i] = (f0-tmp)/delta;
-        } else {
-          // Forward
-          g[i] = (tmp0-f0)/delta;
-        }
-      }
-    }
+    th[i] = cur;
   }
   for (int i = 0; i < theta.size(); i++){
     vGrad.push_back(g[i]);
   }
-  if (isMixed){
-    gradType.push_back(2);
-  } else if (doForward) {
-    gradType.push_back(3);
-  } else {
-    gradType.push_back(4);
-  }
+  gradType.push_back(isMixed ? 2 : 3);
   nlmixr2GradPrint(g, gradType.back(), niter.back(), useColor,
                    printNcol, printN, isRstudio);
   return g;
@@ -10852,89 +11353,39 @@ RObject nlmixr2ParHist_(std::string md5){
   return gradInfo["parHistData"];
 }
 
+// An R closure (by do.call), with nlmixr2Hess's progress bar.
+struct RHessObj : FdHessObj {
+  Function fn;
+  SEXP envir, like;
+  int n, cur = 0, curTick = 0, totTick;
+  clock_t t0 = clock();
+  RHessObj(Function fn, SEXP envir, SEXP like, int n) : fn(fn), envir(envir), like(like), n(n), totTick(4*n + 2*n*(n-1)) {
+    nmProgressStart(totTick, t0);
+  }
+  double f(double *x) {
+    double ret = nlmixr2RObjAt(fn, envir, x, n, like);
+    curTick = par_progress(++cur, totTick, curTick, 1, t0, 0);
+    return ret;
+  }
+};
+
 //[[Rcpp::export]]
 RObject nlmixr2Hess_(RObject thetaT, RObject fT, RObject e,
                      RObject gillInfoT){
-  List par(1);
-  NumericVector theta = as<NumericVector>(thetaT);
-  Function f = as<Function>(fT);
+  NumericVector theta = clone(as<NumericVector>(thetaT));
   List gillInfo = as<List>(gillInfoT);
-  arma::mat H(theta.size(), theta.size(), fill::zeros);
-  double epsI, epsJ;
   NumericVector rEpsC = as<NumericVector>(gillInfo["rEpsC"]);
   NumericVector aEpsC = as<NumericVector>(gillInfo["aEpsC"]);
   NumericVector nF = as<NumericVector>(gillInfo["f"]);
-  double lastOfv=nF[0];
   int n = theta.size();
-  double f1,f2,f3,f4;
-  double ti, tj;
-  int i, j;
-  int totTick= 4*n +2*n*(n-1);
-  int cur = 0, curTick=0;
-  clock_t t0=clock();
-  for (i=n; i--;){
-    epsI = (std::fabs(theta[i])*rEpsC[i] + aEpsC[i]);
-    ti = theta[i];
-    theta[i] = ti + 2*epsI;
-    par[0]=theta;
-    f1 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-    cur++;
-    curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-    theta[i] = ti + epsI;
-    par[0]=theta;
-    f2 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-    cur++;
-    curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-    theta[i] = ti - epsI;
-    par[0]=theta;
-    f3 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-    cur++;
-    curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-    theta[i] = ti - 2*epsI;
-    par[0]=theta;
-    f4 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-    cur++;
-    curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-    theta[i] = ti;
-    H(i,i)=(-f1+16*f2-30*lastOfv+16*f3-f4)/(12*epsI*epsI);
-    for (j = i; j--;){
-      epsJ = (std::fabs(theta[j])*rEpsC[j] + aEpsC[j]);
-      // eps = sqrt(epsI*epsJ);// 0.5*epsI+0.5*epsJ;
-      // epsI = eps;
-      // epsJ = eps;
-      tj = theta[j];
-      theta[i] = ti + epsI;
-      theta[j] = tj + epsJ;
-      par[0]=theta;
-      f1 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-      cur++;
-      curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-      theta[i] = ti + epsI;
-      theta[j] = tj - epsJ;
-      par[0]=theta;
-      f2 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-      cur++;
-      curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-      theta[i] = ti - epsI;
-      theta[j] = tj + epsJ;
-      par[0]=theta;
-      f3 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-      cur++;
-      curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-      theta[i] = ti - epsI;
-      theta[j] = tj - epsJ;
-      par[0]=theta;
-      f4 = as<double>(doCall(_["what"] = f, _["args"]=par, _["envir"]=e));
-      cur++;
-      curTick = par_progress(cur, totTick, curTick, 1, t0, 0);
-      H(i,j)= (f1-f2-f3+f4)/(4*epsI*epsJ);
-      H(j,i) = H(i,j);
-      theta[i] = ti;
-      theta[j] = tj;
-    }
-  }
-  par_progress(totTick, totTick, cur, 1, t0, 0);
-  if (isRstudio){
+  std::vector<double> h(n);
+  for (int i = n; i--;) h[i] = std::fabs(theta[i])*rEpsC[i] + aEpsC[i];
+  RHessObj obj(as<Function>(fT), e, thetaT, n);
+  arma::mat H;
+  // the objective is -LL, so the Hessian is used as it is
+  fdHessian(obj, theta.begin(), n, nF[0], h.data(), H, 1.0, false, false);
+  par_progress(obj.totTick, obj.totTick, obj.cur, 1, obj.t0, 0);
+  if (isRstudio()){
     RSprintf("\n");
   } else {
     RSprintf("\r                                                                                \r");
@@ -10944,6 +11395,50 @@ RObject nlmixr2Hess_(RObject thetaT, RObject fT, RObject e,
 
 ////////////////////////////////////////////////////////////////////////////////
 // Covariance functions
+
+// cholSE0 of the R (X = "R") or S ("S") matrix M, stored for foceiCovUsable() as
+// e["<X>.pd"], e["<X>.E"] and e["chol<X>"].
+static void foceiCovChol(Environment e, const arma::mat &M, const std::string &X) {
+  arma::mat ch, E;
+  bool pd = cholSE0(ch, E, M, op_focei.cholSEtol);
+  e[X + ".pd"] = wrap(pd);
+  e[X + ".E"] = wrap(E);
+  e["chol" + X] = wrap(ch);
+}
+
+// Whether the R (X = "R") or S ("S") matrix M0 can be used, by covAcceptRule() on
+// foceiCovChol()'s factorization: label "r+"/"s+" or "|r|"/"|s|" when repaired (the
+// latter replaces e["chol<X>"]).  A rank-deficient M0 may still be "r+" here.
+static bool foceiCovUsable(Environment e, const std::string &X, const arma::mat &M0,
+                           std::string &lab, bool &checkSandwich) {
+  std::string x(1, (char)std::tolower(X[0]));
+  arma::mat U = as<arma::mat>(e["chol" + X]);
+  arma::vec E = as<arma::vec>(e[X + ".E"]);
+  int rc = covAcceptRule(M0, as<bool>(e[X + ".pd"]), E, U, op_focei.cholAccept);
+  if (rc == 1) return true;
+  if (rc <= 0) return false;
+  checkSandwich = true;
+  if (rc == 2) {
+    lab = x + "+";
+  } else {
+    e["chol" + X] = wrap(U);
+    lab = "|" + x + "|";
+  }
+  return true;
+}
+
+// X^{-1} from X = U'U (U upper triangular), through the pseudo-inverse of U, with a
+// warning naming `what`, when U is singular (then true).
+static bool foceiCholInv(const arma::mat &U, arma::mat &Xinv, const char *what) {
+  arma::mat Ui;
+  bool singular = !arma::inv(Ui, arma::trimatu(U));
+  if (singular) {
+    warning(_("%s matrix seems singular; Using pseudo-inverse"), what);
+    Ui = arma::pinv(arma::trimatu(U));
+  }
+  Xinv = Ui * Ui.t();
+  return singular;
+}
 
 // R-callable bridge to shi21Central (analytic-cov 3rd-order tensor): `f` returns
 // the vector to difference (NULL/short -> NaN, which shi21Central tolerates).
@@ -10969,199 +11464,127 @@ Rcpp::List shi21CentralWrap(Rcpp::Function f, arma::vec t, arma::vec f0, int idx
   return Rcpp::List::create(_["h"] = h, _["gr"] = gr);
 }
 
-int foceiCalcR(Environment e){
+// The methods foceiControl(covFallback=) lists for a covariance method ("r,s", "r", "s",
+// "analytic"), in order; none when the control has no entry for it.
+static std::vector<std::string> covFallbackFor(Environment e, const std::string &method) {
+  std::vector<std::string> ret;
+  if (!e.exists("control")) return ret;
+  // a control saved before covFallback existed gets foceiControl()'s default
+  Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
+  Function of = as<Function>(nlmixr2[".covFallbackOf"]);
+  List fb = as<List>(of(e["control"]));
+  if (!fb.containsElementNamed(method.c_str())) return ret;
+  RObject v = fb[method];
+  if (TYPEOF(v) != STRSXP) return ret;
+  CharacterVector cv(v);
+  for (int i = 0; i < cv.size(); ++i) ret.push_back(as<std::string>(cv[i]));
+  return ret;
+}
+
+static int covSlotOf(const std::string &m) {
+  return m == "r,s" ? 1 : (m == "r" ? 2 : (m == "s" ? 3 : 0));
+}
+
+// Whether the control asks for the analytic covariance (covType = "analytic").
+static bool foceiCovTypeAnalytic(Environment e) {
+  if (!e.exists("control")) return false;
+  List _ctl = as<List>(e["control"]);
+  return _ctl.containsElementNamed("covType") && as<std::string>(_ctl["covType"]) == "analytic";
+}
+
+// covType="analytic": the exact analytic observed-information R-matrix while the
+// optimizer is live; `.foceiCalcRanalytic` returns the npars x npars R or NULL.
+// Returns 1 when R.0 is installed, 0 when the step must be abandoned (covMethod
+// is 0), and -1 when the analytic R is declined, with covMethod moved to the
+// finite-difference sandwich.
+static int foceiCalcRAnalytic(Environment e) {
   rx = getRxSolve_();
-  // covType="analytic": the exact analytic observed-information R-matrix while the
-  // optimizer is live; `.foceiCalcRanalytic` returns the npars x npars R or NULL to
-  // fall through to the finite-difference Hessian below.
-  {
-    List _ctl = as<List>(e["control"]);
-    std::string _covType = _ctl.containsElementNamed("covType") ?
-      as<std::string>(_ctl["covType"]) : "fd";
-    if (_covType == "analytic") {
-      Environment nlmixr2est = Environment::namespace_env("nlmixr2est");
-      Function af = as<Function>(nlmixr2est[".foceiCalcRanalytic"]);
-      RObject res = af(e);
-      if (!Rf_isNull(res)) {
-        arma::mat H0 = as<arma::mat>(res);
-        e["R.0"] = wrap(H0);
-        arma::mat cholR0, RE0;
-        bool rpd0 = cholSE0(cholR0, RE0, H0, op_focei.cholSEtol);
-        e["R.pd"] = wrap(rpd0);
-        e["R.E"]  = wrap(RE0);
-        e["cholR"] = wrap(cholR0);
-        // the augmented sensitivity solves replaced the fit's global solve; restore it
-        // so foceiFinalizeTables (llikObs, tolFactor) reads the fit, not the last
-        // subject.  If the restore fails the global solve is unusable -> abort the cov
-        // step (foceiCalcCov honors covMethod==0 as a clean skip) rather than let
-        // finalize read a dangling solve.
-        if (!restoreFitSolve_()) {
-          op_focei.covMethod = 0;
-          return 0;
-        }
-        return 1;
-      }
-      // analytic declined -> FD Hessian below.  Restore the freed global solve BEFORE
-      // the warning (options(warn=2) longjmps out); a failed restore -> failed cov,
-      // don't run FD against a freed solve.
-      if (e.exists(".analyticStarted") && as<bool>(e[".analyticStarted"])) {
-        if (!restoreFitSolve_()) {
-          op_focei.covMethod = 0;
-          return 0;
-        }
-      }
-      // tell the user (not silent).  RSprintf is the visible channel (like "Could not
-      // calculate covariance matrix"); the warning condition is for programmatic capture.
-      RSprintf("\rcovType=\"analytic\" not available for this model (out of scope, or "
-               "the augmented model would not build/solve); using the finite-difference "
-               "sandwich (\"r,s\") covariance.\n");
-      Rf_warning("covType=\"analytic\": the analytic covariance is not available for "
-                 "this model; used the finite-difference sandwich (\"r,s\") covariance instead.");
-      // analytic requested but unavailable -> fall back to the finite-difference SANDWICH
-      // ("r,s"), not the R-matrix alone ("r"): covMethod=2 was only the internal slot the
-      // "analytic" token maps to.  The S block in foceiCalcCov fires once this is 1.
-      if (op_focei.covMethod == 2) op_focei.covMethod = 1;
+  Environment nlmixr2est = Environment::namespace_env("nlmixr2est");
+  Function af = as<Function>(nlmixr2est[".foceiCalcRanalytic"]);
+  RObject res = af(e);
+  if (!Rf_isNull(res)) {
+    arma::mat H0 = as<arma::mat>(res);
+    e["R.0"] = wrap(H0);
+    foceiCovChol(e, H0, "R");
+    // the augmented sensitivity solves replaced the fit's global solve; restore it
+    // so foceiFinalizeTables (llikObs, tolFactor) reads the fit, not the last
+    // subject.  If the restore fails the global solve is unusable -> abort the cov
+    // step (foceiCalcCov honors covMethod==0 as a clean skip) rather than let
+    // finalize read a dangling solve.
+    if (!restoreFitSolve_()) {
+      op_focei.covMethod = 0;
+      return 0;
+    }
+    return 1;
+  }
+  // analytic declined -> the caller takes the FD Hessian.  Restore the freed global solve BEFORE
+  // the warning (options(warn=2) longjmps out); a failed restore -> failed cov,
+  // don't run FD against a freed solve.
+  if (e.exists(".analyticStarted") && as<bool>(e[".analyticStarted"])) {
+    if (!restoreFitSolve_()) {
+      op_focei.covMethod = 0;
+      return 0;
     }
   }
-  arma::mat H(op_focei.npars, op_focei.npars);
-  arma::vec theta(op_focei.npars);
-  unsigned int i, j, k;
-  for (k = op_focei.npars; k--;){
-    j=op_focei.fixedTrans[k];
-    theta[k] = op_focei.fullTheta[j];
+  // analytic declined: the first method covFallback$analytic lists (the finite-difference
+  // sandwich "r,s" by default); none listed fails the step.  RSprintf is the visible
+  // channel (like "Could not calculate covariance matrix"); the warning is for
+  // programmatic capture.
+  // the first finite-difference method listed; "sa"/"imp" come after the fit
+  std::vector<std::string> fb = covFallbackFor(e, "analytic");
+  int slot = 0;
+  std::string rung;
+  for (const std::string &m : fb) {
+    slot = covSlotOf(m);
+    if (slot != 0) {
+      rung = m;
+      break;
+    }
   }
+  if (slot == 0) {
+    RSprintf("\rcovType=\"analytic\" not available for this model, and covFallback lists "
+             "no fallback for it.\n");
+    Rf_warning("covType=\"analytic\": the analytic covariance is not available for this "
+               "model; covFallback lists no fallback");
+    op_focei.covMethod = 0;
+    return 0;
+  }
+  RSprintf("\rcovType=\"analytic\" not available for this model (out of scope, or "
+           "the augmented model would not build/solve); using the finite-difference "
+           "\"%s\" covariance.\n", rung.c_str());
+  Rf_warning("covType=\"analytic\": the analytic covariance is not available for "
+             "this model; used the finite-difference \"%s\" covariance instead.", rung.c_str());
+  op_focei.covMethod = slot;
+  return -1;
+}
 
-  // arma::vec df1(op_focei.npars);
-  // arma::vec df2(op_focei.npars);
-  double epsI, epsJ;
-
-  bool doForward=false;
-  if (op_focei.derivMethod == 0){
-    doForward=true;
+// The R matrix: the analytic one when asked for (unless already tried), else the
+// central finite-difference Hessian of -2LL at the steps the step search chose.
+int foceiCalcR(Environment e, bool tryAnalytic = true){
+  rx = getRxSolve_();
+  if (tryAnalytic && foceiCovTypeAnalytic(e)) {
+    int rc = foceiCalcRAnalytic(e);
+    if (rc >= 0) return rc;
   }
-  double f1,f2,f3,f4;
-  double ti, tj;
-  if (doForward){
-    stop("Not implemented for finite differences.");
-  } else {
-    //https://pdfs.semanticscholar.org/presentation/e7d5/aff49eb17fd155e75725c295859d983cfda4.pdf
-    // https://v8doc.sas.com/sashtml/ormp/chap5/sect28.htm
-    double fnscale = 1.0;
-    if (op_focei.scaleObjective == 2){
-      fnscale = op_focei.initObjective / op_focei.scaleObjectiveTo;
-    }
-    double parScaleI=1.0, parScaleJ=1.0;
-    for (i=op_focei.npars; i--;){
-      epsI = (std::fabs(theta[i])*op_focei.rEpsC[i] + op_focei.aEpsC[i]);
-      // > (45/12)^(1/5)
-      // [1] 1.302585542348676073132
-      // based on central error to stencil error which is closer to optimal for this difference
-      // epsI = pow(epsI, 3.0/5.0)*1.302585542348676073132;
-      ti = theta[i];
-      theta[i] = ti + 2*epsI;
-      updateTheta(theta.begin());
-      f1 = foceiOfv0(theta.begin());
-      if (ISNA(f1)) return 0;
-      op_focei.cur++;
-      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-      theta[i] = ti + epsI;
-      updateTheta(theta.begin());
-      f2 = foceiOfv0(theta.begin());
-      if (ISNA(f2)) return 0;
-      op_focei.cur++;
-      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-      theta[i] = ti - epsI;
-      updateTheta(theta.begin());
-      f3 = foceiOfv0(theta.begin());
-      if (ISNA(f3)) return 0;
-      op_focei.cur++;
-      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-      theta[i] = ti - 2*epsI;
-      updateTheta(theta.begin());
-      f4 = foceiOfv0(theta.begin());
-      if (ISNA(f4)) return 0;
-      op_focei.cur++;
-      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-      theta[i] = ti;
-      // RSprintf("-- i:%d, i: %d\n", i, i);
-      // print(NumericVector::create(f1,f2,f3,f4,op_focei.lastOfv));
-      H(i,i)=fnscale*(-f1+16*f2-30*op_focei.lastOfv+16*f3-f4)/(12*epsI*epsI*parScaleI*parScaleI);
-      for (j = i; j--;){
-        epsJ = (std::fabs(theta[j])*op_focei.rEpsC[j] + op_focei.aEpsC[j]);
-        epsI = (std::fabs(theta[i])*op_focei.rEpsC[i] + op_focei.aEpsC[i]);
-        // eps = sqrt(epsI*epsJ);// 0.5*epsI+0.5*epsJ;
-        // epsI = eps;
-        // epsJ = eps;
-        tj = theta[j];
-        theta[i] = ti + epsI;
-        theta[j] = tj + epsJ;
-        updateTheta(theta.begin());
-        f1 = foceiOfv0(theta.begin());
-        if (ISNA(f1)) return 0;
-        op_focei.cur++;
-        op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-        theta[i] = ti + epsI;
-        theta[j] = tj - epsJ;
-        updateTheta(theta.begin());
-        f2 = foceiOfv0(theta.begin());
-        if (ISNA(f2)) return 0;
-        op_focei.cur++;
-        op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-        theta[i] = ti - epsI;
-        theta[j] = tj + epsJ;
-        updateTheta(theta.begin());
-        f3 = foceiOfv0(theta.begin());
-        if (ISNA(f3)) return 0;
-        op_focei.cur++;
-        op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-        theta[i] = ti - epsI;
-        theta[j] = tj - epsJ;
-        updateTheta(theta.begin());
-        f4 = foceiOfv0(theta.begin());
-        if (ISNA(f4)) return 0;
-        op_focei.cur++;
-        op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-        // RSprintf("-- i:%d, j: %d\n", i, j);
-        // print(NumericVector::create(f1,f2,f3,f4));
-        H(i,j)= fnscale*(f1-f2-f3+f4)/(4*epsI*epsJ*parScaleI*parScaleJ);
-        H(j,i) = H(i,j);
-        theta[i] = ti;
-        theta[j] = tj;
-      }
-    }
+  // Hessian of -2LL about the base point at the steps |theta|*rEpsC + aEpsC, always by
+  // the central stencil (covDerivMethod chooses the S matrix's differences); the
+  // objective is unscaled for the whole covariance step.
+  arma::vec theta(op_focei.npars), h(op_focei.npars);
+  for (unsigned int k = op_focei.npars; k--;){
+    theta[k] = op_focei.fullTheta[op_focei.fixedTrans[k]];
+    h[k] = std::fabs(theta[k])*op_focei.rEpsC[k] + op_focei.aEpsC[k];
   }
+  FoceiHessObj obj;
+  // a mixture's S legs take each component's score separately (foceiS)
+  obj.keep = covReuseOn() && op_focei.mixIdxN == 0;
+  if (obj.keep) obj.x0.assign(theta.begin(), theta.end());
+  arma::mat H;
   // R matrix = Hessian/2
-  H = H*0.5;
   // https://github.com/cran/nmw/blob/59478fcc91f368bb3bbc23e55d8d1d5d53726a4b/R/CovStep.R
-  // H = 0.25*H + 0.25*H.t();
-  if (e.exists("R.1")){
-    // This is the 2nd attempt
-    arma::mat H2 = 0.5*H + 0.5*as<arma::mat>(e["R.1"]);
-    arma::mat cholR;
-    arma::mat RE;
-    bool rpd = cholSE0(cholR, RE, H2, op_focei.cholSEtol);
-    if (rpd){
-      e["R.pd"] =  rpd;
-      e["R.E"] =  wrap(RE);
-      e["cholR"] = wrap(cholR);
-    } else {
-      e["R.pd2"] = false;
-      e["R.2"] = H2;
-      e["R.E2"] = wrap(RE);
-      e["cholR2"] = wrap(cholR);
-      e["R.pd"] = cholSE0(cholR, RE, H, op_focei.cholSEtol);
-      e["R.E"] =  wrap(RE);
-      e["cholR"] = wrap(cholR);
-    }
-  } else {
-    e["R.0"] = H;
-    arma::mat cholR;
-    arma::mat RE;
-    bool rpd = cholSE0(cholR, RE, H, op_focei.cholSEtol);
-    e["R.pd"] =  wrap(rpd);
-    e["R.E"] =  wrap(RE);
-    e["cholR"] = wrap(cholR);
-  }
+  if (!fdHessian(obj, theta.memptr(), op_focei.npars, op_focei.lastOfv, h.memptr(), H,
+                 0.5, true, false)) return 0;
+  e["R.0"] = H;
+  foceiCovChol(e, H, "R");
   return 1;
 }
 
@@ -11184,6 +11607,7 @@ static void foceiSInnerAll(int slot, std::vector<int> &res) {
   bool doParallel = (cores > 1) && solveMethodThreadSafe(op);
   res.assign((size_t)nsub, 1);
   std::vector<int> ok((size_t)nsub, 0);
+  if (_covStage >= 0) _covEvals[_covStage]++;
   for (int m = 0; m < nMix; ++m) {
     std::fill(ok.begin(), ok.end(), 0);
     if (doParallel) sortIds(rx, 2);
@@ -11206,7 +11630,7 @@ static bool foceiSMixScore(int cpar, const std::vector<double> &mixR,
   if (op_focei.mixIdxN == 0 || op_focei.mixTrans == NULL ||
       op_focei.mixTrans[cpar] == -1) return false;
   int mi = op_focei.mixTrans[cpar];
-  double sc = dUnscaleParDx(cpar);
+  double sc = scaleAdjustGradScale(&op_focei, 1.0, cpar);
   for (int gid = 0; gid < (int)getRxNsub(rx); ++gid) {
     double r = mixR[(size_t)gid*nMixS + mi];
     double g = R_FINITE(r) ? -2.0*(r - mixP[(size_t)mi])*sc : 0.0;
@@ -11282,10 +11706,6 @@ static void foceiSMixCentral(int cpar, double delta, const arma::vec &gfull,
 int foceiS(double *theta, Environment e, bool &hasZero){
   int npars = op_focei.npars;
   int oldCalcGrad = op_focei.calcGrad;
-  op_focei.calcGrad = 1;
-  arma::vec gfull(npars);
-  numericGrad(theta, gfull.memptr());
-  op_focei.calcGrad = oldCalcGrad;
   hasZero = false;
   rx = getRxSolve_();
   op_focei.calcGrad=1;
@@ -11303,16 +11723,20 @@ int foceiS(double *theta, Environment e, bool &hasZero){
         break;
       }
     }
-    if (doForward){
-      // Fill in lik0.  For a mixture the subject's contribution is the MARGINAL
-      // over components, not component 0's -- see foceiMixObjSlot().
-      for (gid = getRxNsub(rx); gid--;){
-        if (op_focei.mixIdxN != 0) {
-          op_focei.likSav[gid] = foceiMixObjSlot(gid, 0);
-        } else {
-          fInd = &(inds_focei[gid]);
-          op_focei.likSav[gid] = -2*fInd->lik[0];
-        }
+  }
+  // likSav and the mixture responsibilities below are the subjects' values at the BASE
+  // theta, which foceiLik0At() evaluates unless theta was the last point evaluated (the
+  // R matrix stencil and the step search end on a perturbed leg).
+  if (doForward || op_focei.mixIdxN != 0) foceiLik0At(theta);
+  if (doForward){
+    // Fill in lik0.  For a mixture the subject's contribution is the MARGINAL
+    // over components, not component 0's -- see foceiMixObjSlot().
+    for (gid = getRxNsub(rx); gid--;){
+      if (op_focei.mixIdxN != 0) {
+        op_focei.likSav[gid] = foceiMixObjSlot(gid, 0);
+      } else {
+        fInd = &(inds_focei[gid]);
+        op_focei.likSav[gid] = -2*fInd->lik[0];
       }
     }
   }
@@ -11325,7 +11749,7 @@ int foceiS(double *theta, Environment e, bool &hasZero){
   // here from the per-component lik[0] rather than read from fInd->mixProb when
   // it is needed: the loop below perturbs theta, and neither innerOpt1() nor
   // updateTheta() refreshes the responsibilities, so a later read would be at
-  // the wrong point.  Same base-theta assumption likSav above already makes.
+  // the wrong point.
   int nMixS = (int)op_focei.mixIdxN + 1;
   std::vector<double> mixR, mixP;
   // Which subjects' FORWARD (slot 2) leg converged for the current cpar.  Held
@@ -11351,27 +11775,62 @@ int foceiS(double *theta, Environment e, bool &hasZero){
       }
     }
   }
+  auto sDelta = [&](int k) {
+    double d = doForward ? std::fabs(theta[k])*op_focei.rEps[k] + op_focei.aEps[k] :
+      std::fabs(theta[k])*op_focei.rEpsC[k] + op_focei.aEpsC[k];
+    // the centre value (covEtaStartF0), not the fit's initial objective: a refit's
+    // initial objective is its value at the estimates, by another procedure
+    if (smatNorm) d /= _safe_sqrt(1+std::fabs(op_focei.lastOfv));
+    return d;
+  };
+  // A central leg pair the R stencil already evaluated (_covThetaAxis) is read, not solved.
+  int nsubS = (int)getRxNsub(rx);
+  std::vector<const arma::vec*> axP(npars, nullptr), axM(npars, nullptr);
+  const bool canAxis = !doForward && op_focei.mixIdxN == 0;
+  bool allAxis = canAxis;
+  for (cpar = npars; canAxis && cpar--;) {
+    double d = sDelta(cpar);
+    if (!R_FINITE(d)) {
+      allAxis = false;
+      continue;
+    }
+    auto ip = _covThetaAxis.find(std::make_pair(cpar, theta[cpar] + d));
+    auto im = _covThetaAxis.find(std::make_pair(cpar, theta[cpar] - d));
+    if (ip != _covThetaAxis.end() && im != _covThetaAxis.end() &&
+        (int)ip->second.n_elem == nsubS && (int)im->second.n_elem == nsubS) {
+      axP[cpar] = &ip->second;
+      axM[cpar] = &im->second;
+    } else {
+      allAxis = false;
+    }
+  }
+  // The pooled gradient, a subject's fallback score below; not needed when every leg is
+  // read.  After the base values above: its finite-difference legs move them.  A zero
+  // component is a value here, not the outer optimizer's reset request that
+  // numericGrad() flags it as, so zeroGrad is put back as it was: it drives the "zero
+  // gradient replaced with small number" report and the theta reset in the next
+  // innerOpt().
+  arma::vec gfull(npars, fill::zeros);
+  if (!allAxis) {
+    ScopedRestore<bool> zeroGrad(op_focei.zeroGrad);
+    numericGrad(theta, gfull.memptr());
+  }
+  op_focei.calcGrad=1;
   double sInfoPer = npars * getRxNsub(rx);
   for (cpar = npars; cpar--;){
     // A mixture proportion's per-subject score is known in closed form, so the
     // finite difference is skipped entirely for those parameters.
     if (foceiSMixScore(cpar, mixR, mixP, nMixS)) continue;
-    double rEps = op_focei.rEps[cpar];
-    double rEpsC = op_focei.rEpsC[cpar];
-    if (smatNorm){
-      if (doForward){
-        delta = (std::fabs(theta[cpar])*rEps + op_focei.aEps[cpar])/_safe_sqrt(1+std::fabs(min2(op_focei.initObjective, op_focei.lastOfv)));
-      } else {
-        delta = (std::fabs(theta[cpar])*rEpsC + op_focei.aEpsC[cpar])/_safe_sqrt(1+std::fabs(min2(op_focei.initObjective, op_focei.lastOfv)));
+    delta = sDelta(cpar);
+    if (axP[cpar] != nullptr) {
+      for (gid = nsubS; gid--;) {
+        inds_focei[gid].thetaGrad[cpar] = ((*axP[cpar])[gid] - (*axM[cpar])[gid]) / (2*delta);
       }
-    } else {
-      if (doForward){
-        delta = std::fabs(theta[cpar])*rEps + op_focei.aEps[cpar];
-      } else {
-        delta = std::fabs(theta[cpar])*rEpsC + op_focei.aEpsC[cpar];
-      }
+      op_focei.cur++;
+      op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
+      continue;
     }
-    if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0); // All etas = -42;  Unlikely if normal
+    if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
     cur = theta[cpar];
     theta[cpar] = cur + delta;
     updateTheta(theta);
@@ -11383,6 +11842,7 @@ int foceiS(double *theta, Environment e, bool &hasZero){
       int _cores = getOpCores(_op);
       bool _doParallel = (_cores > 1) && solveMethodThreadSafe(_op);
       std::vector<int> _opt1Res(_nsub, 0);
+      if (_covStage >= 0) _covEvals[_covStage]++;
       if (_doParallel) sortIds(rx, 2);
       _innerParallel.store(1, std::memory_order_release);
       nmForEachSubject(rx, _nsub, _cores, _doParallel, [&](int _gid) {
@@ -11399,7 +11859,7 @@ int foceiS(double *theta, Environment e, bool &hasZero){
       for (int _gid = 0; _gid < _nsub; _gid++) {
         if (!_opt1Res[_gid]) {
           fInd = &(inds_focei[_gid]);
-          if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0);
+          if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
           theta[cpar] = cur - delta;
           updateTheta(theta);
           if (!innerOpt1(_gid, 2)) {
@@ -11414,7 +11874,7 @@ int foceiS(double *theta, Environment e, bool &hasZero){
       }
     }
     if (!doForward){
-      if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, -42.0);
+      if (op_focei.neta != 0) std::fill_n(&op_focei.goldEta[0], op_focei.gEtaGTransN, INNER_ETA_RESET_TO);
       theta[cpar] = cur - delta;
       updateTheta(theta);
       // Second inner loop: run innerOpt1(gid, 1) over subjects in parallel.
@@ -11425,6 +11885,7 @@ int foceiS(double *theta, Environment e, bool &hasZero){
         rx_solving_options *_op = getSolvingOptions(rx);
         int _cores = getOpCores(_op);
         bool _doParallel = (_cores > 1) && solveMethodThreadSafe(_op);
+        if (_covStage >= 0) _covEvals[_covStage]++;
         if (_doParallel) sortIds(rx, 2);
         _innerParallel.store(1, std::memory_order_release);
         nmForEachSubject(rx, _nsub, _cores, _doParallel, [&](int _gid) {
@@ -11447,7 +11908,10 @@ int foceiS(double *theta, Environment e, bool &hasZero){
     op_focei.cur++;
     op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
   }
-  op_focei.calcGrad=0;
+  updateTheta(theta); // the last leg left fullTheta at theta - delta
+  // Put back what the caller had (the covariance step owns the flag for its
+  // whole duration) rather than forcing 0 in the middle of that step.
+  op_focei.calcGrad=oldCalcGrad;
   // Now calculate S matrix
   arma::mat m1(1, op_focei.npars), S(op_focei.npars, op_focei.npars, fill::zeros), s1(1, op_focei.npars,fill::ones);
   for (gid = getRxNsub(rx); gid--;){
@@ -11465,23 +11929,32 @@ int foceiS(double *theta, Environment e, bool &hasZero){
   if (sInfoPer < op_focei.smatPer) {
     return 0;
   }
-  arma::mat cholS;
-  arma::mat SE;
-  e["S.pd"] =  cholSE0(cholS, SE, S, op_focei.cholSEtol);
-  e["S.E"] =  wrap(SE);
-  e["cholS"] = wrap(cholS);
+  foceiCovChol(e, S, "S");
   return 1;
 }
 //' Return the square root of general square matrix A
 //'
 //' @param m Matrix to take the square root of.
 //'
-//' @return A square root general square matrix of m
+//' @return A square root general square matrix of m.  A matrix that is not
+//'   finite is an error.
 //'
 //' @export
 //[[Rcpp::export]]
 NumericMatrix sqrtm(NumericMatrix m){
-  arma::cx_mat ret = sqrtmat(as<arma::mat>(m));
+  arma::mat x = as<arma::mat>(m);
+  // Armadillo's sqrtmat() empties its result for a non-finite matrix (or turns
+  // the NaN into "imaginary" components) instead of failing
+  if (!x.is_finite()) {
+    stop("sqrtm() needs a finite matrix");
+  }
+  arma::cx_mat ret;
+  // a false status also flags the approximate root of a singular matrix, which
+  // is returned; only an empty result is a failure
+  const bool exact = arma::sqrtmat(ret, x);
+  if (!exact && ret.n_elem != x.n_elem) {
+    stop("sqrtm() could not compute the square root");
+  }
   mat im = arma::imag(ret);
   mat re = arma::real(ret);
   if (arma::any(arma::any(im,0))){
@@ -11502,7 +11975,97 @@ void setupAq0_(Environment e) {
 }
 
 
-//[[Rcpp::export]]
+static bool foceiFdFullMerge(Environment e);
+// calcGrad as the covariance step found it (CovCalcGradGuard), for the full stage, which
+// runs with the fit's setting wherever it runs
+static int _covFitCalcGrad = 0;
+
+// The stored steps (e$covThetaStore$steps) onto op_focei, when they were taken about theta.
+static bool foceiThetaStepsFromStore(List sp, const arma::vec &theta) {
+  int np = (int)op_focei.npars;
+  NumericVector th = sp["theta"], aE = sp["aEps"], rE = sp["rEps"], aC = sp["aEpsC"], rC = sp["rEpsC"];
+  if (th.size() != np || aE.size() != np || rE.size() != np || aC.size() != np || rC.size() != np) {
+    return false;
+  }
+  for (int k = 0; k < np; ++k) {
+    if (th[k] != theta[k]) return false;
+  }
+  std::copy(aE.begin(), aE.end(), op_focei.aEps);
+  std::copy(rE.begin(), rE.end(), op_focei.rEps);
+  std::copy(aC.begin(), aC.end(), op_focei.aEpsC);
+  std::copy(rC.begin(), rC.end(), op_focei.rEpsC);
+  return true;
+}
+
+// The stored step search's outcome, for $scaleInfo and its warning
+static void foceiThetaGillFromStore(List sp) {
+  if (!sp.containsElementNamed("gillRetC")) return;
+  int np = (int)op_focei.npars;
+  IntegerVector gr = sp["gillRetC"];
+  NumericVector gd = sp["gillDf"], gd2 = sp["gillDf2"], ge = sp["gillErr"];
+  if (gr.size() != np || gd.size() != np || gd2.size() != np || ge.size() != np) return;
+  std::copy(gr.begin(), gr.end(), op_focei.gillRetC);
+  std::copy(gd.begin(), gd.end(), op_focei.gillDf);
+  std::copy(gd2.begin(), gd2.end(), op_focei.gillDf2);
+  std::copy(ge.begin(), ge.end(), op_focei.gillErr);
+  op_focei.didGill += 1;
+}
+
+// The stored finite-difference R, when the request uses R and none is installed
+static void foceiThetaRFromStore(Environment e, List st) {
+  if (!(op_focei.covMethod == 1 || op_focei.covMethod == 2) || e.exists("cholR") ||
+      !st.containsElementNamed("R0") || Rf_isNull(st["R0"])) return;
+  int np = (int)op_focei.npars;
+  arma::mat R0 = as<arma::mat>(st["R0"]);
+  if ((int)R0.n_rows != np || (int)R0.n_cols != np) return;
+  e["R.0"] = wrap(R0);
+  foceiCovChol(e, R0, "R");
+}
+
+// The stored S, when the request uses S and none is installed
+static void foceiThetaSFromStore(Environment e, List st) {
+  if (!(op_focei.covMethod == 1 || op_focei.covMethod == 3) || e.exists("cholS") ||
+      !st.containsElementNamed("S0") || Rf_isNull(st["S0"]) || !st.containsElementNamed("Sper")) {
+    return;
+  }
+  int np = (int)op_focei.npars;
+  arma::mat S0 = as<arma::mat>(st["S0"]);
+  double sper = as<double>(st["Sper"]);
+  if ((int)S0.n_rows != np || (int)S0.n_cols != np) return;
+  e["S0"] = wrap(S0);
+  e["Sper"] = sper;
+  e["SHasZero"] = st.containsElementNamed("SHasZero") && as<bool>(st["SHasZero"]);
+  if (sper >= op_focei.smatPer) foceiCovChol(e, S0, "S");
+}
+
+// Install a stored theta-only stage (e$covThetaStore, from setCov()'s lookup) as
+// foceiCalcR() and foceiS() install theirs, when its steps were taken about this theta.
+static bool foceiThetaFromStore(Environment e, const arma::vec &theta) {
+  if (!covReuseOn() || !e.exists("covThetaStore")) return false;
+  List st = as<List>(e["covThetaStore"]);
+  if (!st.containsElementNamed("steps") || Rf_isNull(st["steps"])) return false;
+  List sp = as<List>(st["steps"]);
+  if (!foceiThetaStepsFromStore(sp, theta)) return false;
+  foceiThetaGillFromStore(sp);
+  e["covSteps"] = sp;
+  foceiThetaRFromStore(e, st);
+  foceiThetaSFromStore(e, st);
+  return true;
+}
+
+// Choose the covariance from the R and S matrices (.covSelectFocei() in R/covSelect.R):
+// installs e$cov and e$covMethod and gives the warnings; returns the slot, 0 when none.
+static int foceiCovSelect(Environment e, int req, int rState, int sState,
+                          const std::string &rstr, const std::string &sstr,
+                          bool checkSandwich, bool sHasZero,
+                          const std::vector<std::string> &fallback) {
+  Environment nlmixr2 = Environment::namespace_env("nlmixr2est");
+  Function sel = as<Function>(nlmixr2[".covSelectFocei"]);
+  CharacterVector fb(fallback.begin(), fallback.end());
+  List r = sel(e, req, rState, sState, rstr, sstr, checkSandwich, sHasZero, op_focei.covSmall, fb);
+  return as<int>(r["slot"]);
+}
+
 NumericMatrix foceiCalcCov(Environment e){
   std::string boundStr = "";
   CharacterVector thetaNames=as<CharacterVector>(e["thetaNames"]);
@@ -11510,6 +12073,21 @@ NumericMatrix foceiCalcCov(Environment e){
   // needs them for the whole cov step (incl. foceiCalcR below), so release only on
   // exit.  RAII covers every early return, the catch, and the covMethod=="" no-op.
   struct CovSolveArgsRelease { ~CovSolveArgsRelease() { releaseCovSolveArgs_(); } } _covSolveArgsRelease;
+  // Every objective evaluation in the covariance step is a derivative leg (the
+  // step-size searches, foceiCalcR's Hessian stencil, foceiS), so own calcGrad
+  // for the whole step and put the previous value back on every exit.  Before
+  // this the R-matrix legs ran with the flag only when the step-size search
+  // happened to set it (gillKcov != 0 or shi21maxOuter != 0), and a covMethod
+  // without an S matrix left the flag set past the end of the fit -- the same
+  // set-and-never-cleared shape as the Gill gradient in issue 1114.
+  struct CovCalcGradGuard {
+    int saved;
+    CovCalcGradGuard() : saved(op_focei.calcGrad) {
+      _covFitCalcGrad = op_focei.calcGrad;
+      op_focei.calcGrad = 1;
+    }
+    ~CovCalcGradGuard() { op_focei.calcGrad = saved; }
+  } _covCalcGradGuard;
   try {
     if (op_focei.covMethod) {
       // Mu-referenced-FOCEI-family (muModel = lin/irls): the covariance must be
@@ -11518,8 +12096,6 @@ NumericMatrix foceiCalcCov(Environment e){
       // wrong SEs on the mu-referenced/linear parameters).  Bail here and recompute
       // the covariance at the R level with muModel="none" (.foceiRecomputeMuCov).
       if (op_focei.muModel != 0) {
-        op_focei.cur = op_focei.totTick;
-        op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
         e["covMethod"] = CharacterVector::create("");
         NumericMatrix ret;
         return ret;
@@ -11533,13 +12109,17 @@ NumericMatrix foceiCalcCov(Environment e){
       bool checkUpperBound=false;
       rx = getRxSolve_();
       if (op_focei.neta == 0) op_focei.covMethod = 2; // Always use hessian for NLS
-      for (unsigned int k = op_focei.npars; k--;){
-        if (R_FINITE(op_focei.lower[k])){
-          op_focei.lower[k]=unscalePar(op_focei.lower,k);
+      // the boundary check below needs the bounds on the parameters' own scale
+      if (op_focei.boundsScaled) {
+        for (unsigned int k = op_focei.npars; k--;){
+          if (R_FINITE(op_focei.lower[k])){
+            op_focei.lower[k]=scaleUnscalePar(&op_focei, op_focei.lower,k);
+          }
+          if (R_FINITE(op_focei.upper[k])) {
+            op_focei.upper[k]=scaleUnscalePar(&op_focei, op_focei.upper,k);
+          }
         }
-        if (R_FINITE(op_focei.upper[k])) {
-          op_focei.upper[k]=unscalePar(op_focei.upper,k);
-        }
+        op_focei.boundsScaled = false;
       }
       if (op_focei.boundTol > 0){
         // Subtract nEstOmega so that Omega boundaries are not counted.
@@ -11579,8 +12159,6 @@ NumericMatrix foceiCalcCov(Environment e){
         fInd->doChol=!(op_focei.cholSECov);
         fInd->doFD = 0;
       }
-      op_focei.resetEtaSize = std::numeric_limits<double>::infinity(); // Dont reset ETAs
-      op_focei.resetEtaSize=0; // Always reset ETAs.
       if (!e.exists("fullTheta")) {
         stop("focei environment requires 'fullTheta'");
       }
@@ -11606,6 +12184,9 @@ NumericMatrix foceiCalcCov(Environment e){
       // muModel is always 0 here: ordinary methods never set it, and mu-referenced
       // (lin/irls) families bail above and recompute the covariance on the full model.
       foceiSetupTheta_(op_focei.mvi, fullT2, skipCov, 0, false);
+      // after foceiSetupTheta_, which takes the Omega parameters from the symbolic
+      // inverse's own copy
+      covHandoffInstall(e);
       op_focei.scaleType=10;
       if (op_focei.covMethod && !boundary) {
         rx = getRxSolve_();
@@ -11627,6 +12208,16 @@ NumericMatrix foceiCalcCov(Environment e){
           op_focei.totTick += 2*op_focei.npars +2*(op_focei.npars*op_focei.npars);
         }
         op_focei.totTick += op_focei.npars;
+        bool covInPlace = nmProgressInPlace();
+        op_focei.curTick = nmProgressStart(op_focei.totTick, op_focei.t0);
+        // finish the bar on every exit, including the early failure returns
+        struct CovProgressEnd {
+          bool inPlace;
+          ~CovProgressEnd() {
+            op_focei.curTick = nmProgressEnd(op_focei.totTick, op_focei.curTick,
+                                             op_focei.t0, inPlace);
+          }
+        } _covProgressEnd{covInPlace};
         double hf, hphif, err;
         unsigned int j, k;
         arma::vec theta(op_focei.npars);
@@ -11635,84 +12226,129 @@ NumericMatrix foceiCalcCov(Environment e){
           theta[k] = op_focei.fullTheta[j];
         }
         std::copy(&theta[0], &theta[0] + op_focei.npars, &op_focei.theta[0]);
-        arma::vec f0(1);
-        f0(0) = op_focei.lastOfv;
-        arma::vec grf(1);
-        grf(0) = 0;
-
-        arma::vec armaTheta(op_focei.npars);
-        std::copy(&theta[0], &theta[0] + op_focei.npars, armaTheta.begin());
-        double h = 0;
-        int gillKcov;
-        double gillStepCov;
-        double gillFtolCov;
-        double hessEps;
-        for (int cpar = (int)op_focei.npars; cpar--;){
-          if (op_focei.needOptimHess) {
-            err = op_focei.rmatNormLlik ? 1/(std::fabs(theta[cpar])+1) : 1;
-            gillKcov = op_focei.gillKcovLlik;
-            gillStepCov=op_focei.gillStepCovLlik;
-            gillFtolCov=op_focei.gillFtolCovLlik;
-            hessEps = op_focei.hessEpsLlik;
-          } else {
-            err = op_focei.rmatNorm ? 1/(std::fabs(theta[cpar])+1) : 1;
-            gillKcov = op_focei.gillKcov;
-            gillStepCov=op_focei.gillStepCov;
-            gillFtolCov=op_focei.gillFtolCov;
-            hessEps = op_focei.hessEps;
-          }
-          if (op_focei.shi21maxOuter != 0) {
-            op_focei.calcGrad=1;
-            h = op_focei.aEps[cpar];
-            op_focei.aEpsC[cpar] = shi21Central(shi21fnF, armaTheta, h,
-                                                f0, grf, 0, cpar,
-                                                op_focei.hessEpsInner, //double ef = 7e-7,
-                                                1.5,  //double rl = 1.5,
-                                                4.0,  //double ru = 6.0);;
-                                                3.0, // nu
-                                                op_focei.shi21maxOuter,  //maxiter=15
-                                                op_focei.shi21hMax, op_focei.shi21hMin);
-          } if (op_focei.gillKcov != 0){
-            op_focei.gillRetC[cpar] = gill83(&hf, &hphif, &op_focei.gillDf[cpar], &op_focei.gillDf2[cpar], &op_focei.gillErr[cpar],
-                                             &theta[0], cpar, hessEps, gillKcov, gillStepCov,
-                                             gillFtolCov, -1, gill83fnG, 1, op_focei.lastOfv);
-            // h=aEps*(|x|+1)/sqrt(1+fabs(f));
-            // h*sqrt(1+fabs(f))/(|x|+1) = aEps
-            // let err=2*sqrt(epsA/(1+f))
-            // err*(aEps+|x|rEps) = h
-            // Let aEps = rEps (could be a different ratio)
-            // h/err = aEps(1+|x|)
-            // aEps=h/err/(1+|x|)
-            //
-            op_focei.aEps[cpar]  = hf*err;
-            op_focei.rEps[cpar]  = hf*err;
-            if (op_focei.covGillF){
-              op_focei.aEpsC[cpar] = hf*err;
-              op_focei.rEpsC[cpar] = hf*err;
-            } else {
-              op_focei.aEpsC[cpar] = hphif*err;
-              op_focei.rEpsC[cpar] = hphif*err;
-            }
-          } else {
-            hf = hessEps;
-            op_focei.aEps[cpar]  = hf*err;
-            op_focei.rEps[cpar]  = hf*err;
-            op_focei.aEpsC[cpar] = hf*err;
-            op_focei.rEpsC[cpar] = hf*err;
-          }
-          op_focei.cur++;
-          op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
+        // The centre value of the step search and the R stencil: the objective at the
+        // estimates by the legs' own inner procedure and start (CovEtaStart), not the final
+        // objective, whose ETAs were optimized by a different procedure.
+        double f0;
+        {
+          CovStageScope _st(covStCenter);
+          f0 = covEtaStartF0(theta.memptr());
         }
-        op_focei.didGill+=1;
+        // foceiOfv0() reports a failed evaluation as 5e100; as a stencil centre it
+        // would make every R diagonal about -1e100
+        if (!R_FINITE(f0) || f0 >= 5e100) {
+          warning(_("covariance failed: objective not evaluable at its tolerances"));
+          e["covMethod"] = CharacterVector::create("failed");
+          NumericMatrix ret;
+          return ret;
+        }
+        op_focei.lastOfv = f0;
+        // The covariance-stage step search: run once, and only before something that uses
+        // its steps (the finite-difference R, the S matrix); an analytic R needs none.
+        bool gillDone = false;
+        auto runGill = [&]() {
+          if (gillDone) return;
+          gillDone = true;
+          int gillKcov;
+          double gillStepCov;
+          double gillFtolCov;
+          double hessEps;
+          for (int cpar = (int)op_focei.npars; cpar--;){
+            if (op_focei.needOptimHess) {
+              err = op_focei.rmatNormLlik ? 1/(std::fabs(theta[cpar])+1) : 1;
+              gillKcov = op_focei.gillKcovLlik;
+              gillStepCov=op_focei.gillStepCovLlik;
+              gillFtolCov=op_focei.gillFtolCovLlik;
+              hessEps = op_focei.hessEpsLlik;
+            } else {
+              err = op_focei.rmatNorm ? 1/(std::fabs(theta[cpar])+1) : 1;
+              gillKcov = op_focei.gillKcov;
+              gillStepCov=op_focei.gillStepCov;
+              gillFtolCov=op_focei.gillFtolCov;
+              hessEps = op_focei.hessEps;
+            }
+            if (gillKcov != 0){
+              CovStageScope _st(covStGill);
+              op_focei.gillRetC[cpar] = gill83(&hf, &hphif, &op_focei.gillDf[cpar], &op_focei.gillDf2[cpar], &op_focei.gillErr[cpar],
+                                               &theta[0], cpar, hessEps, gillKcov, gillStepCov,
+                                               gillFtolCov, -1, gill83fnG, 1, op_focei.lastOfv);
+            } else {
+              hf = hphif = hessEps;
+            }
+            gill83Eps(hf, hphif, err, op_focei.covGillF, &op_focei.aEps[cpar], &op_focei.rEps[cpar],
+                      &op_focei.aEpsC[cpar], &op_focei.rEpsC[cpar]);
+            op_focei.cur++;
+            op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
+          }
+          op_focei.didGill+=1;
+          // the theta-only steps and the centre they were searched about
+          int np = (int)op_focei.npars;
+          e["covSteps"] = List::create(
+            _["theta"] = NumericVector(theta.begin(), theta.end()),
+            _["f0"] = op_focei.lastOfv,
+            _["aEps"] = NumericVector(op_focei.aEps, op_focei.aEps + np),
+            _["rEps"] = NumericVector(op_focei.rEps, op_focei.rEps + np),
+            _["aEpsC"] = NumericVector(op_focei.aEpsC, op_focei.aEpsC + np),
+            _["rEpsC"] = NumericVector(op_focei.rEpsC, op_focei.rEpsC + np),
+            _["gillRetC"] = IntegerVector(op_focei.gillRetC, op_focei.gillRetC + np),
+            _["gillDf"] = NumericVector(op_focei.gillDf, op_focei.gillDf + np),
+            _["gillDf2"] = NumericVector(op_focei.gillDf2, op_focei.gillDf2 + np),
+            _["gillErr"] = NumericVector(op_focei.gillErr, op_focei.gillErr + np));
+        };
+        // covType="analytic": try the analytic R first; it needs no step search
+        bool analyticR = false, analyticDeclined = false;
+        if ((op_focei.covMethod == 1 || op_focei.covMethod == 2) && !e.exists("cholR") &&
+            foceiCovTypeAnalytic(e)) {
+          int rc;
+          {
+            CovStageScope _st(covStR);
+            rc = foceiCalcRAnalytic(e);
+          }
+          if (rc == 0) {
+            warning(_("covariance step failed"));
+            e["covMethod"] = CharacterVector::create("failed");
+            NumericMatrix ret;
+            return ret;
+          }
+          analyticR = (rc == 1);
+          analyticDeclined = (rc == -1);
+        }
+        // covFull: the full stage gives the theta-only R and S too (needs no theta-only
+        // step search, stencil or S legs), also when a declined analytic R falls back
+        bool fullMerged = !analyticR && foceiFdFullMerge(e);
+        if (!analyticR && !fullMerged && foceiThetaFromStore(e, theta)) gillDone = true;
+        if ((!analyticR && !fullMerged) || !covReuseOn()) runGill();
 
+        // The R and S matrices the request needs (S also when R is not usable), then
+        // .covSelectFocei() chooses the covariance from them.  Each matrix's state: 0 not
+        // computed, 1 usable, 2 not positive definite, 3 its computation failed.
         bool isPd;
-        std::string rstr = "r";
-        bool checkSandwich = false, checkSandwich2 = false;
-        if (op_focei.covMethod == 1 || op_focei.covMethod == 2) {
+        std::string rstr = "r", sstr = "s";
+        bool checkSandwich = false, sHasZero = false;
+        const int req = op_focei.covMethod;
+        int rState = 0, sState = 0;
+        // the methods this request may fall back to (covFallback); a declined analytic R
+        // has already taken the first of the analytic list
+        std::vector<std::string> fallback;
+        if (foceiCovTypeAnalytic(e)) {
+          fallback = covFallbackFor(e, "analytic");
+          if (analyticDeclined) {
+            // what the declined analytic covariance has taken: up to its first FD method
+            auto it = std::find_if(fallback.begin(), fallback.end(),
+                                   [](const std::string &m) { return covSlotOf(m) != 0; });
+            fallback.erase(fallback.begin(), it == fallback.end() ? it : it + 1);
+          }
+        } else {
+          fallback = covFallbackFor(e, req == 1 ? "r,s" : (req == 2 ? "r" : "s"));
+        }
+        const bool sListed = std::find(fallback.begin(), fallback.end(), "s") != fallback.end();
+        if (req == 1 || req == 2) {
           // R matrix based covariance
-          arma::mat cholR;
-          if (!e.exists("cholR")){
-            foceiCalcR(e);
+          if (!e.exists("cholR") && !analyticR){
+            {
+              CovStageScope _st(covStR);
+              foceiCalcR(e, false);
+            }
             // covType="analytic" signals an unrecoverable abort (the fit's global
             // solve could not be restored after the augmented sensitivity solves) by
             // zeroing covMethod.  Honor it as a clean cov-skip; do NOT fall through to
@@ -11728,60 +12364,19 @@ NumericMatrix foceiCalcCov(Environment e){
             op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
           }
           if (e.exists("cholR")) {
-            isPd = as<bool>(e["R.pd"]);
-            if (!isPd){
-              isPd = true;
-              arma::vec E = as<arma::vec>(e["R.E"]);
-              for (int j = E.size(); j--;){
-                if (E[j] > op_focei.cholAccept){
-                  isPd=false;
-                  break;
-                }
-              }
-              if (isPd){
-                rstr = "r+";
-                checkSandwich = true;
-              }
-            }
-            if (!isPd){
-              // Suggted by https://www.tandfonline.com/doi/pdf/10.1198/106186005X78800
-              mat H0 = as<arma::mat>(e["R.0"]);
-              H0 = H0*H0;
-              cx_mat H1;
-              bool success = sqrtmat(H1,H0);
-              if (success){
-                mat im = arma::imag(H1);
-                mat re = arma::real(H1);
-                if (!arma::any(arma::any(im,0))){
-                  success= chol(H0, re);
-                  if (success){
-                    e["cholR"] = wrap(H0);
-                    rstr = "|r|";
-                    checkSandwich = true;
-                    isPd = true;
-                  }
-                }
-              }
-            }
+            isPd = foceiCovUsable(e, "R", as<arma::mat>(e["R.0"]), rstr, checkSandwich);
             op_focei.cur += op_focei.npars*2;
             op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
             if (!isPd){
-              warning(_("R matrix non-positive definite"));
               e["R"] = wrap(e["R.0"]);
-              op_focei.covMethod = 3;
+              rState = 2;
               op_focei.cur += op_focei.npars*2;
               op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
             } else {
-              cholR = as<arma::mat>(e["cholR"]);
+              arma::mat cholR = as<arma::mat>(e["cholR"]);
               e["R"] = wrap(trans(cholR) * cholR);
               if (!e.exists("Rinv")){
-                bool success  = inv(Rinv, trimatu(cholR));
-                if (!success){
-                  warning(_("Hessian (R) matrix seems singular; Using pseudo-inverse"));
-                  Rinv = pinv(trimatu(cholR));
-                  checkSandwich = true;
-                }
-                Rinv = Rinv * Rinv.t();
+                if (foceiCholInv(cholR, Rinv, "Hessian (R)")) checkSandwich = true;
                 e["Rinv"] = wrap(Rinv);
               } else {
                 Rinv = as<arma::mat>(e["Rinv"]);
@@ -11789,90 +12384,39 @@ NumericMatrix foceiCalcCov(Environment e){
               op_focei.cur++;
               op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, getRxCores(rx), op_focei.t0, 0);
               if (!e.exists("covR")){
-                // Issue #666: the R-matrix covariance is the inverse observed
-                // information Rinv = R^{-1} (R = 0.5*Hessian(-2LL) here).  This
-                // was 2*Rinv, which made every covMethod="r" SE sqrt(2) too
-                // large vs NONMEM $COV MATRIX=R and vs the (correct) sandwich
-                // "r,s".  covR feeds both the final "r" output and the
-                // sandwich-selection heuristic below, so it is fixed at source.
+                // the R-matrix covariance is the inverse observed information R^{-1}
+                // (R = 0.5*Hessian(-2LL) here), as NONMEM's $COV MATRIX=R (issue #666)
                 e["covR"] = wrap(Rinv);
               }
-              if (op_focei.covMethod == 2){
-                e["cov"] = as<NumericMatrix>(e["covR"]);
-              }
+              rState = 1;
             }
           } else {
-            RSprintf("\rR matrix calculation failed; Switch to S-matrix covariance.\n");
-            op_focei.covMethod = 3;
+            rState = 3;
             op_focei.cur += op_focei.npars*2;
             op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
           }
         }
-        arma::mat cholS;
-        int origCov = op_focei.covMethod;
-        std::string sstr="s";
-        bool sHasZero = false;
-        if (op_focei.covMethod == 1 || op_focei.covMethod == 3) {
-          arma::vec theta(op_focei.npars);
-          unsigned int j, k;
-          for (k = op_focei.npars; k--;){
-            j=op_focei.fixedTrans[k];
-            theta[k] = op_focei.fullTheta[j];
-          }
+        // S for "s", for the sandwich of a usable R, or as a listed fallback for R
+        const bool needS = req == 3 || (req == 1 && rState == 1) || (rState != 1 && sListed);
+        if (needS) {
           if (!e.exists("cholS")){
+            runGill();
+            CovStageScope _st(covStS);
             foceiS(&theta[0], e, sHasZero);
+            e["SHasZero"] = sHasZero;
           } else {
             op_focei.cur += op_focei.npars;
             op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
           }
+          if (!sHasZero && e.exists("SHasZero")) sHasZero = as<bool>(e["SHasZero"]);
           if (e.exists("cholS")) {
-            isPd = as<bool>(e["S.pd"]);
+            isPd = foceiCovUsable(e, "S", as<arma::mat>(e["S0"]), sstr, checkSandwich);
             if (!isPd){
-              isPd=true;
-              arma::vec E = as<arma::vec>(e["S.E"]);
-              for (int j = E.size(); j--;){
-                if (E[j] > op_focei.cholAccept){
-                  isPd=false;
-                  break;
-                }
-              }
-              if (isPd){
-                sstr="s+";
-                checkSandwich = true;
-              }
-            }
-            if (!isPd){
-              // Suggted by https://www.tandfonline.com/doi/pdf/10.1198/106186005X78800
-              mat H0 = as<arma::mat>(e["S0"]);
-              H0 = H0*H0;
-              cx_mat H1;
-              bool success = sqrtmat(H1,H0);
-              if (success){
-                mat im = arma::imag(H1);
-                mat re = arma::real(H1);
-                if (!arma::any(arma::any(im,0))){
-                  success= chol(H0,re);
-                  if (success){
-                    e["cholS"] = wrap(H0);
-                    sstr = "|s|";
-                    checkSandwich = true;
-                    isPd = true;
-                  }
-                }
-              }
-            }
-            if (!isPd){
-              warning(_("S matrix non-positive definite"));
-              if (op_focei.covMethod == 1){
-                e["cov"] = as<NumericMatrix>(e["covR"]);
-                op_focei.covMethod = 2;
-              } else {
-                warning(_("cannot calculate covariance"));
-              }
+              sState = 2;
               op_focei.cur += op_focei.npars*2;
               op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
             } else {
-              cholS = as<arma::mat>(e["cholS"]);
+              arma::mat cholS = as<arma::mat>(e["cholS"]);
               arma::mat S;
               if (e.exists("S")){
                 S = as<arma::mat>(e["S"]);
@@ -11880,197 +12424,48 @@ NumericMatrix foceiCalcCov(Environment e){
                 S = trans(cholS) * cholS;
                 e["S"] = wrap(S);
               }
-              if (op_focei.covMethod == 1){
-                e["covRS"] = Rinv * S *Rinv;
-                arma::mat covRS = as<arma::mat>(e["covRS"]);
-                mat Sinv;
-                bool success;
-                success = inv(Sinv, trimatu(cholS));
-                if (!success){
-                  warning(_("S matrix seems singular; Using pseudo-inverse"));
-                  Sinv = pinv(trimatu(cholS));
-                }
-                Sinv = Sinv * Sinv.t();
-                // Issue #666: the S-matrix (OPG/cross-product) covariance is
-                // Sinv = S^{-1}.  This was 4*Sinv, which made every covMethod="s"
-                // SE 2x too large.  Confirmed against the empirical sampling
-                // covariance of a known data-generating model: r, the sandwich,
-                // and S^{-1} all match the true Cov(theta_hat), while 4*S^{-1}
-                // is ~2x.  covS also feeds the selection heuristic below, so it
-                // is fixed at source alongside covR.
-                e["covS"]= Sinv;
-                if (!checkSandwich) {
-                  bool covRSsmall = arma::any(abs(covRS.diag()) < op_focei.covSmall);
-                  if (covRSsmall) {
-                    checkSandwich2 = true;
-                  }
-                }
-                if (checkSandwich || checkSandwich2){
-                  if (!checkSandwich2 && rstr == "r"){
-                    // Use covR
-                    e["cov"] = as<NumericMatrix>(e["covR"]);
-                    op_focei.covMethod=2;
-                  } else if (!checkSandwich2 && sstr == "s"){
-                    // use covS
-                    e["cov"] = as<NumericMatrix>(e["covS"]);
-                    op_focei.covMethod=3;
-                  } else {
-                    // Now check sandwich matrix against R and S methods.
-                    // issue #666 rescaled covR (2*Rinv->Rinv) and covS (4*Sinv->Sinv)
-                    // but left the sandwich covRS unchanged.  This selector's covSmall
-                    // diagonal floors and magnitude ordering were calibrated to the OLD
-                    // covR/covS scale, so compare in that scale (covR*2, covS*4) to keep
-                    // the estimator choice invariant to the rescale; the *installed*
-                    // covR/covS/covRS (below) stay on the corrected #666 scale.
-                    bool covRSsmall = arma::any(abs(covRS.diag()) < op_focei.covSmall);
-                    double covRSd= sum(covRS.diag());
-                    arma::mat covR = as<arma::mat>(e["covR"]);
-                    bool covRsmall = arma::any(abs(2.0*covR.diag()) < op_focei.covSmall);
-                    double covRd= sum(2.0*covR.diag());
-                    arma::mat covS = as<arma::mat>(e["covS"]);
-                    bool covSsmall = arma::any(abs(4.0*covS.diag()) < op_focei.covSmall);
-                    double  covSd= sum(4.0*covS.diag());
-                    if ((covRSsmall && covSsmall && covRsmall)){
-                      e["cov"] = covRS;
-                    } else if (covRSsmall && covSsmall && !covRsmall) {
-                      e["cov"] = covR;
-                      op_focei.covMethod=2;
-                    } else if (covRSsmall && !covSsmall && covRsmall) {
-                      e["cov"] = covS;
-                      op_focei.covMethod=3;
-                    } else if (covRSd > covRd){
-                      // SE(RS) > SE(R)
-                      if (covRd > covSd){
-                        // SE(R) > SE(S)
-                        e["cov"] = covS;
-                        op_focei.covMethod=3;
-                      } else {
-                        e["cov"] = covR;
-                        op_focei.covMethod=2;
-                      }
-                    } else if (covRSd > covSd){
-                      e["cov"] = covS;
-                      op_focei.covMethod=3;
-                    } else {
-                      e["cov"] = covRS;
-                    }
-                  }
-                } else {
-                  e["cov"] = covRS;
-                }
+              // the S-matrix (cross-product) covariance is S^{-1} (issue #666)
+              arma::mat Sinv;
+              foceiCholInv(cholS, Sinv, "S");
+              e[".covSinv"] = wrap(Sinv);
+              e["covS"] = Sinv;
+              if (req == 1 && rState == 1) {
+                e["covRS"] = Rinv * S * Rinv;
               } else {
-                mat Sinv;
-                bool success;
-                success = inv(Sinv, trimatu(cholS));
-                if (!success){
-                  warning(_("S matrix seems singular; Using pseudo-inverse"));
-                  Sinv = pinv(trimatu(cholS));
-                }
-                Sinv = Sinv * Sinv.t();
                 op_focei.cur++;
                 op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-                e["cov"]= Sinv;   // issue #666: S-matrix covariance is S^{-1}, not 4*S^{-1}
               }
+              sState = 1;
             }
           } else {
-            if (op_focei.covMethod == 1){
-              RSprintf("\rS matrix calculation failed; Switch to R-matrix covariance.\n");
-              e["cov"] = wrap(e["covR"]);
-              op_focei.covMethod = 2;
-            } else {
-              op_focei.covMethod=0;
-              RSprintf("\rCould not calculate covariance matrix.\n");
-              warning(_("cannot calculate covariance"));
-              op_focei.cur++;
-              op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-            }
+            sState = 3;
           }
         }
         op_focei.cur=op_focei.totTick;
         op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
-        if (e.exists("cov")){
-          arma::mat cov = as<arma::mat>(e["cov"]);
-          if (all(cov.diag() < 1e-7)){
-            warning(_("The variance of all elements are unreasonably small, <1e-7"));
-            op_focei.covMethod=0;
-            e.remove("cov");
-          }
-        }
-        if (op_focei.covMethod==0){
-          warning(_("covariance step failed"));
+        int slot = foceiCovSelect(e, req, rState, sState, rstr, sstr, checkSandwich, sHasZero,
+                                  fallback);
+        if (e.exists(".covSinv")) e.remove(".covSinv");
+        if (slot == 0) {
           e["covMethod"] = CharacterVector::create("failed");
           NumericMatrix ret;
           return ret;
-        } else {
-          if (sHasZero) {
-            warning(_("S matrix had problems solving for some subject and parameters"));
-          }
-          if (op_focei.covMethod == 1){
-            bool doWarn=false;
-            if (rstr == "|r|"){
-              warning(_("R matrix non-positive definite but corrected by R = sqrtm(R%%*%%R)"));
-              doWarn=true;
-            } else if (rstr == "r+"){
-              warning(_("R matrix non-positive definite but corrected (because of cholAccept)"));
-              doWarn=true;
-            }
-            if (sstr == "|s|"){
-              warning(_("S matrix non-positive definite but corrected by S = sqrtm(S%%*%%S)"));
-              doWarn=true;
-            } else if (sstr == "s+"){
-              warning(_("S matrix non-positive definite but corrected (because of cholAccept)"));
-              doWarn=true;
-            }
-            if (doWarn){
-              warning(_("since sandwich matrix is corrected, you may compare to $covR or $covS if you wish"));
-            }
-            rstr =  rstr + "," + sstr;
-            e["covMethod"] = wrap(rstr);
-          } else if (op_focei.covMethod == 2){
-            if (rstr == "|r|"){
-              warning(_("R matrix non-positive definite but corrected by R = sqrtm(R%%*%%R)"));
-            } else if (rstr == "r+"){
-              warning(_("R matrix non-positive definite but corrected (because of cholAccept)"));
-            }
-            e["covMethod"] = wrap(rstr);
-            if (origCov != 2){
-              if (checkSandwich){
-                warning(_("using R matrix to calculate covariance, can check sandwich or S matrix with $covRS and $covS"));
-              } else {
-                warning(_("using R matrix to calculate covariance"));
-              }
-            }
-          } else if (op_focei.covMethod == 3){
-            if (sHasZero) {
-              warning(_("S matrix had problems solving for some subject and parameters"));
-            }
-            e["covMethod"] = wrap(sstr);
-            if (origCov != 2){
-              if (checkSandwich){
-                warning(_("using S matrix to calculate covariance, can check sandwich or R matrix with $covRS and $covR"));
-              } else {
-                warning(_("using S matrix to calculate covariance"));
-              }
-            }
-          }
-          if (e.exists("cov")) {
-            RObject covRO = e["cov"];
-            if (covRO.sexp_type() == REALSXP &&
-                Rf_isMatrix(covRO)) {
-              return as<NumericMatrix>(covRO);
-            }
-          }
-          NumericMatrix ret;
-          return ret;
         }
+        op_focei.covMethod = slot;
+        if (e.exists("cov")) {
+          RObject covRO = e["cov"];
+          if (covRO.sexp_type() == REALSXP && Rf_isMatrix(covRO)) {
+            return as<NumericMatrix>(covRO);
+          }
+        }
+        NumericMatrix ret;
+        return ret;
       } else {
         if (op_focei.covMethod && boundary){
           warning(_("parameter estimate near boundary; covariance not calculated:\n   ") + boundStr +
                   _("\n use 'getVarCov' to calculate anyway"));
           e["covMethod"] = "Boundary issue; Get SEs with `getVarCov()`: " + boundStr;
         }
-        op_focei.cur=op_focei.totTick;
-        op_focei.curTick = par_progress(op_focei.cur, op_focei.totTick, op_focei.curTick, 1, op_focei.t0, 0);
         NumericMatrix ret;
         return ret;
       }
@@ -12111,23 +12506,23 @@ static bool foceiFdSetOmega(const arma::mat &Om) {
 
 // objective at a full natural parameter vector x (thetas on fullTheta, Omega on the
 // variance-covariance scale); NA_REAL if the perturbed Omega is not PD.
-static double foceiFdObjAt(const FdFullCtx &c, const std::vector<double> &x) {
+static double foceiFdObjAt(const FdFullCtx &c, const double *x) {
   for (int i = 0; i < c.nth; ++i) op_focei.fullTheta[c.thPos[i]] = x[i];
   arma::mat Om = c.Om0;
   for (int q = 0; q < c.nom; ++q) {
     Om(c.omA[q]-1, c.omB[q]-1) = x[c.nth+q]; Om(c.omB[q]-1, c.omA[q]-1) = x[c.nth+q];
   }
   if (!foceiFdSetOmega(Om)) return NA_REAL;
-  return foceiOfv0(&op_focei.theta[0]);
+  // foceiOfv0() reports a failed evaluation as 5e100, which must not enter a difference
+  double r = foceiOfv0(&op_focei.theta[0]);
+  return (R_FINITE(r) && r < 5e100) ? r : NA_REAL;
 }
 
 // gill83 callback (plain function pointer -> file-static context): the objective at the
 // perturbed natural parameter vector.  Same role as gill83fnF for the theta gradient.
 static const FdFullCtx *g_fdGillCtx = nullptr;
 static void foceiFdGill83fn(double *fp, double *theta, int, int) {
-  const FdFullCtx &c = *g_fdGillCtx;
-  std::vector<double> x(theta, theta + c.nth + c.nom);
-  *fp = foceiFdObjAt(c, x);
+  *fp = foceiFdObjAt(*g_fdGillCtx, theta);
 }
 
 // Per-parameter finite-difference step for coordinate i via the Gill-Murray-Saunders-
@@ -12135,84 +12530,50 @@ static void foceiFdGill83fn(double *fp, double *theta, int, int) {
 // for the theta gradient/Hessian steps (it grows the step until the 2nd-difference
 // condition error sits in [0.001, 0.1]).  Returns the accepted central step `hphif`, or
 // NA_REAL if gill83 fails (caller falls back to a step-doubling search).
-static double foceiFdGillStep(const FdFullCtx &c, int i, const std::vector<double> &x0, double f0) {
+// covKnobs takes the covariance-stage settings (hessEps, gillKcov, gillStepCov,
+// gillFtolCov), as the theta-only stage does, instead of the estimation's.  d2Seed, a
+// second-derivative estimate along i, seeds the search (gill83).
+static double foceiFdGillStep(const FdFullCtx &c, int i, const std::vector<double> &x0, double f0,
+                              bool covKnobs = false, double d2Seed = NA_REAL) {
   g_fdGillCtx = &c;
   std::vector<double> xg = x0;                       // gill83 perturbs then restores this
   double hf, hphif, df, df2, ef;
-  int gret = gill83(&hf, &hphif, &df, &df2, &ef, xg.data(), i,
-                    op_focei.gillRtol, op_focei.gillK, op_focei.gillStep, op_focei.gillFtol,
-                    -1, foceiFdGill83fn, 0, f0);
+  int gret = covKnobs ?
+    gill83(&hf, &hphif, &df, &df2, &ef, xg.data(), i,
+           op_focei.hessEps, op_focei.gillKcov, op_focei.gillStepCov, op_focei.gillFtolCov,
+           -1, foceiFdGill83fn, 0, f0, d2Seed) :
+    gill83(&hf, &hphif, &df, &df2, &ef, xg.data(), i,
+           op_focei.gillRtol, op_focei.gillK, op_focei.gillStep, op_focei.gillFtol,
+           -1, foceiFdGill83fn, 0, f0, d2Seed);
   return (gret == 1 && R_FINITE(hphif) && hphif > 0) ? hphif : NA_REAL;
 }
 
-// 5-point central diagonal 2nd-difference at step `e` (the foceiCalcR stencil).
-static double foceiFdDiag5(const FdFullCtx &c, int i, const std::vector<double> &x0, double f0, double e) {
-  std::vector<double> xp2=x0,xp1=x0,xm1=x0,xm2=x0;
-  xp2[i]+=2*e; xp1[i]+=e; xm1[i]-=e; xm2[i]-=2*e;
-  double f1=foceiFdObjAt(c,xp2), f2=foceiFdObjAt(c,xp1), f3=foceiFdObjAt(c,xm1), f4=foceiFdObjAt(c,xm2);
-  if (!R_FINITE(f1)||!R_FINITE(f2)||!R_FINITE(f3)||!R_FINITE(f4)) return NA_REAL;
-  return (-f1 + 16*f2 - 30*f0 + 16*f3 - f4) / (12*e*e);
-}
-
-// Gill-style adaptive diagonal 2nd-difference for coordinate i: grow the step until the
-// 2nd-difference stabilizes (below that it is round-off dominated, which makes the
-// off-diagonal Hessian -- and the covariance -- indefinite).  Returns it (or NA_REAL);
-// writes the accepted step to *hOut for reuse on the off-diagonals.
-static double foceiFdDiag(const FdFullCtx &c, int i, const std::vector<double> &x0,
-                          double f0, double *hOut) {
-  double base = std::max(std::fabs(x0[i]), 1e-3);
-  double d2prev = NA_REAL, hi = base * 5e-4, d2Use = NA_REAL;
-  *hOut = base * 1.6e-2;
-  for (int s = 0; s < 6; ++s) {
-    std::vector<double> xp = x0, xm = x0; xp[i] += hi; xm[i] -= hi;
-    double fp = foceiFdObjAt(c, xp), fm = foceiFdObjAt(c, xm);
-    if (R_FINITE(fp) && R_FINITE(fm)) {
-      double d2 = (fp - 2*f0 + fm) / (hi*hi);
-      *hOut = hi; d2Use = d2;
-      if (R_FINITE(d2prev) && std::fabs(d2 - d2prev) <= 0.01 * std::fabs(d2)) break;
-      d2prev = d2;
+// The full FD's objective for fdHessian; foceiCalcRFdFull's FdFullStateGuard
+// re-installs the base point.  With x0 set, a point that moves one coordinate k from
+// x0 also keeps each subject's -2LL there, keyed by (k, x[k]): the S matrix's x +/- h
+// probes are among the R stencil's points and need not be solved again.  Every probe
+// re-optimizes the ETAs from eta-hat (CovEtaStart), so a point's values do not depend
+// on when it was evaluated.
+struct FdFullHessObj : FdHessObj {
+  const FdFullCtx &c;
+  // a copy: fdHessian perturbs the caller's base vector in place
+  std::vector<double> x0;
+  bool keep = false;
+  std::map<std::pair<int, double>, arma::vec> axis;
+  explicit FdFullHessObj(const FdFullCtx &c) : c(c) {}
+  double f(double *x) {
+    double r = foceiFdObjAt(c, x);
+    if (keep && R_FINITE(r)) {
+      int k = -1, nd = 0;
+      for (int i = 0; i < (int)x0.size(); ++i) {
+        if (x[i] != x0[i]) { ++nd; k = i; }
+      }
+      arma::vec l;
+      if (nd == 1 && foceiFdLikById(l)) axis[std::make_pair(k, x[k])] = l;
     }
-    hi *= 2.0;
+    return r;
   }
-  return d2Use;
-}
-
-// off-diagonal (i,j) 4-point mixed 2nd-difference with the accepted per-parameter steps h.
-static double foceiFdOffDiag(const FdFullCtx &c, int i, int j, const std::vector<double> &x0,
-                             const std::vector<double> &h) {
-  std::vector<double> xpp=x0,xpm=x0,xmp=x0,xmm=x0;
-  xpp[i]+=h[i]; xpp[j]+=h[j]; xpm[i]+=h[i]; xpm[j]-=h[j];
-  xmp[i]-=h[i]; xmp[j]+=h[j]; xmm[i]-=h[i]; xmm[j]-=h[j];
-  double a=foceiFdObjAt(c,xpp), b=foceiFdObjAt(c,xpm), cc=foceiFdObjAt(c,xmp), d=foceiFdObjAt(c,xmm);
-  if (!R_FINITE(a)||!R_FINITE(b)||!R_FINITE(cc)||!R_FINITE(d)) return NA_REAL;
-  return (a - b - cc + d) / (4*h[i]*h[j]);
-}
-
-// full natural-scale FD Hessian at x0 (f0=obj(x0)), mirroring foceiCalcR: a Gill-optimal
-// per-parameter step (gill83) with the 5-point diagonal and 4-point off-diagonal stencils.
-// If gill83 fails for a coordinate, fall back to the step-doubling diagonal.  Returns false
-// on any non-finite probe.  Writes the accepted per-parameter steps to `h` (reused by the
-// full-S cross-product below so R and S difference on the same steps).
-static bool foceiFdHessian(const FdFullCtx &c, const std::vector<double> &x0, double f0,
-                           arma::mat &H, std::vector<double> &h) {
-  int np = c.nth + c.nom;
-  H.zeros(np, np);
-  if (!R_FINITE(f0)) return false;
-  h.assign(np, 0.0);
-  for (int i = 0; i < np; ++i) {
-    double e = foceiFdGillStep(c, i, x0, f0);
-    double d2 = R_FINITE(e) ? foceiFdDiag5(c, i, x0, f0, e) : NA_REAL;
-    if (R_FINITE(d2)) { h[i] = e; H(i, i) = d2; }
-    else              { H(i, i) = foceiFdDiag(c, i, x0, f0, &h[i]); }   // step-doubling fallback
-    if (!R_FINITE(H(i, i))) return false;
-  }
-  for (int i = 0; i < np - 1; ++i) for (int j = i+1; j < np; ++j) {
-    double v = foceiFdOffDiag(c, i, j, x0, h);
-    if (!R_FINITE(v)) return false;
-    H(i, j) = H(j, i) = v;
-  }
-  return true;
-}
+};
 
 // per-subject -2LL contributions after a foceiFdObjAt probe -- the quantity foceiS
 // differences (native: likSav[gid] = -2*fInd->lik[0]).  For a mixture the contribution is
@@ -12234,20 +12595,35 @@ static bool foceiFdLikById(arma::vec &out) {
 
 // full natural-scale cross-product (OPG) S = 0.25 * sum_i g_i g_i^T, with per-subject
 // central-difference gradients g_i over the SAME parameters and accepted steps `h` as
-// foceiFdHessian.  Matches the native foceiS convention (S = 0.25*sum, paired with
+// the full Hessian.  Matches the native foceiS convention (S = 0.25*sum, paired with
 // R = 0.5*Hessian), so Rinv * S * Rinv reproduces the native sandwich scale over the full
 // theta+sigma+Omega parameter set.  Returns false on any non-finite probe or if the
 // per-subject contributions are unavailable (foceiFdLikById), keeping the native cov.
+// The per-subject -2LL at x, from `axis` when the stencil already evaluated it there.
+static bool foceiFdLikAt(const FdFullCtx &c, std::vector<double> &x, int j,
+                         const std::map<std::pair<int, double>, arma::vec> *axis,
+                         arma::vec &out) {
+  if (axis != nullptr) {
+    auto it = axis->find(std::make_pair(j, x[j]));
+    if (it != axis->end()) {
+      out = it->second;
+      return true;
+    }
+  }
+  return R_FINITE(foceiFdObjAt(c, x.data())) && foceiFdLikById(out);
+}
+
 static bool foceiFdSFull(const FdFullCtx &c, const std::vector<double> &x0,
-                         const std::vector<double> &h, arma::mat &S) {
+                         const std::vector<double> &h, arma::mat &S,
+                         const std::map<std::pair<int, double>, arma::vec> *axis = nullptr) {
   int np = c.nth + c.nom;
   arma::vec lp, lm;
   arma::mat G;
   for (int j = 0; j < np; ++j) {
     std::vector<double> xp = x0, xm = x0;
     xp[j] += h[j]; xm[j] -= h[j];
-    if (!R_FINITE(foceiFdObjAt(c, xp)) || !foceiFdLikById(lp)) return false;
-    if (!R_FINITE(foceiFdObjAt(c, xm)) || !foceiFdLikById(lm)) return false;
+    if (!foceiFdLikAt(c, xp, j, axis, lp)) return false;
+    if (!foceiFdLikAt(c, xm, j, axis, lm)) return false;
     if (G.n_rows == 0) G.zeros(lp.n_elem, np);
     if (lp.n_elem != G.n_rows || lm.n_elem != G.n_rows) return false;
     G.col(j) = (lp - lm) / (2.0 * h[j]);
@@ -12277,50 +12653,357 @@ static bool foceiFdParams(Environment e, FdFullCtx &c, CharacterVector &nm) {
   return (c.nth + c.nom) > 0;
 }
 
-// Orchestrator: assemble the FD Hessian around the fit, restore live state, install the
-// natural cov solve(0.5*H) in e[".fdFullCov"] (installed as fit$cov by .foceiInstallFdFullCov).
-void foceiCalcRFdFull(Environment e) {
-  if (op_focei.neta <= 0) return;
-  FdFullCtx c; CharacterVector nm;
-  if (!foceiFdParams(e, c, nm)) return;
+// Everything foceiCalcRFdFull's probes change, put back on every exit (the caller
+// swallows its exceptions): the natural thetas, the Omega state they set directly,
+// covFdDirect, and what updateTheta pushed -- each subject's parameters and the
+// mixture proportions.  No R calls, so it is safe in a destructor.
+struct FdFullStateGuard {
+  std::vector<double> fth, mixProb;
+  arma::mat omegaInv, cholOmegaInv;
+  double logDet;
+  FdFullStateGuard() : fth(op_focei.fullTheta, op_focei.fullTheta + op_focei.ntheta),
+                       omegaInv(op_focei.omegaInv), cholOmegaInv(op_focei.cholOmegaInv),
+                       logDet(op_focei.logDetOmegaInv5) {
+    if (op_focei.mixIdxN != 0) {
+      mixProb.assign(op_focei.mixProb, op_focei.mixProb + op_focei.mixIdxN + 1);
+    }
+    op_focei.covFdDirect = 1;
+  }
+  ~FdFullStateGuard() {
+    std::copy(fth.begin(), fth.end(), op_focei.fullTheta);
+    std::copy(mixProb.begin(), mixProb.end(), op_focei.mixProb);
+    op_focei.omegaInv = omegaInv; op_focei.cholOmegaInv = cholOmegaInv;
+    op_focei.logDetOmegaInv5 = logDet;
+    op_focei.covFdDirect = 0;
+    foceiPushFullTheta();
+  }
+};
+
+// What the full theta+sigma+Omega stage computed: R = H/2 and, when asked for, the
+// cross-product S, over the parameters c (names nm) at the steps h.
+// With a hint (e[".fdFullHint"]), precursor names its source; shortcut is "accepted",
+// "fell back" or "off" (covShortcut), and checks holds the shortcut's check directions.
+struct FdFullResult {
+  FdFullCtx c;
+  CharacterVector nm;
+  std::vector<double> h, x0;
+  arma::mat R, S;
+  bool okS = false;
+  std::string precursor, shortcut;
+  arma::mat checks;
+};
+
+// The hint for the full stage, from e[".fdFullHint"] (set by setCov()'s refit when the
+// control's covPrecursor names a source the fit holds): list(R, source, shortcut), R
+// over the stage's parameters nm.  False when there is none or it does not fit.
+static bool foceiFdFullHint(Environment e, const CharacterVector &nm, arma::mat &R,
+                            std::string &source, bool &shortcut) {
+  if (!e.exists(".fdFullHint")) return false;
+  RObject ho = e[".fdFullHint"];
+  if (TYPEOF(ho) != VECSXP) return false;
+  List hl = as<List>(ho);
+  if (!hl.containsElementNamed("R") || !hl.containsElementNamed("source")) return false;
+  RObject ro = hl["R"];
+  if (!Rf_isMatrix(ro) || TYPEOF(ro) != REALSXP) return false;
+  NumericMatrix Rh = as<NumericMatrix>(ro);
+  int np = nm.size();
+  if (Rh.nrow() != np || Rh.ncol() != np) return false;
+  RObject dn = Rh.attr("dimnames");
+  if (Rf_isNull(dn)) return false;
+  CharacterVector rn = as<List>(dn)[0];
+  for (int i = 0; i < np; ++i) {
+    if (as<std::string>(rn[i]) != as<std::string>(nm[i])) return false;
+  }
+  R = as<arma::mat>(Rh);
+  if (!R.is_finite()) return false;
+  R = 0.5 * (R + R.t());
+  source = as<std::string>(hl["source"]);
+  shortcut = hl.containsElementNamed("shortcut") && as<bool>(hl["shortcut"]);
+  return true;
+}
+
+// Whether the full stage needs the OPG cross-product S: the "r,s" sandwich or "s".
+// Which shape .foceiInstallFdFullCov installs is the one REQUESTED (the control's
+// covMethod slot: 1 "r,s", 2 "r", 3 "s"; with covType = "analytic" it follows the
+// native step), so S is needed when the request uses it even if the native step fell
+// back to "r" (the requested "r,s (full)" needs S to be installed), as well as when the
+// native step's final choice uses it.
+static bool foceiFdFullNeedS(Environment e) {
+  int req = 0;
+  if (e.exists("control")) {
+    List ctl = as<List>(e["control"]);
+    std::string covType = ctl.containsElementNamed("covType") ?
+      as<std::string>(ctl["covType"]) : "fd";
+    if (covType != "analytic" && ctl.containsElementNamed("covMethod")) {
+      // a slot number; anything else would throw here, and the caller swallows the
+      // exception and with it the whole full covariance
+      RObject cm = ctl["covMethod"];
+      if ((TYPEOF(cm) == INTSXP || TYPEOF(cm) == REALSXP) && Rf_length(cm) == 1) {
+        req = as<int>(cm);
+      }
+    }
+  }
+  return op_focei.covMethod == 1 || op_focei.covMethod == 3 || req == 1 || req == 3;
+}
+
+// The full stage about the fit: a step search per coordinate (the estimation's settings,
+// or with covKnobs the covariance stage's), R = H/2 by the shared stencil (a coordinate
+// whose search fails takes the step-doubling diagonal and its step), and S from the
+// per-subject values at the stencil's own x +/- h points.  The live state is restored.
+static bool foceiFdFullCompute(Environment e, bool covKnobs, bool needS, FdFullResult &res) {
+  if (op_focei.neta <= 0) return false;
+  FdFullCtx &c = res.c;
+  if (!foceiFdParams(e, c, res.nm)) return false;
   c.Om0 = as<arma::mat>(getOmega());
   int np = c.nth + c.nom;
 
-  // save live state (restored on exit)
-  arma::mat omegaInv0 = op_focei.omegaInv, cholOmegaInv0 = op_focei.cholOmegaInv;
-  double logDet0 = op_focei.logDetOmegaInv5;
-  std::vector<double> fth0(op_focei.ntheta);
-  std::copy(&op_focei.fullTheta[0], &op_focei.fullTheta[0] + op_focei.ntheta, fth0.begin());
-  std::vector<double> x0(np);
+  std::vector<double> &x0 = res.x0;
+  x0.resize(np);
   for (int i = 0; i < c.nth; ++i) x0[i] = op_focei.fullTheta[c.thPos[i]];
   for (int q = 0; q < c.nom; ++q) x0[c.nth + q] = c.Om0(c.omA[q]-1, c.omB[q]-1);
 
-  op_focei.covFdDirect = 1;
-  arma::mat H;
-  std::vector<double> h;
-  bool ok = foceiFdHessian(c, x0, foceiFdObjAt(c, x0), H, h);
-  // only the S-using cov methods need the OPG cross-product ("r,s" sandwich or "s"); this is
-  // the final selection after foceiCalcCov's heuristic, matching what e["covMethod"] reports.
-  bool needS = (op_focei.covMethod == 1 || op_focei.covMethod == 3);
-  arma::mat S;
-  bool okS = ok && needS && foceiFdSFull(c, x0, h, S);
+  FdFullStateGuard _restore;
+  double f0;
+  {
+    CovStageScope _st(covStFullCenter);
+    f0 = foceiFdObjAt(c, x0.data());
+  }
+  bool ok = R_FINITE(f0);
+  // A hint R0 seeds each step search with its diagonal (the objective's Hessian is 2 R0).
+  // With covShortcut, the full R it predicts from the measured diagonal D and its own
+  // correlations, D^1/2 rho0 D^1/2, is checked along fixed directions after the
+  // diagonal; when it explains them the off-diagonals are not measured.
+  arma::mat Rh;
+  std::string src;
+  bool shortcut = false;
+  std::vector<double> d2(np, NA_REAL);
+  if (ok && foceiFdFullHint(e, res.nm, Rh, src, shortcut)) {
+    res.precursor = src;
+    for (int i = 0; i < np; ++i) d2[i] = 2.0 * Rh(i, i);
+    shortcut = shortcut && Rh.diag().min() > 0;
+    res.shortcut = shortcut ? "fell back" : "off";
+  }
+  std::vector<double> &h = res.h;
+  h.assign(np, NA_REAL);
+  {
+    CovStageScope _st(covStFullGill);
+    for (int i = 0; ok && i < np; ++i) h[i] = foceiFdGillStep(c, i, x0, f0, covKnobs, d2[i]);
+  }
+  FdFullHessObj obj(c);
+  if (covReuseOn()) {
+    obj.x0 = x0;
+    obj.keep = true;
+  }
+  std::function<bool(arma::mat &)> check = [&](arma::mat &H) {
+    arma::vec sd = arma::sqrt(Rh.diag());
+    arma::mat rho = Rh / (sd * sd.t());
+    arma::vec dh = arma::sqrt(H.diag());
+    if (!dh.is_finite()) return false;
+    arma::mat Hp = rho % (dh * dh.t());
+    CovShortcutResult sc = covShortcutVerify(obj, x0.data(), np, f0, h.data(), Hp, 0.5);
+    res.checks = sc.checks;
+    if (sc.status != 1) return false;
+    res.shortcut = "accepted";
+    H = Hp;
+    return true;
+  };
+  {
+    CovStageScope _st(covStFullR);
+    ok = ok && fdHessian(obj, x0.data(), np, f0, h.data(), res.R, 0.5, true, true,
+                         shortcut ? &check : nullptr);
+  }
+  {
+    CovStageScope _st(covStFullS);
+    res.okS = ok && needS && foceiFdSFull(c, x0, h, res.S, obj.keep ? &obj.axis : nullptr);
+  }
+  return ok;
+}
 
-  // restore live state
-  std::copy(fth0.begin(), fth0.end(), &op_focei.fullTheta[0]);
-  op_focei.omegaInv = omegaInv0; op_focei.cholOmegaInv = cholOmegaInv0; op_focei.logDetOmegaInv5 = logDet0;
-  op_focei.covFdDirect = 0;
-  if (!ok) return;
+// The full stage's natural covariance solve(R); false when R cannot be inverted.
+static bool foceiFdFullCovOf(const FdFullResult &res, arma::mat &cov) {
+  return arma::inv_sympd(cov, res.R) || arma::inv(cov, res.R);
+}
 
+// Whether a stored full-stage R (rows named) was taken about the live point, to the last
+// bit; sets res.c.Om0 and res.x0 to that point.
+static bool foceiFdFullStoreAtPoint(FdFullResult &res, const NumericMatrix &Rs,
+                                    const NumericVector &x0s) {
+  FdFullCtx &c = res.c;
+  int np = c.nth + c.nom;
+  c.Om0 = as<arma::mat>(getOmega());
+  std::vector<double> &x0 = res.x0;
+  x0.resize(np);
+  for (int i = 0; i < c.nth; ++i) x0[i] = op_focei.fullTheta[c.thPos[i]];
+  for (int q = 0; q < c.nom; ++q) x0[c.nth + q] = c.Om0(c.omA[q]-1, c.omB[q]-1);
+  for (int i = 0; i < np; ++i) {
+    if (x0[i] != x0s[i]) return false;
+  }
+  RObject dn = Rs.attr("dimnames");
+  if (Rf_isNull(dn)) return false;
+  CharacterVector rn = as<List>(dn)[0];
+  for (int i = 0; i < np; ++i) {
+    if (rn[i] != res.nm[i]) return false;
+  }
+  return true;
+}
+
+// The stored full-stage S, when one of the right size was stored
+static bool foceiFdFullStoreS(List st, int np, arma::mat &S) {
+  if (!st.containsElementNamed("S") || Rf_isNull(st["S"])) return false;
+  NumericMatrix Ss = as<NumericMatrix>(st["S"]);
+  if (Ss.nrow() != np || Ss.ncol() != np) return false;
+  S = as<arma::mat>(Ss);
+  return true;
+}
+
+// Read a stored full stage (e$.fdFullStore, from setCov()'s lookup) taken about this point;
+// S alone is computed, at the stored steps, when it is needed and was not stored.
+static bool foceiFdFullFromStore(Environment e, bool needS, FdFullResult &res) {
+  if (!covReuseOn() || !e.exists(".fdFullStore") || op_focei.neta <= 0) return false;
+  List st = as<List>(e[".fdFullStore"]);
+  if (!st.containsElementNamed("R") || !st.containsElementNamed("h") ||
+      !st.containsElementNamed("x0")) return false;
+  FdFullCtx &c = res.c;
+  if (!foceiFdParams(e, c, res.nm)) return false;
+  int np = c.nth + c.nom;
+  NumericMatrix Rs = as<NumericMatrix>(st["R"]);
+  NumericVector h = as<NumericVector>(st["h"]), x0s = as<NumericVector>(st["x0"]);
+  if (Rs.nrow() != np || Rs.ncol() != np || h.size() != np || x0s.size() != np) return false;
+  if (!foceiFdFullStoreAtPoint(res, Rs, x0s)) return false;
+  res.R = as<arma::mat>(Rs);
+  res.h.assign(h.begin(), h.end());
+  if (st.containsElementNamed("precursor") && !Rf_isNull(st["precursor"])) {
+    e[".fdFullPrecursor"] = st["precursor"];
+  }
+  res.okS = foceiFdFullStoreS(st, np, res.S);
+  if (needS && !res.okS) {
+    FdFullStateGuard _restore;
+    CovStageScope _st(covStFullS);
+    res.okS = foceiFdSFull(c, res.x0, res.h, res.S);
+  }
+  return true;
+}
+
+// Install the full stage for .foceiInstallFdFullCov: the natural cov solve(R) as
+// e[".fdFullCov"] and S as e[".fdFullS"].
+static bool foceiFdFullStash(Environment e, const FdFullResult &res) {
   arma::mat cov;
-  if (!arma::inv_sympd(cov, 0.5 * H) && !arma::inv(cov, 0.5 * H)) return;   // cov = 2 H^{-1} = Rinv
+  if (!foceiFdFullCovOf(res, cov)) return false;   // cov = Rinv
   NumericMatrix covR = wrap(cov);
-  covR.attr("dimnames") = List::create(nm, nm);
+  covR.attr("dimnames") = List::create(res.nm, res.nm);
   e[".fdFullCov"] = covR;                       // Rinv_full (feeds "r" and the sandwich)
-  if (okS) {
-    NumericMatrix Sout = wrap(S);
-    Sout.attr("dimnames") = List::create(nm, nm);
+  // R and the steps themselves, for the fit's covariance store (.covStoreRecord)
+  NumericMatrix Rout = wrap(res.R);
+  Rout.attr("dimnames") = List::create(res.nm, res.nm);
+  e[".fdFullR"] = Rout;
+  e[".fdFullH"] = NumericVector(res.h.begin(), res.h.end());
+  e[".fdFullX0"] = NumericVector(res.x0.begin(), res.x0.end());
+  // how a hint served, for the fit's record (.covPrecursorRecord)
+  if (!res.precursor.empty()) {
+    List rec = List::create(_["source"] = res.precursor, _["shortcut"] = res.shortcut);
+    if (res.checks.n_rows) {
+      NumericMatrix ck = wrap(res.checks);
+      ck.attr("dimnames") = List::create(R_NilValue,
+                                         CharacterVector::create("measured", "predicted", "allowance"));
+      rec["checks"] = ck;
+    }
+    e[".fdFullPrecursor"] = rec;
+  }
+  if (res.okS) {
+    NumericMatrix Sout = wrap(res.S);
+    Sout.attr("dimnames") = List::create(res.nm, res.nm);
     e[".fdFullS"] = Sout;                        // Sfull (feeds "s" and the sandwich)
   }
+  return true;
+}
+
+// Whether the full stage ran inside foceiCalcCov (and gave the theta-only R and S), so
+// the separate full stage after it is not needed.
+static bool _fdFullDone = false;
+
+// Whether the theta-only R and S can be read from the full stage: a covariance on the
+// finite-difference route (the caller has tried an analytic R), every estimated theta among the full
+// stage's, and the theta-only stage's own construction not needed -- a mixture's
+// analytic responsibility scores, a non-normal endpoint's settings and forward-difference
+// S legs (covDerivMethod = "forward") are its own.
+static bool foceiFdFullMergeable(Environment e) {
+  return op_focei.covFull && op_focei.neta > 0 && op_focei.muModel == 0 &&
+    op_focei.mixIdxN == 0 && !op_focei.needOptimHess && op_focei.gillKcov != 0 &&
+    op_focei.covDerivMethod != 0 &&                   // forward S differences are the theta stage's
+    (op_focei.covMethod >= 1 && op_focei.covMethod <= 3);
+}
+
+// The full stage's index of each of op_focei's thetas; false when one is not among them.
+static bool foceiFdFullThetaIdx(const FdFullResult &res, arma::uvec &idx) {
+  int np = (int)op_focei.npars;
+  idx.set_size((unsigned int)np);
+  for (int k = 0; k < np; ++k) {
+    int j = op_focei.fixedTrans[k], found = -1;
+    for (int i = 0; i < res.c.nth; ++i) {
+      if (res.c.thPos[i] == j) { found = i; break; }
+    }
+    if (found < 0) return false;
+    idx[(unsigned int)k] = (unsigned int)found;
+  }
+  return true;
+}
+
+// The theta-only R.0 and S0 as the theta block of the full stage's, in op_focei's
+// parameter order (idx from foceiFdFullThetaIdx).
+static void foceiFdFullInstallTheta(Environment e, const FdFullResult &res, const arma::uvec &idx) {
+  arma::mat R0 = res.R.submat(idx, idx);
+  e["R.0"] = wrap(R0);
+  foceiCovChol(e, R0, "R");
+  if (res.okS) {
+    arma::mat S0 = res.S.submat(idx, idx);
+    e["S0"] = wrap(S0);
+    e["Sper"] = 1.0;
+    foceiCovChol(e, S0, "S");
+  }
+}
+
+// Run the full stage inside foceiCalcCov when the theta-only R and S can be read from
+// it, at the covariance stage's step settings: one step search and one stencil per
+// covariance step instead of two.  Installs the theta-only R.0/S0 and the full stage's
+// .fdFullCov/.fdFullS; false (nothing installed) when it does not apply.
+// An error in the full stage (it moves Omega, which the theta-only stage does not) leaves
+// the theta-only route to run, as when the stages were separate.
+static bool foceiFdFullMerge(Environment e) {
+  if (!covReuseOn() || !foceiFdFullMergeable(e)) return false;
+  FdFullResult res;
+  try {
+    ScopedRestore<int> calcGrad(op_focei.calcGrad);
+    // the full stage's evaluations under the fit's calcGrad write these; the theta-only
+    // stage after it needs its own centre value
+    ScopedRestore<double> lastOfv(op_focei.lastOfv);
+    ScopedRestore<int> checkTheta(op_focei.checkTheta);
+    op_focei.calcGrad = _covFitCalcGrad;
+    bool needS = foceiFdFullNeedS(e);
+    if (!foceiFdFullFromStore(e, needS, res) && !foceiFdFullCompute(e, true, needS, res)) return false;
+  } catch (Rcpp::internal::InterruptedException&) {
+    throw;
+  } catch (Rcpp::LongjumpException&) {
+    throw;
+  } catch (...) {
+    return false;
+  }
+  arma::uvec idx;
+  arma::mat cov;
+  if (!foceiFdFullThetaIdx(res, idx) || !foceiFdFullCovOf(res, cov)) return false;
+  foceiFdFullInstallTheta(e, res, idx);
+  foceiFdFullStash(e, res);
+  _fdFullDone = true;
+  return true;
+}
+
+// The separate full stage (covFull = TRUE), at the estimation's step settings, unless
+// foceiCalcCov already ran it.
+void foceiCalcRFdFull(Environment e) {
+  if (_fdFullDone) return;
+  FdFullResult res;
+  bool needS = foceiFdFullNeedS(e);
+  if (!foceiFdFullFromStore(e, needS, res) && !foceiFdFullCompute(e, false, needS, res)) return;
+  foceiFdFullStash(e, res);
 }
 
 void addLlikObs(Environment e) {
@@ -12335,102 +13018,28 @@ void addLlikObs(Environment e) {
 void parHistData(Environment e, bool focei){
   if (!e.exists("method") && iterType.size() > 0) {
     CharacterVector thetaNames=as<CharacterVector>(e["thetaNames"]);
-    CharacterVector dfNames;
-    if (focei){
-      CharacterVector dfNames2(3+op_focei.nparsPrint);
-      dfNames = dfNames2;
-    } else {
-      CharacterVector dfNames2(3+thetaNames.size());
-      dfNames = dfNames2;
-    }
-    dfNames[0] = "iter";
-    dfNames[1] = "type";
-    dfNames[2] = "objf";
-    int i, j, k=1;
+    CharacterVector names = thetaNames;
     if (focei){
       // print-map order: optimizer columns plus regression-updated mu thetas
       // at their natural positions (identity over fixedTrans when muModel off)
-      for (i = 0; i < (int)op_focei.nparsPrint; i++){
-        j=_printFullIdx[i];
+      names = CharacterVector(op_focei.nparsPrint);
+      int k = 1;
+      for (int i = 0; i < (int)op_focei.nparsPrint; i++){
+        int j=_printFullIdx[i];
         if (j < thetaNames.size()){
-          dfNames[i+3] = thetaNames[j];
+          names[i] = thetaNames[j];
         } else {
-          dfNames[i+3] = "o" + std::to_string(k++);
+          names[i] = "o" + std::to_string(k++);
         }
       }
-    } else {
-      for (i = 0; i < thetaNames.size(); i++){
-        dfNames[i+3] = thetaNames[i];
-      }
     }
-    // iter type parameters
-    List ret;
-    if (focei){
-      ret = List(3+op_focei.nparsPrint);
-    } else {
-      ret = List(3+thetaNames.size());
-    }
-    int sz = niter.size()+niterGrad.size();
-    IntegerVector tmp;
-    std::vector<int> iter;
-    iter.reserve(sz);
-    iter.insert(iter.end(), niter.begin(), niter.end());
-    iter.insert(iter.end(), niterGrad.begin(), niterGrad.end());
-    ret[0] = iter;
-    tmp = IntegerVector(sz);
-    std::vector<int> typ;
-    typ.reserve(sz);
-    typ.insert(typ.end(), iterType.begin(), iterType.end());
-    typ.insert(typ.end(), gradType.begin(), gradType.end());
-    tmp = typ;
-    tmp.attr("levels") = CharacterVector::create("Gill83 Gradient", "Mixed Gradient",
-                                                 "Forward Difference", "Central Difference",
-                                                 "Scaled", "Unscaled", "Back-Transformed",
-                                                 "Forward Sensitivity", "Analytic Gradient",
-                                                 "Analytic Gradient (relaxed)",
-                                                 "Analytic Gradient (finite difference)",
-                                                 "Analytic Gradient (Chartrand)");
-    tmp.attr("class") = "factor";
-    ret[1] = tmp;
-    arma::mat cPar(vPar.size()/iterType.size(), iterType.size());
-    std::copy(vPar.begin(), vPar.end(), cPar.begin());
-    arma::mat vals;
-    if (vGrad.size() > 0){
-      arma::mat cGrad(vGrad.size()/gradType.size(), gradType.size());
-      std::copy(vGrad.begin(), vGrad.end(), cGrad.begin());
-      cPar = cPar.t();
-      cGrad = cGrad.t();
-      vals = arma::join_cols(cPar, cGrad);
-    } else {
-      cPar = cPar.t();
-      vals = cPar;
-    }
-    if (focei){
-      for (i = 0; i < min2(op_focei.nparsPrint+1, vals.n_cols); i++){
-        ret[i+2]= vals.col(i);
-      }
-    } else {
-      for (i = 0; i < thetaNames.size()+1; i++){
-        ret[i+2]= vals.col(i);
-      }
-    }
-    vGrad.clear();
-    vPar.clear();
-    iterType.clear();
-    gradType.clear();
-    niter.clear();
-    niterGrad.clear();
-    ret.attr("names")=dfNames;
-    ret.attr("class") = "data.frame";
-    ret.attr("row.names")=IntegerVector::create(NA_INTEGER, -sz);
+    List ret = scaleParHisList(names, niter, iterType, vPar, niterGrad, gradType, vGrad);
     Function loadNamespace("loadNamespace", R_BaseNamespace);
     Environment nlmixr2 = loadNamespace("nlmixr2est");
     Environment thetaReset = nlmixr2[".thetaReset"];
     if (thetaReset.exists("parHistData")) {
       // rbind  data.
       if (TYPEOF(thetaReset["parHistData"]) == VECSXP) {
-        Function loadNamespace("loadNamespace", R_BaseNamespace);
-        Environment nlmixr2 = loadNamespace("nlmixr2est");
         Function rbind = nlmixr2[".rbindParHistory"];
         ret = rbind(thetaReset["parHistData"], ret);
       }
@@ -13044,6 +13653,8 @@ void foceiFinalizeTables(Environment e){
           _["solverFail"] = op_focei.nTrustSolverNoConv.load(std::memory_order_relaxed),
           _["newtonGate"] = op_focei.nTrustPush.load(std::memory_order_relaxed),
           _["warmRetry"] = op_focei.nTrustWarm.load(std::memory_order_relaxed),
+          // Accepted Newton polish steps after a converged solve (#1152).
+          _["polish"] = op_focei.nTrustPolish.load(std::memory_order_relaxed),
           _["radiusRetry"] = op_focei.nTrustRetry.load(std::memory_order_relaxed),
           _["nudge"] = op_focei.nTrustNudge.load(std::memory_order_relaxed),
           // Omega-draw restarts taken after the fixed nudges were spent.
@@ -13051,6 +13662,12 @@ void foceiFinalizeTables(Environment e){
           // Subjects whose whole cascade -- first solve, radius escalation and
           // all four nudges -- ended without a converged attempt.
           _["failed"] = op_focei.nTrustFail.load(std::memory_order_relaxed));
+      }
+      if (op_focei.innerOpt == 2) {
+        e["nLbfgsInner"] = IntegerVector::create(
+          _["calls"] = op_focei.nLbfgsInner.load(std::memory_order_relaxed),
+          _["notConverged"] = op_focei.nLbfgsNoConv.load(std::memory_order_relaxed),
+          _["maxit"] = op_focei.nLbfgsMaxit.load(std::memory_order_relaxed));
       }
       if (op_focei.muModel == 1) {
         _details += "; mu: lin";
@@ -13144,6 +13761,21 @@ double impLogDetOmegaInv5() {
   return op_focei.logDetOmegaInv5;
 }
 
+// The eta prior likInner0() adds to a subject's -log joint, 0.5 * eta' Omega^-1 eta
+double impEtaPriorHalf(const arma::vec& eta) {
+  arma::mat etam(eta);
+  return 0.5 * arma::as_scalar(etam.t() * curOmegaInv() * etam);
+}
+
+// Whether the imp covariance may reuse its own evaluations (see covReuseOn())
+bool impCovReuseOn() {
+  return covReuseOn();
+}
+
+bool impIsFo() {
+  return op_focei.fo == 1;
+}
+
 int impNiter() {
   return op_focei.impNiter;
 }
@@ -13195,6 +13827,8 @@ int impMuGroupN() {
 int impNtheta() { return (int)op_focei.ntheta; }
 
 bool impCovEnabled() { return op_focei.impCov; }
+
+bool impFrozen() { return op_focei.impFrozen; }
 
 // ---- quasi-random (QRPEM) + SIR controls -----------------------------------
 bool impQrEnabled() { return op_focei.impQr; }
@@ -13256,15 +13890,6 @@ void impSetMixThetas(const arma::vec& theta) {
   std::copy(mj.begin(), mj.end(), &op_focei.mixProbGrad[0]);
 }
 
-// fullTheta indices of the estimated (non-fixed) thetas, in free-parameter order.
-void impGetEstThetaIdx(std::vector<int>& idx) {
-  idx.clear();
-  for (unsigned int k = 0; k < op_focei.npars; ++k) {
-    int j = op_focei.fixedTrans[k];
-    if (j >= 0 && j < (int)op_focei.ntheta) idx.push_back(j);
-  }
-}
-
 // fullTheta index of every free (estimated) parameter, in the optimizer's
 // free-parameter (fixedTrans) order -- the order the fit's covariance uses.
 // idx[k] < ntheta is a theta; idx[k] >= ntheta is the Omega parameter idx-ntheta.
@@ -13303,9 +13928,6 @@ void impForceResolve(int id) { inds_focei[id].setup = 0; }
 
 // ---- Omega block of the MC covariance ----
 
-// Number of parameterized Omega free parameters (fullTheta[ntheta .. +omegan-1]).
-int impOmegaN() { return (int)op_focei.omegan; }
-
 double impGetOmegaThetaVal(int m) { return op_focei.fullTheta[op_focei.ntheta + m]; }
 
 // Set Omega free parameter m (FD perturbation) and rebuild omegaInv / cholOmegaInv
@@ -13323,6 +13945,21 @@ void impSetOmegaThetaAll(int m, double val) {
   op_focei.omegaInv = getOmegaInv();
   op_focei.cholOmegaInv = getCholOmegaInv();
   op_focei.logDetOmegaInv5 = getOmegaDet();
+}
+
+// d(Omega)/d(p_m) for every Omega parameter p_m = fullTheta[ntheta + m] at the
+// current estimate.  The parameters are the entries of chol(Omega^-1) (diagXform
+// on the diagonal) of the _rxInv handle the inner problem uses, which also gives
+// d(Omega^-1)/d(p_m); with A = Omega^-1, dOmega = -Omega dA Omega.
+List impOmegaParDeriv() {
+  foceiOmegaEnvSyncFromTail();
+  arma::mat Om = getOmegaMat();
+  List dA = getDOmegaInvL();
+  List ret(dA.size());
+  for (int m = 0; m < dA.size(); ++m) {
+    ret[m] = wrap(arma::mat(-Om * as<arma::mat>(dA[m]) * Om));
+  }
+  return ret;
 }
 
 // M-step helpers (EM loop lives in impOuter, src/imp.cpp).
@@ -13469,7 +14106,7 @@ void impIterPrintRow(arma::vec& par, double obj) {
 // scaleParHisDf clears the accumulators.
 void impIterPrintGet(Environment e) {
   scaling *s = &op_focei.scale;
-  if (s->every != 0) scalePrintLine(s, min2((int)s->npars, s->ncol));
+  if (s->every != 0) scalePrintLine(s->showOfv, min2((int)s->npars, s->ncol));
   RObject ph = scaleParHisDf(s);
   if (!ph.isNULL()) e["parHistData"] = ph;
 }
@@ -13516,11 +14153,33 @@ void impReMap() {
   innerOpt();
 }
 
+// impSetOmega()'s floor changes the reported omega (and the fit's ini()), so
+// say which variances it replaced; `idx` holds 0-based eta positions.
+void impWarnOmegaFloor(Environment e, const std::vector<int>& idx) {
+  if (idx.empty()) return;
+  CharacterVector etaNames;
+  if (e.exists("etaNames")) etaNames = as<CharacterVector>(e["etaNames"]);
+  std::string msg = "omega variance floored at 1e-6: ";
+  for (size_t k = 0; k < idx.size(); ++k) {
+    std::string nm = (idx[k] >= 0 && idx[k] < etaNames.size()) ?
+      as<std::string>(etaNames[idx[k]]) : "eta" + std::to_string(idx[k] + 1);
+    if (k > 0) nm = ", " + nm;
+    // keep the warning on one line of $runInfo
+    if (msg.size() + nm.size() > 70) {
+      msg += ", ...";
+      break;
+    }
+    msg += nm;
+  }
+  Rcpp::warning(msg);
+}
+
 // Install a new Omega: rebuild the rxSymInvChol environment (reusing the rxode2
 // matrix->parameterization machinery), refresh the cached inverse/Cholesky/log-
 // determinant, and copy the new Omega thetas into fullTheta so the next MAP and
-// the output see them.
-void impSetOmega(const arma::mat& Omega, const std::string& diagXform) {
+// the output see them.  Returns the etas (0-based) whose variance it raised to
+// the floor.
+std::vector<int> impSetOmega(const arma::mat& Omega, const std::string& diagXform) {
   foceiOmegaFastReset(); // the _rxInv env is replaced; the map may change
   foceiOmegaTailMemoClear();
   Environment rxode2ns = Environment::namespace_env("rxode2");
@@ -13531,8 +14190,16 @@ void impSetOmega(const arma::mat& Omega, const std::string& diagXform) {
   // rxSymInvCholCreate error "initial 'omega' matrix inverse is non-positive
   // definite".  Symmetrize and floor the diagonal so the inverse is well-defined.
   arma::mat Om = 0.5 * (Omega + Omega.t());
-  for (unsigned int d = 0; d < Om.n_rows; ++d) if (Om(d, d) < 1e-6) Om(d, d) = 1e-6;
-  _rxInv = as<List>(f(Rcpp::Named("mat") = wrap(Om),
+  std::vector<int> floored;
+  for (unsigned int d = 0; d < Om.n_rows; ++d) {
+    if (Om(d, d) < 1e-6) {
+      Om(d, d) = 1e-6;
+      floored.push_back((int)d);
+    }
+  }
+  // held first: Function's argument list allocates while it is built
+  NumericMatrix omR = wrap(Om);
+  _rxInv = as<List>(f(Rcpp::Named("mat") = omR,
                       Rcpp::Named("diag.xform") = diagXform));
   if (op_focei.fo == 1) {
     op_focei.omega = getOmegaMat();
@@ -13545,6 +14212,7 @@ void impSetOmega(const arma::mat& Omega, const std::string& diagXform) {
   std::copy(omegaTheta.begin(),
             omegaTheta.begin() + op_focei.omegan,
             &op_focei.fullTheta[0] + op_focei.ntheta);
+  return floored;
 }
 
 // Sync the optimizer's reference point (initPar) to the current natural
@@ -13570,7 +14238,7 @@ void impMapPass(Environment e) {
   // foceiOuter() takes when maxOuterIterations == 0.
   NumericVector x(op_focei.npars);
   for (unsigned int k = op_focei.npars; k--;) {
-    x[k] = scalePar(op_focei.initPar, k);
+    x[k] = scaleScalePar(&op_focei, op_focei.initPar, k);
   }
   foceiOuterFinal(x.begin(), e);
 }
@@ -13581,17 +14249,12 @@ void impGetMode(int id, arma::vec& mode) {
   std::copy(&fInd->eta[0], &fInd->eta[0] + op_focei.neta, mode.begin());
 }
 
-double impGetIndLik(int id) {
-  focei_ind *fInd = &(inds_focei[id]);
-  return fInd->lik[0];
-}
-
 bool impGetHessian(int id, arma::mat& H) {
   focei_ind *fInd = &(inds_focei[id]);
   int neta = op_focei.neta;
   // Establish the inner solve at this subject's mode before the FD Hessian.
   double f = likInner0(fInd->eta, id);
-  if (ISNA(f)) {
+  if (ISNAN(f)) {
     // The MAP already evaluated this mode, so an NA here means the cached solve
     // state is stale (e.g. left by a prior fit of a different-sized model).
     // Force a fresh solve and retry at the same mode before giving up.
@@ -13599,7 +14262,7 @@ bool impGetHessian(int id, arma::mat& H) {
     setIndSolve(getSolvingOptionsInd(rx, getRxId(id)), -1);
     resetOpBadSolve(getSolvingOptions(rx));
     f = likInner0(fInd->eta, id);
-    if (ISNA(f)) return false;
+    if (ISNAN(f)) return false;
   }
   rx = getRxSolve_();
   rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(id));
@@ -14147,6 +14810,7 @@ static void foceiFitSetupScale(const CharacterVector &thetaNames,
 //[[Rcpp::export]]
 Environment foceiFitCpp_(Environment e){
   focei_wall_clock::time_point wallT0 = focei_wall_clock::now();
+  _foceiProgInPlace = nmProgressInPlace();
   // The registry is a global that outlives a fit, so start every fit from empty:
   // otherwise a fit with no theta-sensitivity model of its own would size its
   // pool from the PREVIOUS fit's, which is exactly what resetting _impPoolModel
@@ -14527,10 +15191,14 @@ Environment foceiFitCpp_(Environment e){
     }
   }
   IntegerVector xType = e["xType"];
+  // R gives scaleC by parameter; the optimizer reads it by optimizer index
   std::fill_n(&op_focei.scaleC[0], op_focei.ntheta+op_focei.omegan, NA_REAL);
   if (e.exists("scaleC")){
-    arma::vec scaleC = as<arma::vec>(e["scaleC"]);
-    std::copy(scaleC.begin(), scaleC.end(), &op_focei.scaleC[0]);
+    NumericVector scaleC = as<NumericVector>(e["scaleC"]);
+    for (unsigned int k = op_focei.npars; k--;){
+      int j = op_focei.fixedTrans[k];
+      if (j < scaleC.size()) op_focei.scaleC[k] = scaleC[j];
+    }
   }
   // Theta transforms (ntheta-indexed, from R's .iterPrintXParFromUi xform list,
   // length ntheta_total); re-indexed below via fixedTrans into the npars-sized
@@ -14549,7 +15217,7 @@ Environment foceiFitCpp_(Environment e){
     int j = op_focei.fixedTrans[k];
     op_focei.xPar[k] = 0;
     op_focei.probitIdxArr[k] = 0;
-    if ((int)op_focei.ntheta < j){
+    if (j >= (int)op_focei.ntheta){
       op_focei.xPar[k] = xType[j-op_focei.ntheta];
     } else {
       if (j < thetaXPar.size())       op_focei.xPar[k]         = thetaXPar[j];
@@ -14592,6 +15260,17 @@ Environment foceiFitCpp_(Environment e){
       npbOuter(e);
     } else {
       foceiOuter(e);
+      if (op_focei.maxOuterIterations > 0 && op_focei.initObj &&
+          foceiFinalOfvWorse(op_focei.initOfv, op_focei.finalOfv)) {
+        // The outer optimizer can only return a point it evaluated, and every
+        // optimizer here keeps its best, so the reported objective should never be
+        // worse than the starting one.  When it is, the fit is not trustworthy:
+        // either the optimizer failed outright or the inner (eta) problem did not
+        // converge when the final estimates were re-evaluated.  Issue 1114 returned
+        // ~2e244 against a starting 824 with every theta untouched and no message.
+        warning(_("the final objective function (%g) is worse than the initial objective function (%g); the estimates are not reliable.\nThe outer optimizer did not improve on the initial estimates or the inner (eta) optimization did not converge at the final estimates; check the initial estimates and the scaling (foceiControl(scaleType=, normType=))"),
+                op_focei.finalOfv, op_focei.initOfv);
+      }
     }
     if (op_focei.didHessianReset==1){
       warning(_("Hessian reset during optimization; (can control by foceiControl(resetHessianAndEta=.))"));
@@ -14627,14 +15306,18 @@ Environment foceiFitCpp_(Environment e){
     }
   }
   e["optimTime"] = foceiElapsedSeconds(wallT0);
-  NumericVector scaleSave(op_focei.ntheta+op_focei.omegan);
-  for (unsigned int i =op_focei.ntheta+op_focei.omegan;i--;){
-    scaleSave[i] = getScaleC(i);
+  // by parameter again; a parameter the optimizer does not move has none
+  NumericVector scaleSave(op_focei.ntheta+op_focei.omegan, NA_REAL);
+  for (unsigned int k = op_focei.npars; k--;){
+    scaleSave[op_focei.fixedTrans[k]] = scaleGetScaleC(&op_focei, k);
   }
   e["scaleC"] = scaleSave;
   parHistData(e, true); // Need to calculate before the parameter translations are mangled
   thetaResetObj(e);
-  IntegerVector gillRet(op_focei.ntheta+op_focei.omegan);
+  // The first gradient's step searches, which numericGrad() keeps by optimizer
+  // index, listed by parameter; a parameter the optimizer does not move was not
+  // assessed (level 1, "Not Assessed").
+  IntegerVector gillRet(op_focei.ntheta+op_focei.omegan, 1);
   NumericVector gillAEps(op_focei.ntheta+op_focei.omegan,NA_REAL);
   NumericVector gillREps(op_focei.ntheta+op_focei.omegan,NA_REAL);
   NumericVector gillAEpsC(op_focei.ntheta+op_focei.omegan,NA_REAL);
@@ -14642,14 +15325,14 @@ Environment foceiFitCpp_(Environment e){
   NumericVector gillCAEpsC(op_focei.ntheta+op_focei.omegan,NA_REAL);
   NumericVector gillCREpsC(op_focei.ntheta+op_focei.omegan,NA_REAL);
   bool warnGill = false;
-  int j = op_focei.npars;
-  for (int i = op_focei.ntheta+op_focei.omegan; i--;){
-    gillRet[i] = op_focei.gillRet[i]+1;
+  for (unsigned int k = op_focei.npars; k--;){
+    int i = op_focei.fixedTrans[k];
+    gillRet[i] = op_focei.gillRet[k]+1;
     if (gillRet[i] != 1) {
-      gillAEps[i] = op_focei.aEps[--j];
-      gillREps[i] = op_focei.rEps[j];
-      gillAEpsC[i] = op_focei.aEpsC[j];
-      gillREpsC[i] = op_focei.rEpsC[j];
+      gillAEps[i] = op_focei.aEps[k];
+      gillREps[i] = op_focei.rEps[k];
+      gillAEpsC[i] = op_focei.aEpsC[k];
+      gillREpsC[i] = op_focei.rEpsC[k];
     }
     if (gillRet[i] >= 3) warnGill=true;
   }
@@ -14659,10 +15342,27 @@ Environment foceiFitCpp_(Environment e){
   gillRet.attr("class") = "factor";
   e["gillRet"] = gillRet;
   wallT0 = focei_wall_clock::now();
+  // What the estimation left in the flags its warnings report.  The covariance step's legs
+  // can set them too; those are reported as the covariance step's below.
+  const bool estPredSolve = op_focei.didPredSolve.load(std::memory_order_relaxed);
+  const int estReducedTol = op_focei.reducedTol.load(std::memory_order_relaxed);
+  const int estStickyTol = op_focei.stickyTol.load(std::memory_order_relaxed);
+  const int estOuterReducedTol = op_focei.outerReducedTol.load(std::memory_order_relaxed);
+  const int estOuterStickyTol = op_focei.outerStickyTol.load(std::memory_order_relaxed);
   {
-    // covSolveTol tightens the finite-difference cov solves (R/S + full-cov FD)
+    // Constructed first so it restores last, after _covTolGuard has reset the factors.
+    CovTolFactorGuard _tolFactorGuard;
+    // the covariance step's solves and inner problems run at the probe tolerances
     CovSolveTolGuard _covTolGuard(e);
+    CovInnerTolGuard _covInnerTolGuard(e);
+    CovLlikObsGuard _llikObsGuard;
+    // every leg below starts its inner problems from the fit's ETAs
+    CovEtaStart _etaStart(e);
+    std::fill_n(_covEvals, (int)covStN, 0);
+    _fdFullDone = false;
+    _covThetaAxis.clear();
     foceiCalcCov(e);
+    _covThetaAxis.clear();
     // covType="fd" + covFull=TRUE: the full theta+sigma+Omega FD covariance (installed by
     // .foceiInstallFdFullCov).  Also runs when covType="analytic" DECLINED (analytic out of
     // scope leaves no .analyticCov and drops to the FD r,s sandwich) so that fallback still
@@ -14681,21 +15381,41 @@ Environment foceiFitCpp_(Environment e){
       }
     }
   }
-  if (op_focei.didPredSolve) {
+  {
+    IntegerVector covEvals(_covEvals, _covEvals + (int)covStN);
+    covEvals.attr("names") = CharacterVector(covStageNames, covStageNames + (int)covStN);
+    e["covEvals"] = covEvals;
+  }
+  if (estPredSolve) {
     warning(_("numerical difficulties solving forward sensitivity inner problem, tried approximating with more inaccurate numeric differences"));
+  } else if (op_focei.didPredSolve) {
+    warning(_("covariance step: inner sensitivities approximated by numeric differences"));
+  }
+  if (!estReducedTol && op_focei.reducedTol) {
+    warning(_("covariance step: atol/rtol increased for some difficult ODE solves"));
+  }
+  if (!estOuterReducedTol && op_focei.outerReducedTol.load(std::memory_order_relaxed)) {
+    warning(_("analytic covariance: tolerances increased for some subjects"));
   }
   if (op_focei.nnOuterSkipped) {
     warning(_("outer network step skipped (mixture or numeric-difference solve)"));
   }
-  IntegerVector gillRetC(op_focei.ntheta+op_focei.omegan);
+  if (op_focei.nNearPdDiag.load(std::memory_order_relaxed) > 0) {
+    warning(_("eta Hessian repair changed its diagonal %d times"),
+            op_focei.nNearPdDiag.load(std::memory_order_relaxed));
+  }
+  // The covariance step's searches, listed by parameter: foceiCalcCov() keeps
+  // them by the index of its own parameter set (the thetas, by default), which
+  // fixedTrans maps once it has run
+  IntegerVector gillRetC(op_focei.ntheta+op_focei.omegan, 1);
   bool warnGillC = false;
-  j = op_focei.npars;
-  for (int i = op_focei.ntheta+op_focei.omegan; i--;){
-    gillRetC[i] = op_focei.gillRetC[i]+1;
+  for (unsigned int k = op_focei.npars; k--;){
+    int i = op_focei.fixedTrans[k];
+    gillRetC[i] = op_focei.gillRetC[k]+1;
     if (gillRetC[i] >= 3) warnGillC=true;
     if (gillRetC[i] != 1) {
-      gillCAEpsC[i] = op_focei.aEpsC[--j];
-      gillCREpsC[i] = op_focei.rEpsC[j];
+      gillCAEpsC[i] = op_focei.aEpsC[k];
+      gillCREpsC[i] = op_focei.rEpsC[k];
     }
   }
   gillRetC.attr("levels") = gillLvl;
@@ -14732,15 +15452,15 @@ Environment foceiFitCpp_(Environment e){
   } else if (warnGillC){
     warning(_("gradient problems with covariance; see $scaleInfo"));
   }
-  if (op_focei.reducedTol){
-    if (op_focei.stickyTol){
+  if (estReducedTol){
+    if (estStickyTol){
       warning(_("tolerances (atol/rtol) were increased (after %d bad solves) for some difficult ODE solving during the optimization.\ncan control with foceiControl(stickyRecalcN=)\nconsider increasing sigdig/atol/rtol changing initial estimates or changing the structural model"), op_focei.stickyRecalcN);
     } else {
       warning(_("tolerances (atol/rtol) were temporarily increased for some difficult ODE solving during the optimization.\nconsider increasing sigdig/atol/rtol changing initial estimates or changing the structural model"));
     }
   }
-  if (op_focei.outerReducedTol.load(std::memory_order_relaxed)){
-    if (op_focei.outerStickyTol.load(std::memory_order_relaxed)){
+  if (estOuterReducedTol){
+    if (estOuterStickyTol){
       warning(_("analytic gradient: tolerances increased for some subjects (foceiControl(outerStickyRecalcN=))"));
     } else {
       warning(_("analytic gradient: tolerances temporarily increased for some subjects"));
@@ -14990,7 +15710,7 @@ RObject vaeInnerSetup_(Environment e) {
 
 // Re-parameterize the already-set-up VAE inner problem at new natural-scale
 // theta/omega values WITHOUT re-running foceiSetup_ -- the per-gradient-step
-// fast path.  Each non-fixed parameter goes through scalePar() into the
+// fast path.  Each non-fixed parameter goes through scaleScalePar() into the
 // reduced par vector and updateTheta() rebuilds fullTheta, the per-id solve
 // parameters and the omega inverse (exactly what focei's outer objective does
 // per evaluation).  The omega block uses the setup's "sqrt"-xform rxInv on the
@@ -15146,7 +15866,11 @@ static void vaeInnerLikCore(const arma::mat& etaMat, int cores, bool grad, bool 
       if (grad) {
         std::vector<double> g(neta);
         lpInner(&eta[0], &g[0], id);
-        for (int j = 0; j < neta; ++j) lp(id, j) = g[j];
+        // A subject whose solve failed has no gradient (lpInner gives NA); its objective
+        // below is NA too and is what reports the failure.  A zero row keeps the mixture
+        // marginal's responsibility-weighted rows finite, where a failed component has
+        // responsibility 0 and 0 * NA would poison the encoder gradient.
+        for (int j = 0; j < neta; ++j) lp(id, j) = ISNAN(g[j]) ? 0.0 : g[j];
       }
       if (adjOuter) {
         double v = LikInner2(&eta[0], 0, id);
@@ -15236,53 +15960,9 @@ static thread_local int _outerRetryScratch = 0;
 // builds an EMPTY LIST, not NULL, so every refusal here looked like a successful
 // but empty solve to .foceiAnalyticSolveAll and silently dropped the gradient to
 // finite differences.
-// Phase 8D2: tighten the INNER optimizer for the duration of a differencing phase.
-//
-// KEPT BUT NOT ARMED.  Tightening every inner tolerance by 1e3 and raising the
-// iteration cap 10x changed the hand-differenced tcl values by NOTHING -- identical to
-// four decimals for every subject.  The inner optimizer was already converged, so the
-// step dependence is not re-optimization noise.  Re-reading that data: most subjects
-// converge monotonically but slowly (id2 marches -3.43/-1.82/-1.36/-1.20/-1.15 toward
-// about -1.13), i.e. a large higher-order term biases the WIDE steps, and only id5 and
-// id12 are genuinely erratic.  So the lever is Richardson extrapolation / smaller steps,
-// not inner convergence.  Left here, unarmed, so the experiment is not repeated.
-//
-// d(-2LL_i)/d(theta) is a PROFILE likelihood derivative: every evaluation re-runs
-// innerOpt1(), which lands on a slightly different eta each time.  For a theta that
-// carries an eta that re-optimization noise swamps the signal -- hand-differencing tcl
-// on theo_sd, 8 of 12 subjects failed to converge across two decades of step size
-// (swings of 2-4 units at h=1e-4), while the 4 whose inner problem converges tightly
-// were stable to 3-4 significant figures.  No step-size heuristic can fix that; the
-// noise floor has to come down instead.
-//
-// Restores every control on exit, including on a throw.
-struct FdInnerTolGuard {
-  double epsilon, factr, pgtol, abstol, reltol;
-  int maxInner;
-  bool armed;
-  explicit FdInnerTolGuard(double k, int iterMult) : armed(true) {
-    epsilon = op_focei.epsilon; factr = op_focei.factr; pgtol = op_focei.pgtol;
-    abstol = op_focei.abstol;   reltol = op_focei.reltol;
-    maxInner = op_focei.maxInnerIterations;
-    if (k > 1.0) {
-      op_focei.epsilon /= k;    // n1qn1
-      op_focei.factr   /= k;    // lbfgsb3C: multiple of machine eps, smaller = tighter
-      op_focei.pgtol   /= k;
-      op_focei.abstol  /= k;
-      op_focei.reltol  /= k;
-    }
-    // A tighter tolerance is useless if the iteration cap stops it first.
-    if (op_focei.maxInnerIterations > 0 && iterMult > 1) {
-      op_focei.maxInnerIterations *= iterMult;
-    }
-  }
-  ~FdInnerTolGuard() {
-    if (!armed) return;
-    op_focei.epsilon = epsilon; op_focei.factr = factr; op_focei.pgtol = pgtol;
-    op_focei.abstol = abstol;   op_focei.reltol = reltol;
-    op_focei.maxInnerIterations = maxInner;
-  }
-};
+// Phase 8D2 tried tightening every inner tolerance by 1e3 (and 10x the iteration cap)
+// during a differencing phase: the hand-differenced tcl values did not change, so the
+// FD step dependence is not inner re-optimization noise.  The guard was removed (#1160).
 
 
 // (fdRichardson and fdLanczos lived here.  Both were stencils tried against this
@@ -15921,82 +16601,11 @@ static bool fdOutlierDecide(const NumericMatrix &analyticRef, const NumericMatri
   return true;
 }
 
-// gill83's scalar objective for the per-individual FD: this subject's -2LL at `theta`.
-// Reuses shi21LikTheta(), so the theta install, the pinned reference eta and the
-// innerOpt1() re-optimization are identical to the shi path -- only the differencing
-// scheme changes.  `foceiGill` is unused here: this never touches the outer objective.
-void gill83fnLik(double *fp, double *theta, int id, int) {
-  arma::vec th((size_t)op_focei.ntheta);
-  for (int t = 0; t < (int)op_focei.ntheta; ++t) th[t] = theta[t];
-  arma::vec r = shi21LikTheta(th, id);
-  *fp = r(0);
-}
-
-//' Per-subject -2LL at a given theta, for hand-differencing the 8D2 fallback.
-//'
-//' Same path the finite difference uses (theta into par_ptr, pinned reference eta,
-//' innerOpt1() re-optimization), exposed so a difference can be taken in R at any step
-//' and compared against what shi settles on.  Restores the eta, the n1qn1 Hessian and
-//' fullTheta exactly as the FD phase does.
-//' @param thetaIn theta vector (length ntheta)
-//' @param ids0 0-based subject ids
-//' @return per-subject -2LL, NA where the subject could not be re-optimized
-//' @noRd
-//[[Rcpp::export]]
-NumericVector foceiIndLik_(NumericVector thetaIn, IntegerVector ids0) {
-  int nid = ids0.size(), nth = (int)op_focei.ntheta;
-  NumericVector out(nid);
-  std::fill(out.begin(), out.end(), NA_REAL);
-  if (nid == 0 || nth == 0 || inds_focei == NULL) return out;
-  rx = getRxSolve_();
-  if (rx == NULL) return out;
-  int nsub = foceiIndSetupN(rx);
-  OdeSwapEsBatch esBatch(odeSlotInner);
-  // This runs serially, so without the phase guard innerOpt1() would fold every
-  // perturbed eta into the population Welford statistics -- see FdPhaseStateGuard.
-  FdPhaseStateGuard phaseGuard;
-  std::vector<double> theta0((size_t)nth);
-  for (int t = 0; t < nth; ++t) theta0[(size_t)t] = op_focei.fullTheta[t];
-  arma::vec theta((size_t)nth);
-  for (int t = 0; t < nth && t < thetaIn.size(); ++t) theta[t] = thetaIn[t];
-  for (int k = 0; k < nid; ++k) {
-    int id = ids0[k];
-    if (id < 0 || id >= nsub) continue;
-    EtaRestoreGuard etaGuard(id);
-    FdInnerStateGuard fdGuard(id);
-    rx_solving_options_ind *indR = getSolvingOptionsInd(rx, getRxId(id));
-    _fdRefEta.assign((size_t)op_focei.neta, 0.0);
-    for (int i = 0; i < op_focei.neta; ++i) {
-      _fdRefEta[(size_t)i] = getIndParPtr(indR, op_focei.etaTrans[i]);
-    }
-    arma::vec r = shi21LikTheta(theta, id);
-    out[k] = r(0);
-  }
-  _fdRefEta.clear();
-  for (int t = 0; t < nth; ++t) op_focei.fullTheta[t] = theta0[(size_t)t];
-  return out;
-}
-
-// (The PER-SUBJECT theta step search lived here -- fdCentralAt(), calcOuterThetaHf() and
-// fdThetaOneSubject(), one shi21Central search per subject per parameter.  Replaced by the
-// shared-step primitives above, which follow numericGrad()'s shape instead.  What still
-// applies to the shared search, because it is the same shi21Central call on the same kind of
-// objective:
-//
-//   * Step bounds stay the fit's global shi21hMin/hMax, NOT a per-parameter rescaling.  Two
-//     heuristics were tried and REJECTED on measurement (theo_sd, 12 subjects): a floor of
-//     eps^(1/3)*max(|theta|,1) (~1.2e-5) on the premise that eps^(1/3) is the
-//     central-difference optimum -- wrong premise, this is a PROFILE likelihood whose noise
-//     floor is the inner optimizer's convergence, and lowering the floor took tka from ratio
-//     0.963 to 0.317, so the 1e-4 default is protective rather than restrictive; and a
-//     ceiling of 0.1*max(|theta|,1), which missed the runaway it targeted and clamped three
-//     subjects that were fine.
-//   * shi CENTRAL differences, not Gill83.  Gill was tried because it behaves better on the
-//     OUTER objective gradient and takes a scalar objective, which this is -- but on theo_sd
-//     it was worse in every direction (ratios -0.10/-0.018/0.86/1.28 against shi's
-//     0.963/-0.053/0.992/0.997).  gill83fnLik() is kept for re-testing that comparison.
-//   * Plain shi differences by default; the TV refinement runs ONLY where the across-subject
-//     pass flags the parameter, i.e. where the O(h^2) term is demonstrably material.)
+// The shared theta step search keeps the fit's global shi21hMin/hMax bounds (the noise
+// floor of this profile likelihood is the inner optimizer's convergence, so the 1e-4
+// floor is protective) and uses shi central differences; a per-parameter rescaling of
+// the bounds and Gill83 steps were both measured worse.  The TV refinement runs only
+// where the across-subject pass flags the parameter.
 
 // ---- omega directions of the per-individual FD --------------------------------------
 //
@@ -16224,32 +16833,30 @@ struct FdIndPoint {
   bool doOmega = true;                        // false -> skip the omega phase entirely
 };
 
-//' Per-individual d(llik)/d(theta) for subjects whose augmented solve failed.
-//'
-//' Phase 8D2.  This is a SEPARATE phase and cannot be folded into the augmented solve
-//' loop: that loop runs inside OdeSwapEsBatch(odeSlotOuter), i.e. under the outer
-//' model's event-sensitivity shape, while this needs the INNER problem.  The shape is a
-//' process global that only changes at a batch boundary, so the two cannot interleave.
-//' The caller passes the subjects flagged by vaeOuterSolve_ (its "ok" attribute).
-//'
-//' Shaped like the non-fast path's numericGrad(): a sequential loop over the parameters the
-//' optimizer moves, ONE shi CENTRAL step per parameter searched on the SUMMED -2LL over the
-//' flagged subjects, then explicit +-h legs, with every likelihood evaluation parallel over
-//' subjects.  Each evaluation re-optimizes the subject through innerOpt1(), so what is
-//' differenced is a PROFILE likelihood.  Per-subject slopes are still produced by the legs, so
-//' the across-subject outlier pass and its TV refinement still work; only the step is pooled.
-//'
-//' Omega directions are covered too, in the trailing omegan columns, by the same arrangement --
-//' see the fdOmegaBuild note above for the extra constraint there (the perturbed Omega needs an
-//' R call, so it is built once per evaluation outside the parallel region).
-//' @param ids0 0-based subject ids to difference
-//' @param analyticRef per-subject analytic slopes for the subjects that DID solve, used as
-//'   the reference distribution of the outlier pass; may be a 0 x 0 matrix
-//' @return nid x (ntheta + omegan) matrix of d(llik_i)/d(par), full-theta indexing (theta
-//'   block then omega block), natural parameter scale.  NA where a subject could not be
-//'   re-optimized even at a perturbed parameter
-//' @noRd
-//[[Rcpp::export]]
+// Per-individual d(llik)/d(theta) for subjects whose augmented solve failed.
+//
+// Phase 8D2.  This is a SEPARATE phase and cannot be folded into the augmented solve
+// loop: that loop runs inside OdeSwapEsBatch(odeSlotOuter), i.e. under the outer
+// model's event-sensitivity shape, while this needs the INNER problem.  The shape is a
+// process global that only changes at a batch boundary, so the two cannot interleave.
+// The caller passes the subjects flagged by vaeOuterSolve_ (its "ok" attribute).
+//
+// Shaped like the non-fast path's numericGrad(): a sequential loop over the parameters the
+// optimizer moves, ONE shi CENTRAL step per parameter searched on the SUMMED -2LL over the
+// flagged subjects, then explicit +-h legs, with every likelihood evaluation parallel over
+// subjects.  Each evaluation re-optimizes the subject through innerOpt1(), so what is
+// differenced is a PROFILE likelihood.  Per-subject slopes are still produced by the legs, so
+// the across-subject outlier pass and its TV refinement still work; only the step is pooled.
+//
+// Omega directions are covered too, in the trailing omegan columns, by the same arrangement --
+// see the fdOmegaBuild note above for the extra constraint there (the perturbed Omega needs an
+// R call, so it is built once per evaluation outside the parallel region).
+// @param ids0 0-based subject ids to difference
+// @param analyticRef per-subject analytic slopes for the subjects that DID solve, used as
+//   the reference distribution of the outlier pass; may be a 0 x 0 matrix
+// @return nid x (ntheta + omegan) matrix of d(llik_i)/d(par), full-theta indexing (theta
+//   block then omega block), natural parameter scale.  NA where a subject could not be
+//   re-optimized even at a perturbed parameter
 NumericMatrix foceiOuterFdInd_(IntegerVector ids0, NumericMatrix analyticRef) {
   FdIndPoint _pt;                       // all defaults: the inner problem's own point
   return foceiOuterFdIndCore(ids0, analyticRef, _pt);
@@ -16493,17 +17100,15 @@ static NumericMatrix foceiOuterFdIndCore(IntegerVector ids0, NumericMatrix analy
   // The accuracy of a difference here is a question about (subject, parameter, step), and
   // nothing outside could see any of the three: the step was chosen internally and discarded,
   // so "is this slope wrong because the step is wrong" was unanswerable from R.  An external
-  // hand-difference is NOT a substitute -- one written through foceiIndLik_ reproduced the
-  // analytic slope only for a parameter with no eta attached, because it does not establish
-  // calcGrad=1 and innerOpt1 then discards the pinned reference eta.  So the probe has to run
-  // THROUGH this function, guards and all.
+  // hand-difference is NOT a substitute: it does not establish calcGrad=1, so innerOpt1
+  // discards the pinned reference eta and the slope is right only for a parameter with no
+  // eta attached.  So the probe has to run THROUGH this function, guards and all.
   //
   //   NLMIXR2EST_OUTER_FD_H     force this step for every parameter, skipping the search, the
   //                             cache and the bound test -- so a plateau can be swept
   //   NLMIXR2EST_OUTER_FD_SPAN  override the TV refinement's interval half-width
   //
-  // The settled steps come back as the "h" attribute of the returned matrix (see the end),
-  // which needs no arity change and so no src/init.c edit.
+  // The settled steps come back as the "h" attribute of the returned matrix (see the end).
   double _fdForceH = 0.0, _fdSpanOverride = 0.0;
   {
     const char *e_ = getenv("NLMIXR2EST_OUTER_FD_H");
@@ -17082,6 +17687,21 @@ static void outerSolveFill(int slot, rxSolveF *fns,
           double v = lhs[C.rsig2[r]];
           E.Rsig2(ko, C.sigA[r], C.sigB[r]) = v; E.Rsig2(ko, C.sigB[r], C.sigA[r]) = v;
         }
+        // Mirror likInner0's floor: a floored (or zero -> 1) R is constant in every
+        // direction, so its derivatives must be zero too (#1132).
+        if (E.R[ko] < foceiRFloor) {
+          E.R[ko] = (E.R[ko] <= 0.0) ? 1.0 : foceiRFloor;
+          E.aR.row(ko).zeros();
+          for (arma::uword i = 0; i < E.AR.n_cols; ++i)
+            for (arma::uword j = 0; j < E.AR.n_slices; ++j) E.AR(ko, i, j) = 0.0;
+          if (nsig > 0) {
+            E.Rsig.row(ko).zeros();
+            for (arma::uword i = 0; i < E.RsigDir.n_cols; ++i)
+              for (arma::uword j = 0; j < E.RsigDir.n_slices; ++j) E.RsigDir(ko, i, j) = 0.0;
+            for (arma::uword i = 0; i < E.Rsig2.n_cols; ++i)
+              for (arma::uword j = 0; j < E.Rsig2.n_slices; ++j) E.Rsig2(ko, i, j) = 0.0;
+          }
+        }
       }
       if (hasT) for (int c = 0; c < 4; ++c) E.trans(ko, c) = lhs[C.tr[c]];
       ko++;
@@ -17283,7 +17903,7 @@ RObject vaeOuterSolve_(NumericVector thVals, NumericMatrix ebes, List cols, int 
     VaeOuterE& E = Es[(size_t)i];
     okv[i] = E.ok ? 1 : 0;
     if (!E.ok) continue;                       // flagged; entry stays R_NilValue
-    List Ei = List::create(_["f"] = wrap(E.f), _["a"] = wrap(E.a), _["A"] = wrap(E.A));
+    List Ei = List::create(_["f"] = E.f, _["a"] = E.a, _["A"] = E.A);
     if (hasR) {
       Ei["R"] = wrap(E.R); Ei["aR"] = wrap(E.aR); Ei["AR"] = wrap(E.AR);
       if (nsig > 0) {
@@ -17371,15 +17991,15 @@ static void obsFromInd(rx_solving_options_ind *ind, const VaeOuterE &E,
 // use convTol.  These are the FIXED values the routine shipped with (1e-3 / 1e-9), not
 // sigdig-derived: a score convergence target on an inner Newton is not a solve precision,
 // and tying it to sigdig made the analytic FOCE gradient available or not depending on
-// the requested digits.  foceiControl(foceEbeTol=) overrides convTol.  Returns false if
-// any subject fails to converge, which sends the whole
-// gradient to the ordinary finite-difference route rather than reporting a mode that was
-// never reached.
+// the requested digits.  foceiControl(foceEbeTol=) overrides convTol.  A subject whose
+// solve fails or whose mode is not reached is marked in `skip` (which may arrive with
+// subjects already marked) and left at its incoming eta; the caller finite-differences
+// it as FOCEI does a flagged subject.  Returns false only when every subject is skipped.
 static bool foceEbeNewton(const FoceiGradPooledSetup &G,
                           const std::vector<double> &thVals, const arma::mat &ebes,
                           const arma::mat &Oi, const std::vector<VaeOuterE> *E0all,
                           int cores, rx_solving_options *op, int nsub, int neta,
-                          arma::mat &etaOut) {
+                          arma::mat &etaOut, std::vector<char> &skip) {
   // Backtracking line search on |S|, arranged to fit the BATCHED solve: each iteration is
   // one population solve, and a subject either accepts a fresh Newton step or halves the
   // one it last took, so a backtrack costs no extra solve of its own.
@@ -17399,7 +18019,14 @@ static bool foceEbeNewton(const FoceiGradPooledSetup &G,
   const bool fp = (G.foceType == 1) || (E0all == NULL);
   const bool hasCens = hasRxCens(rx), hasLimit = hasRxLimit(rx);
   etaOut = ebes;
+  skip.resize((size_t)nsub, 0);
   std::vector<char> active((size_t)nsub, 1);
+  for (int i = 0; i < nsub; ++i) if (skip[(size_t)i]) active[(size_t)i] = 0;
+  auto skipSub = [&](int i) {
+    skip[(size_t)i] = 1;
+    active[(size_t)i] = 0;
+    etaOut.row(i) = ebes.row(i);
+  };
   std::vector<VaeOuterE> Es((size_t)nsub);
   // Per-subject line-search state.  prevS is |S| at the eta BEFORE the step currently
   // being judged; lastStep is that step's full (undamped) direction and alpha the
@@ -17421,11 +18048,11 @@ static bool foceEbeNewton(const FoceiGradPooledSetup &G,
     for (int i = 0; i < nsub; ++i) {
       if (!active[(size_t)i]) continue;
       const VaeOuterE &E = Es[(size_t)i];
-      if (!E.ok) { op_focei.nNewtonSolve++; return false; }
+      if (!E.ok) { op_focei.nNewtonSolve++; skipSub(i); continue; }
       const int nobs = E.nobs;
-      if (nobs <= 0) { op_focei.nNewtonSolve++; return false; }
+      if (nobs <= 0) { op_focei.nNewtonSolve++; skipSub(i); continue; }
       const arma::vec &R0v = fp ? E.R : (*E0all)[(size_t)i].R;
-      if ((int)R0v.n_elem != nobs) { op_focei.nNewtonSolve++; return false; }
+      if ((int)R0v.n_elem != nobs) { op_focei.nNewtonSolve++; skipSub(i); continue; }
       rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(i));
       arma::vec yt, limt; arma::ivec cens;
       obsFromInd(ind, E, G.hasT, hasCens, hasLimit, yt, cens, limt);
@@ -17458,7 +18085,7 @@ static bool foceEbeNewton(const FoceiGradPooledSetup &G,
           Hf(l, m) += h;
         }
       }
-      if (!S.is_finite() || !Hf.is_finite()) { op_focei.nNewtonSingular++; return false; }
+      if (!S.is_finite() || !Hf.is_finite()) { op_focei.nNewtonSingular++; skipSub(i); continue; }
       double sMax = arma::abs(S).max();
       if (sMax < (it == 0 ? skipTol : convTol)) { active[(size_t)i] = 0; continue; }
       // The Newton decrement lam2 = S' Hf^-1 S is how much of the objective this point
@@ -17504,7 +18131,8 @@ static bool foceEbeNewton(const FoceiGradPooledSetup &G,
         }
         op_focei.nNewtonMaxit++;
         if (bestS[(size_t)i] > op_focei.newtonWorstS) op_focei.newtonWorstS = bestS[(size_t)i];
-        return false;
+        skipSub(i);
+        continue;
       }
       // Did the last step actually reduce |S|?  If not, undo it and retry at half the
       // length; the Newton DIRECTION is kept, only its magnitude is cut.
@@ -17517,7 +18145,7 @@ static bool foceEbeNewton(const FoceiGradPooledSetup &G,
         any = true;
         continue;                                  // re-solve and re-judge the same step
       }
-      if (!haveSolve) { op_focei.nNewtonSingular++; return false; }
+      if (!haveSolve) { op_focei.nNewtonSingular++; skipSub(i); continue; }
       prevS[(size_t)i] = sMax;                     // reference for judging this new step
       lastStep[(size_t)i] = step;
       alpha[(size_t)i] = 1.0;
@@ -17528,8 +18156,9 @@ static bool foceEbeNewton(const FoceiGradPooledSetup &G,
     }
     if (!any) break;
   }
-  for (int i = 0; i < nsub; ++i) if (active[(size_t)i]) return false;
-  return true;
+  for (int i = 0; i < nsub; ++i) if (active[(size_t)i]) skipSub(i);
+  for (int i = 0; i < nsub; ++i) if (!skip[(size_t)i]) return true;
+  return false;
 }
 
 // ---- ll() / generalized likelihood -------------------------------------------------
@@ -17762,7 +18391,7 @@ static bool gradPooledCoreLL(const FoceiGradPooledSetup &G,
 // for failed subjects, the stacking and the per-subject kernel all happen in one region,
 // so R never runs between the solve and the assembly and cannot disturb the shared pool.
 //
-// `g` comes back on the NATURAL parameter scale (the caller applies dUnscaleParDx);
+// `g` comes back on the NATURAL parameter scale (the caller applies scaleAdjustGradScale);
 // `etaP` is written straight into op_focei.getaP by the caller.
 // Which `return false` inside gradPooledCore()/gradPooledCoreLL() last refused the
 // analytic gradient.  These refusals used to be silent, which is how the mu-family
@@ -18246,16 +18875,19 @@ static bool gradPooledCore(const FoceiGradPooledSetup &G,
   // population prediction, which needs its own solve first.
   std::vector<VaeOuterE> E0s;
   arma::mat foceEta;
+  // FOCE subjects whose frozen variance or mode could not be found; they are
+  // finite-differenced below like a subject whose augmented solve failed
+  std::vector<char> foceSkip((size_t)nsub, 0);
   const bool needE0 = isFoce && (G.foceType == 0) && G.dependsF0;
   if (needE0) {
     E0s.resize((size_t)nsub);
     arma::mat zeroEta((unsigned int)nsub, (unsigned int)neta, arma::fill::zeros);
     outerSolveFill(odeSlotOuter, &rxVaeOuter, thVals, zeroEta, G, cores, op, nsub, neta, E0s);
     for (int i = 0; i < nsub; ++i)
-      if (!E0s[(size_t)i].ok) { op_focei.nDeclineE0++; return declineHere(9); }
+      if (!E0s[(size_t)i].ok) { op_focei.nDeclineE0++; foceSkip[(size_t)i] = 1; }
   }
   if (isFoce && !foceEbeNewton(G, thVals, ebes, Oi, needE0 ? &E0s : NULL,
-                               cores, op, nsub, neta, foceEta)) {
+                               cores, op, nsub, neta, foceEta, foceSkip)) {
     op_focei.nDeclineNewton++;
     return declineHere(10);
   }
@@ -18263,6 +18895,9 @@ static bool gradPooledCore(const FoceiGradPooledSetup &G,
 
   std::vector<VaeOuterE> Es((size_t)nsub);
   outerSolveFill(odeSlotOuter, &rxVaeOuter, thVals, ebesUse, G, cores, op, nsub, neta, Es);
+  if (isFoce) {
+    for (int i = 0; i < nsub; ++i) if (foceSkip[(size_t)i]) Es[(size_t)i].ok = false;
+  }
 
   // Swap the pool outer -> inner for the failed subjects.  The augmented solve ran under
   // the OUTER event-sensitivity shape; the difference needs the INNER problem, and the
@@ -18651,8 +19286,7 @@ static bool gradDirectFoldFd(int npars, arma::vec &gp) {
   // injected into a subject that actually solved, the substituted column is isolated
   // exactly -- An_i = gRef - g_skip, FD_i = gOne - g_skip -- instead of being measured
   // through a total where 11 correct subjects dilute it.  The `aref` built below is the
-  // per-subject analytic reference foceiOuterFdInd_'s outlier pass tests against;
-  // foceiAnalyticGradPooled_ is the one remaining call site that passes it empty.
+  // per-subject analytic reference foceiOuterFdInd_'s outlier pass tests against.
   const char *_fdSkip = getenv("NLMIXR2EST_OUTER_FD_SKIP");
   const int nFd = (int)op_focei.outerFdIds.size();
   if (_fdSkip != NULL && _fdSkip[0] == '1') {
@@ -18688,7 +19322,7 @@ static void gradDirectStoreEtaP(const FoceiGradPooledSetup &G, const arma::cube 
   }
   if (op_focei.etaPTheta == NULL) op_focei.etaPTheta = R_Calloc(npars, double);
   for (int k = 0; k < npars; ++k) {
-    double sc = dUnscaleParDx(k);
+    double sc = scaleAdjustGradScale(&op_focei, 1.0, k);
     int kk = G.gMap[(size_t)k];
     for (int i = 0; i < nsub; ++i)
       for (int j = 0; j < neta; ++j)
@@ -18756,7 +19390,7 @@ static bool analyticOuterGradDirect(double *theta, double *g) {
   arma::vec gp;
   if (!gradDirectGather(G, gv, nKer, npars, gp)) return false;
   if (!gradDirectFinalize(npars, gp, Oi, dOiEst)) return false;
-  for (int i = 0; i < npars; ++i) g[i] = gp[i] * dUnscaleParDx(i);
+  for (int i = 0; i < npars; ++i) g[i] = gp[i] * scaleAdjustGradScale(&op_focei, 1.0, i);
   gradDirectStoreEtaP(G, etaP, theta, nsub, neta, npars, nKer);
   return true;
 }
@@ -18903,285 +19537,6 @@ RObject foceiGradPooledDirect_(NumericVector thVals, NumericMatrix ebes,
   return wrap(NumericVector(gv.begin(), gv.end()));
 }
 
-
-// The per-subject sensitivities, stacked into one row block per subject (indexed by
-// `off`) -- what the R route used to assemble before handing the kernel a subject.
-struct GradPooledStack {
-  std::vector<int> nobsAll;
-  arma::ivec off;
-  arma::mat aB, aRB;
-  arma::cube AB, ARB;
-  arma::vec fB, yB, RB;
-  arma::mat RsigB;
-  arma::cube RsigDirB;
-  arma::mat dvSensB;
-  arma::ivec censB;
-  arma::vec limB;
-  arma::mat ehatB;
-  double jacSum;
-  int totObs;
-  bool hasLam, hasCens;
-  GradPooledStack() : jacSum(0.0), totObs(0), hasLam(false), hasCens(false) {}
-};
-
-// Everything foceiAnalyticGradPooled_ must establish before it commits to a solve: the
-// augmented model is bound and its bound code matches the registry, the live pool is the
-// one the registry describes, the caller's etas match the problem, and the column map
-// names columns this model actually has.  Hands back the pieces the caller then needs
-// (`op`, `nsub`, the flattened map) so nothing is read twice.
-//
-// Split out of the entry rather than inlined: these are the checks, and keeping them
-// here leaves the entry itself about the gradient.  `rx` is the file-scope global the
-// rest of this file reads, and is assigned here exactly as before.
-static bool analyticGradPooledReady(const NumericMatrix &ebes, const List &cols, int neta,
-                                    rx_solving_options *&op, int &nsub,
-                                    FoceiGradPooledSetup &gcols) {
-  if (op_focei.vaeOuterNlhs <= 0 || rxVaeOuter.calc_lhs == NULL) return false;
-  rx = getRxSolve_();
-  if (rx == NULL) return false;
-  op = getSolvingOptions(rx);
-  if (!odeSwapCheckLhsWidth(odeSlotOuter, &rxVaeOuter, rx, op)) return false;
-  nsub = (int)getRxNsub(rx);
-  if (ebes.nrow() != nsub || (int)ebes.ncol() != neta) return false;
-  if (!as<bool>(cols["hasR"])) return false;  // (f,R) kernel only; the FOCE path stays in R
-  colsFromList(cols, gcols);
-  // ... and the map R just handed us must name columns this model actually has
-  return outerColsWithin(gcols, op_focei.vaeOuterNlhs);
-}
-
-// Swap the pool outer -> inner and finite-difference the failed subjects.
-//
-// Same reason as in vaeOuterSolve_: the augmented solve ran under the OUTER model's
-// event-sensitivity shape, and a subject that failed it needs the INNER problem
-// re-established before its likelihood can be differenced.  The shape is a process
-// global, so the outer batch has to close first.
-static bool gradPooledFdFailed(const std::vector<VaeOuterE> &Es, int nsub,
-                               std::unique_ptr<OdeSwapEsBatch> &esBatch,
-                               std::vector<int> &flagged, NumericMatrix &fd,
-                               IntegerVector &fids) {
-  for (int i = 0; i < nsub; ++i) if (!Es[(size_t)i].ok) flagged.push_back(i);
-  if (flagged.empty()) return true;
-  esBatch.reset();
-  fids = IntegerVector((R_xlen_t)flagged.size());
-  for (size_t q = 0; q < flagged.size(); ++q) fids[(R_xlen_t)q] = flagged[q];
-  NumericMatrix aref(0, 0);
-  fd = foceiOuterFdInd_(fids, aref);
-  return fd.nrow() == (int)flagged.size();
-}
-
-
-// DV, CENS and LIMIT come straight from the individual -- the inner problem reads them
-// the same way -- so they never have to cross from R, and they are read in the same
-// observation order the solve loop filled E.f with.  Returns the observation count seen.
-static int gradPooledStackObs(const VaeOuterE &E, rx_solving_options_ind *ind, int o0,
-                              int n, int nd, bool hasT, const arma::ivec &lamDir,
-                              GradPooledStack &S) {
-  int ko = 0;
-  for (int q = 0; q < getIndNallTimes(ind) && ko < n; ++q) {
-    int kk = getIndIx(ind, q);
-    if (getIndEvid(ind, kk) != 0) continue;
-    const double dv = getIndDv(ind, kk);
-    double yj, lam, lo, hi;
-    gradPooledObsTrans(E, ko, hasT, yj, lam, lo, hi);
-    S.yB[o0 + ko] = hasT ? _powerD(dv, lam, (int)yj, lo, hi) : dv;
-    if (S.hasLam) {
-      const double dvs = _powerDLambda(dv, lam, (int)yj, lo, hi);
-      for (unsigned int L = 0; L < lamDir.n_elem; ++L) {
-        int d = lamDir[L] - 1;
-        if (d >= 0 && d < nd) S.dvSensB(o0 + ko, d) = dvs;
-      }
-      S.jacSum += _powerDL(dv, lam, (int)yj, lo, hi);
-    }
-    if (S.hasCens) gradPooledObsCens(ind, kk, o0 + ko, hasT, yj, lam, lo, hi, S.censB, S.limB);
-    ko++;
-  }
-  return ko;
-}
-
-// Size every stacked buffer for the totObs rows counted so far.
-static void gradPooledStackSize(GradPooledStack &S, int nsub, int neta, int nd, int nsg,
-                                bool hasT, const arma::ivec &lamDir) {
-  const int totObs = S.totObs;
-  S.off.set_size((unsigned int)nsub + 1); S.off[0] = 0;
-  for (int i = 0; i < nsub; ++i) S.off[i + 1] = S.off[i] + S.nobsAll[(size_t)i];
-  S.aB.zeros(totObs, nd); S.aRB.zeros(totObs, nd);
-  S.AB.zeros(totObs, nd, nd); S.ARB.zeros(totObs, nd, nd);
-  S.fB.zeros(totObs); S.yB.zeros(totObs); S.RB.zeros(totObs);
-  S.RsigB.zeros(totObs, nsg);
-  S.RsigDirB.zeros(totObs, nd, nsg);
-  S.hasLam = (lamDir.n_elem > 0) && hasT;
-  S.dvSensB.zeros(totObs, S.hasLam ? nd : 0);
-  S.hasCens = hasRxCens(rx) || hasRxLimit(rx);
-  S.censB.zeros(S.hasCens ? totObs : 0);
-  S.limB.set_size(S.hasCens ? totObs : 0);
-  if (S.hasCens) S.limB.fill(NA_REAL);
-  S.ehatB.zeros(nsub, neta);
-}
-
-// Stack the per-subject sensitivities (this is what R used to do).
-static bool gradPooledStackFill(const std::vector<VaeOuterE> &Es, NumericMatrix ebes,
-                                int nsub, int neta, int nd, int nsg, bool hasT,
-                                const arma::ivec &lamDir, GradPooledStack &S) {
-  S.nobsAll.assign((size_t)nsub, 0);
-  for (int i = 0; i < nsub; ++i) {
-    // A flagged subject contributes no analytic sensitivities; its gradient column is
-    // replaced by the finite difference later, so it needs no rows here.  It still needs
-    // a slot, and zero rows would break the kernel, so it is given its own rows and
-    // simply not read.
-    S.nobsAll[(size_t)i] = Es[(size_t)i].nobs;
-    if (S.nobsAll[(size_t)i] <= 0) return false;
-    S.totObs += S.nobsAll[(size_t)i];
-  }
-  gradPooledStackSize(S, nsub, neta, nd, nsg, hasT, lamDir);
-  for (int i = 0; i < nsub; ++i) {
-    const VaeOuterE& E = Es[(size_t)i];
-    int o0 = S.off[i], n = S.nobsAll[(size_t)i];
-    for (int j = 0; j < neta; ++j) S.ehatB(i, j) = ebes(i, j);
-    if (!E.ok) continue;                    // finite-differenced later; rows stay zero
-    S.aB.rows(o0, o0 + n - 1) = E.a;
-    S.aRB.rows(o0, o0 + n - 1) = E.aR;
-    S.AB.rows(o0, o0 + n - 1) = E.A;
-    S.ARB.rows(o0, o0 + n - 1) = E.AR;
-    S.fB.subvec(o0, o0 + n - 1) = E.f;
-    S.RB.subvec(o0, o0 + n - 1) = E.R;
-    if (nsg > 0) {
-      S.RsigB.rows(o0, o0 + n - 1) = E.Rsig;
-      S.RsigDirB.rows(o0, o0 + n - 1) = E.RsigDir;
-    }
-    rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(i));
-    // an observation count disagreement bails to R
-    if (gradPooledStackObs(E, ind, o0, n, nd, hasT, lamDir, S) != n) return false;
-  }
-  return true;
-}
-
-// The kernel, per subject.
-static void gradPooledKernelRun(const std::vector<VaeOuterE> &Es, const GradPooledStack &S,
-                                int nsub, int nd, int neta, int nth, int nsg, int nom,
-                                const arma::mat &Oi, const arma::cube &dOiEst,
-                                const arma::vec &tr28, const arma::ivec &dirTh,
-                                const arma::ivec &sigCol, int censOpt, int cores,
-                                arma::mat &gmat, arma::cube &etaPall) {
-  int kcores = cores; if (kcores < 1) kcores = 1;
-  nmForEachSubject(rx, nsub, kcores, kcores > 1, [&](int i) {
-    if (!Es[(size_t)i].ok) return;        // finite-differenced; leave the column zero
-    try {
-      int o0 = S.off[i], o1 = S.off[i + 1] - 1;
-      arma::mat ai = S.aB.rows(o0, o1), aRi = S.aRB.rows(o0, o1);
-      arma::cube Ai = S.AB.rows(o0, o1), ARi = S.ARB.rows(o0, o1);
-      arma::mat Rsigi = (nsg > 0) ? arma::mat(S.RsigB.rows(o0, o1)) : arma::mat(o1 - o0 + 1, 0);
-      arma::cube RsigDiri = (nsg > 0) ? arma::cube(S.RsigDirB.rows(o0, o1)) :
-        arma::cube(o1 - o0 + 1, nd, 0);
-      arma::mat dvi = S.hasLam ? arma::mat(S.dvSensB.rows(o0, o1)) : arma::mat(o1 - o0 + 1, 0);
-      arma::ivec censi = S.hasCens ? arma::ivec(S.censB.subvec(o0, o1)) : arma::ivec();
-      arma::vec limi = S.hasCens ? arma::vec(S.limB.subvec(o0, o1)) : arma::vec();
-      arma::vec gi; arma::mat etaPi;
-      foceiGradSubjectFR_(ai, Ai, aRi, ARi, Rsigi, RsigDiri, dvi, censi, limi, censOpt,
-                          S.fB.subvec(o0, o1), S.yB.subvec(o0, o1), S.RB.subvec(o0, o1),
-                          S.ehatB.row(i).t(), Oi, dOiEst, tr28,
-                          neta, nth, nsg, nom, dirTh, sigCol, gi, etaPi);
-      gmat.col(i) = gi; etaPall.slice(i) = etaPi;
-    } catch (...) {
-      gmat.col(i).fill(arma::datum::nan); etaPall.slice(i).fill(arma::datum::nan);
-    }
-  });
-}
-
-// Substitute the finite-differenced subjects.
-//
-// fd is full-theta indexed over the WHOLE parameter vector (theta block then omega
-// block); gmat is in the kernel's (nth, nsg, nom) slot order.  The two are not the same
-// space, so the scatter goes through both maps: optimizer parameter p sits in full-theta
-// slot fixedTrans[p] and in kernel slot gMap[p].  Substituting fd's column t straight
-// into gmat row t conflated them, and left the sigma/omega slots at zero besides.
-static bool gradPooledSubstituteFd(const std::vector<int> &flagged, NumericMatrix fd,
-                                   const FoceiGradPooledSetup &gcols, arma::mat &gmat) {
-  const int npAll = (int)foceiOuterFdN();
-  if ((int)gcols.gMap.size() != (int)op_focei.npars) return false;
-  for (int q = 0; q < (int)flagged.size(); ++q) {
-    int i = flagged[(size_t)q];
-    for (int p = 0; p < (int)op_focei.npars; ++p) {
-      int ks = gcols.gMap[(size_t)p], jf = op_focei.fixedTrans[p];
-      if (ks < 0 || ks >= (int)gmat.n_rows || jf < 0 || jf >= npAll) return false;
-      double v = fd(q, jf);
-      if (!R_finite(v)) return false;       // an un-differenced subject: fall back to R
-      gmat(ks, i) = v;
-    }
-  }
-  return true;
-}
-
-//' FOCEI analytic outer gradient, computed entirely in C++.
-//'
-//' Phase 8E.  Solves the augmented model in the shared pool, finite-differences the
-//' subjects whose solve failed, stacks the per-subject sensitivities and runs the
-//' gradient kernel -- without returning to R in between.
-//'
-//' The round trip this replaces was not just slow (the per-observation ndir^2 cubes A
-//' and AR are the bulk of the data and were materialized twice, once wrapped out of C++
-//' and once read back in); it also let R run between the solve and the assembly, where
-//' it could disturb the shared solve pool.  Keeping the whole sequence in one C++ region
-//' removes both.
-//'
-//' Returns R_NilValue when it cannot do the job, and the caller falls back to the
-//' rxSolve route.
-//' @param thVals theta values, in the augmented model's positional order
-//' @param ebes nsub x neta matrix of EBEs (the etas the gradient is taken at)
-//' @param cols augmented-model lhs column map from .foceiAnalyticCols
-//' @param cores thread count
-//' @param Oi Omega^-1
-//' @param dOiEst neta x neta x nom cube of estimation-scale Omega^-1 derivatives
-//' @param tr28 Omega log-determinant derivative terms (length nom)
-//' @param neta,nth,nsg,nom problem dimensions
-//' @param dirTh 1-based direction index per theta
-//' @param sigCol 1-based sigma column per residual parameter
-//' @param censOpt censoring determinant treatment (censOption)
-//' @param lamDir 1-based direction indices of estimated transform lambdas (may be empty)
-//' @return list(g, etaP, jacSum, fdIds) or NULL
-//' @noRd
-//[[Rcpp::export]]
-RObject foceiAnalyticGradPooled_(NumericVector thVals, NumericMatrix ebes, List cols,
-                                 int cores, arma::mat Oi, arma::cube dOiEst,
-                                 arma::vec tr28, int neta, int nth, int nsg, int nom,
-                                 arma::ivec dirTh, arma::ivec sigCol, int censOpt,
-                                 arma::ivec lamDir) {
-  if (odeSwapCanPool(odeSlotOuter) != odeDenyNone) return R_NilValue;
-  std::unique_ptr<OdeSwapEsBatch> _esBatch(new OdeSwapEsBatch(odeSlotOuter));
-  // The fit's tolerance, reset for this solve -- there is no separate analytic
-  // tolerance; see OdeFitTolGuard.
-  OdeFitTolGuard _tolGuard;
-  rx_solving_options *op = NULL;
-  int nsub = 0;
-  FoceiGradPooledSetup _gcols;
-  if (!analyticGradPooledReady(ebes, cols, neta, op, nsub, _gcols)) return R_NilValue;
-  const int nd = as<int>(cols["nd"]);
-  const bool hasT = as<bool>(cols["hasT"]);
-  std::vector<VaeOuterE> Es((size_t)nsub);
-  std::vector<double> _thv((size_t)thVals.size());
-  for (int t = 0; t < thVals.size(); ++t) _thv[(size_t)t] = thVals[t];
-  arma::mat _eb((unsigned int)ebes.nrow(), (unsigned int)ebes.ncol());
-  for (int r = 0; r < ebes.nrow(); ++r)
-    for (int c = 0; c < ebes.ncol(); ++c) _eb(r, c) = ebes(r, c);
-  outerSolveFill(odeSlotOuter, &rxVaeOuter, _thv, _eb, _gcols, cores, op, nsub, neta, Es);
-
-  std::vector<int> flagged;
-  NumericMatrix fd; IntegerVector fids;
-  if (!gradPooledFdFailed(Es, nsub, _esBatch, flagged, fd, fids)) return R_NilValue;
-
-  GradPooledStack S;
-  if (!gradPooledStackFill(Es, ebes, nsub, neta, nd, nsg, hasT, lamDir, S)) return R_NilValue;
-
-  const int np = nth + nsg + nom;
-  arma::mat gmat(np, nsub, arma::fill::zeros);
-  arma::cube etaPall(neta, np, nsub, arma::fill::zeros);
-  gradPooledKernelRun(Es, S, nsub, nd, neta, nth, nsg, nom, Oi, dOiEst, tr28,
-                      dirTh, sigCol, censOpt, cores, gmat, etaPall);
-  if (!gradPooledSubstituteFd(flagged, fd, _gcols, gmat)) return R_NilValue;
-  arma::vec g = arma::sum(gmat, 1);
-  return List::create(_["g"] = g, _["etaP"] = etaPall, _["jacSum"] = S.jacSum,
-                      _["fdIds"] = fids);
-}
-
 // ===========================================================================
 // Nonparametric (npag / npb) support: the conditional-likelihood primitive and
 // the Psi matrix builder.  A support point is an eta vector (each mu-referenced
@@ -19252,7 +19607,6 @@ double npMixCondLik(double *eta, int base, int nsub, int nMix);   // fwd (define
 // optimizer; consumed by npResidELS/npMixCondLik when op_focei.freezeOde is set.
 static std::vector<std::vector<double>> gNpResidCache;
 static int gNpResidNmix = 1;
-static int npIndSolveSize(rx_solving_options* op, rx_solving_options_ind* ind);  // fwd
 
 void npResidFreezeBuild(const arma::mat& postEta) {
   rx = getRxSolve_();
@@ -19490,6 +19844,10 @@ arma::ivec npBuildObsEndpoint(const std::vector<int>& endpointCmt) {
   int nUnmatched = 0;
   for (int i = 0; i < nsub; ++i) {
     rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(i));
+    // Read the covariate in the INNER model's basis, the one endpointCmt is numbered
+    // in: a larger pooled peer re-bases endpoint rows, and the raw value is then the
+    // pool's (grabRFmatFromInner reads under the same scope).
+    OdeSwapCmtScope _cmtScope(odeSlotInner, op, ind);
     int n = getIndNallTimes(ind);
     for (int j = 0; j < n; ++j) {
       int kk = getIndIx(ind, j);
@@ -19502,6 +19860,13 @@ arma::ivec npBuildObsEndpoint(const std::vector<int>& endpointCmt) {
   if (nUnmatched > 0) {
     Rf_warning("%d obs. match no endpoint, dropped from the residual warm start",
                nUnmatched);
+  }
+  // No observation row at all is not a legitimate outcome for a model with
+  // endpoints: it means the sorted event index was not populated yet (this was
+  // called before the first solve) and every row read as a dose.  Say so, since
+  // the silent form of this disabled the moment warm start for every fit (1118).
+  if (out.empty() && !endpointCmt.empty()) {
+    Rf_warning("residual endpoint map is empty (built before the first solve?); the per-endpoint moment warm start is skipped");
   }
   arma::ivec ret((arma::uword)out.size());
   for (size_t k = 0; k < out.size(); ++k) ret[k] = out[k];
@@ -19807,16 +20172,6 @@ void npBuildPsiCoreScaled(const arma::mat& etaPoints, int cores, double gamma,
   }
 }
 
-// ---------------------------------------------------------------------------
-// Residual-only re-evaluation cache (ODE-freeze).  During residual-parameter
-// optimization the ODE states are invariant (residual params only affect the
-// output f/r, not d/dt), so npFreezeBuild solves each (support point, subject)
-// once and caches the ind->solve trajectory; npFreezePsiScaled then rebuilds Psi
-// from the cached states through likInner0's freezeOde path -- calc_lhs recomputes
-// f/r with the current residual params, skipping the (costly) integration.
-static std::vector<std::vector<double> > gFreezeCache;  // [(k*nsub+base)*nMix + m] -> solve buffer
-static int gFreezeNsub = 0, gFreezeNpoint = 0, gFreezeNmix = 1;
-
 // log( sum_m mixProb(m) * exp(ll[m]) ); ll[] are the per-component conditional
 // log-likelihoods for one subject.  Identity for a single component.
 double impMixLogSumExp(const std::vector<double>& ll) {
@@ -19826,84 +20181,9 @@ double impMixLogSumExp(const std::vector<double>& ll) {
   return R_FINITE(r) ? r : R_NegInf;
 }
 
-static double npMixLogSumExp(const std::vector<double>& ll) {
-  return impMixLogSumExp(ll);
-}
-
 static int npIndSolveSize(rx_solving_options* op, rx_solving_options_ind* ind) {
   return (getOpNeq(op) + getOpNlin(op)) * getIndNallTimes(ind);
 }
-
-void npFreezeBuild(const arma::mat& etaPoints, int cores) {
-  rx = getRxSolve_();
-  rx_solving_options *op = getSolvingOptions(rx);
-  cores = min2(cores, getOpCores(op));
-  int nsub = (int)getRxNsub(rx);
-  int nMix = impNmix();
-  int nPoint = (int)etaPoints.n_rows;
-  int neta = (int)etaPoints.n_cols;
-  gFreezeNsub = nsub; gFreezeNpoint = nPoint; gFreezeNmix = nMix;
-  gFreezeCache.assign((size_t)nPoint * nsub * nMix, std::vector<double>());
-  op_focei.freezeOde = false;   // normal solves fill the cache
-  const bool doParallel = (cores > 1) && solveMethodThreadSafe(op);
-  if (doParallel) { sortIds(rx, 2); _innerParallel.store(1, std::memory_order_release); }
-  for (int k = 0; k < nPoint; ++k) {
-    std::vector<double> eta(neta);
-    for (int j = 0; j < neta; ++j) eta[j] = etaPoints(k, j);
-    nmForEachSubject(rx, nsub, cores, doParallel, [&](int base) {
-      // each mixture component's solve shares the physical subject's buffer, so
-      // solve + cache them serially per subject (parallel over subjects).
-      for (int m = 0; m < nMix; ++m) {
-        int id = base + m * nsub;
-        npEvalCondLik(&eta[0], id);   // normal solve, fills ind->solve
-        rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(id));
-        double *s = getIndSolve(ind);
-        gFreezeCache[((size_t)k * nsub + base) * nMix + m].assign(s, s + npIndSolveSize(op, ind));
-      }
-    });
-  }
-  if (doParallel) { _innerParallel.store(0, std::memory_order_release); sortIds(rx, 0); }
-}
-
-// Frozen counterpart of npBuildPsiCoreScaled at gamma == 1: restore each subject's
-// cached states, then re-evaluate the conditional likelihood without solving.
-void npFreezePsiScaled(const arma::mat& etaPoints, int cores, arma::mat& psi, double* offset) {
-  rx = getRxSolve_();
-  rx_solving_options *op = getSolvingOptions(rx);
-  cores = min2(cores, getOpCores(op));
-  int nsub = (int)getRxNsub(rx);
-  int nPoint = (int)etaPoints.n_rows;
-  int neta = (int)etaPoints.n_cols;
-  arma::mat lp(nsub, nPoint);
-  op_focei.freezeOde = true;    // reuse cached states; recompute f/r only
-  const bool doParallel = (cores > 1) && solveMethodThreadSafe(op);
-  if (doParallel) { sortIds(rx, 2); _innerParallel.store(1, std::memory_order_release); }
-  for (int k = 0; k < nPoint; ++k) {
-    std::vector<double> eta(neta);
-    for (int j = 0; j < neta; ++j) eta[j] = etaPoints(k, j);
-    nmForEachSubject(rx, nsub, cores, doParallel, [&](int base) {
-      std::vector<double> llm(gFreezeNmix);
-      for (int m = 0; m < gFreezeNmix; ++m) {
-        int id = base + m * nsub;
-        rx_solving_options_ind *ind = getSolvingOptionsInd(rx, getRxId(id));
-        const std::vector<double>& c = gFreezeCache[((size_t)k * nsub + base) * gFreezeNmix + m];
-        double *s = getIndSolve(ind);
-        std::copy(c.begin(), c.end(), s);            // restore cached states
-        llm[m] = npEvalCondLik(&eta[0], id);         // frozen: no integration
-      }
-      lp(base, k) = npMixLogSumExp(llm);             // mixture-marginalized
-    });
-  }
-  if (doParallel) { _innerParallel.store(0, std::memory_order_release); sortIds(rx, 0); }
-  op_focei.freezeOde = false;
-  arma::vec m = (nPoint > 0) ? arma::max(lp, 1) : arma::vec(nsub, arma::fill::zeros);
-  if (offset != nullptr) *offset = arma::accu(m);
-  psi.set_size(nsub, nPoint);
-  for (int k = 0; k < nPoint; ++k)
-    for (int i = 0; i < nsub; ++i) psi(i, k) = std::exp(lp(i, k) - m[i]);
-}
-
-void npFreezeClear() { gFreezeCache.clear(); gFreezeNsub = 0; gFreezeNpoint = 0; gFreezeNmix = 1; }
 
 //' Build the nonparametric Psi (conditional-likelihood) matrix
 //'
@@ -19972,7 +20252,6 @@ static std::vector<double> _vaeIpScaleC;
 static std::vector<int> _vaeIpXPar;
 static std::string _vaeIpPhase;
 
-//[[Rcpp::export]]
 RObject vaeIterPrintStart_(NumericVector initPar, CharacterVector names,
                            List iterPrintControl, RObject xform = R_NilValue) {
   int np = initPar.size();
@@ -20004,7 +20283,6 @@ RObject vaeIterPrintStart_(NumericVector initPar, CharacterVector names,
   return R_NilValue;
 }
 
-//[[Rcpp::export]]
 RObject vaeIterPrintRow_(NumericVector x, double f, std::string phase = "") {
   _vaeIpPhase = phase;
   _vaeScale.phaseLabel = _vaeIpPhase.empty() ? NULL : _vaeIpPhase.c_str();
@@ -20012,11 +20290,10 @@ RObject vaeIterPrintRow_(NumericVector x, double f, std::string phase = "") {
   return R_NilValue;
 }
 
-//[[Rcpp::export]]
 RObject vaeIterPrintGet_(bool printLine = true) {
   _vaeScale.save = 0;
   _vaeScale.every = 0;
-  if (printLine) scalePrintLine(&_vaeScale, min2(_vaeScale.npars, _vaeScale.ncol));
+  if (printLine) scalePrintLine(_vaeScale.showOfv, min2(_vaeScale.npars, _vaeScale.ncol));
   return scaleParHisDf(&_vaeScale);
 }
 
@@ -20097,7 +20374,7 @@ struct adviStatics {
   arma::umat omFixM;
 // saem's perNoCor rule: hold correlations at zero for the first _advi.nbCorrel
 // iterations so the variances settle first.  A file static rather than a loop
-// argument so the three adviLoop* .Call arities (and src/init.c) are untouched.
+// argument so the three adviLoop* signatures stay unchanged.
   int nbCorrel = 0;
 // ELBO convergence check (adviControl(tol=)); same file-static reasoning.
 // _advi.temper is set while a tempering warm-up is active -- a tempered ELBO is
@@ -20523,7 +20800,6 @@ List adviElboGrad_(NumericMatrix mu, NumericMatrix omega, NumericVector theta,
 // rho = etaScale * i^(-1/2+eps) / (tau + sqrt(s)).  Fixed thetas / omega diagonal
 // entries are held.  `it0` and the passed-in s-accumulators support warm resume
 // (continue a finished fit): global iteration index = it0 + local.
-//[[Rcpp::export]]
 List adviLoop_(NumericMatrix mu0, NumericMatrix omega0, NumericVector theta0,
                NumericVector logPopOmega0, IntegerVector muRefThetaIdx,
                IntegerVector thetaMuRefEta,
@@ -20807,7 +21083,6 @@ List adviElboGradFR_(NumericMatrix mu, NumericMatrix Lpack, NumericVector theta,
                       _["gTheta"] = gTheta, _["gPopLogOmega"] = gPopLogOmega);
 }
 
-//[[Rcpp::export]]
 List adviLoopFR_(NumericMatrix mu0, NumericMatrix Lpack0, NumericVector theta0,
                  NumericVector logPopOmega0, IntegerVector muRefThetaIdx,
                  IntegerVector thetaMuRefEta,
@@ -20969,7 +21244,6 @@ List adviLoopFR_(NumericMatrix mu0, NumericMatrix Lpack0, NumericVector theta0,
 // (the other is -1); phiMuRef[j] is the 0-based eta a mu-ref-theta phi recenters.
 // ===========================================================================
 
-//[[Rcpp::export]]
 List adviLoopFB_(NumericMatrix mu0, NumericMatrix scale0, NumericVector theta0,
                  NumericVector logPopOmega0, NumericVector mPop0, NumericVector LpopPack0,
                  IntegerVector phiThetaIdx, IntegerVector phiOmIdx, IntegerVector phiMuRef,
@@ -21774,23 +22048,6 @@ static bool foceiCondBatchParallel(int &cores, rx_solving_options *op) {
   return (cores > 1) && solveMethodThreadSafe(op);
 }
 
-// Per-thread rxode2 slot id around a subject's solve inside an external
-// OpenMP team (the cross-DLL libgomp fix, see innerOpt).
-static inline void foceiCondEnterThread(bool doParallel) {
-#ifdef _OPENMP
-  if (doParallel) setRxThreadId(omp_get_thread_num());
-#else
-  (void)doParallel;
-#endif
-}
-static inline void foceiCondLeaveThread(bool doParallel) {
-#ifdef _OPENMP
-  if (doParallel) setRxThreadId(-1);
-#else
-  (void)doParallel;
-#endif
-}
-
 // History-independence for one subject: defeat the eta memo and reset the
 // solve state to base (same discipline as adviElboGradCore), then copy the
 // subject's eta row out of the row-major input.
@@ -22077,7 +22334,7 @@ RObject foceiLikIterPrintEnd_() {
   if (!_foceiLikIterOn) return R_NilValue;
   scaling *s = &_foceiLikIterScale;
   s->save = 0;
-  if (_foceiLikIterEvery != 0) scalePrintLine(s, min2((int)s->npars, s->ncol));
+  if (_foceiLikIterEvery != 0) scalePrintLine(s->showOfv, min2((int)s->npars, s->ncol));
   RObject ph = scaleParHisDf(s);
   _foceiLikIterOn = false;
   _foceiLikIterEvery = 0;
@@ -22338,9 +22595,7 @@ IntegerVector foceiLikThetaSensIdxC_() {
 
 
 // ---------------------------------------------------------------------------
-// VAE training loop (est="vae"), fully in C++.  This is a straight port of the
-// former R orchestration (.vaeTrain / .vaeElboStepInner / .vaeMStep* /
-// .vaeUpdateErr / .vaeAdamStep in R/vaeFit.R + R/vaeInner.R): burn-in
+// VAE training loop (est="vae"), fully in C++: burn-in
 // (encoder-only, tiny KL) -> main EM (KL anneal + closed-form M-step, optional
 // BICc-ELBO covariate selection) -> EMA smoothing.  The heavy pieces it calls
 // are already C++: the LSTM encoder fwd/bwd (vaeEncoderFwdBwdCore), the parallel
@@ -25211,8 +25466,11 @@ List vaeTrainCpp_(List params, List prep, List control, int nMix, NumericVector 
       try {
         Rcpp::Environment nsG = Rcpp::Environment::namespace_env("nlmixr2est");
         Rcpp::Function gEval = nsG[".vaeGradEval"];
-        grR = gEval(NumericVector(thvG.begin(), thvG.end()), wrap(etaG),
-                    wrap(omFull()));
+        // held first: Function's argument list allocates while it is built
+        NumericVector thR(thvG.begin(), thvG.end());
+        RObject etaR = wrap(etaG);
+        RObject omR = wrap(omFull());
+        grR = gEval(thR, etaR, omR);
       } catch (Rcpp::internal::InterruptedException&) {
         throw;
       } catch (Rcpp::LongjumpException&) {
@@ -25623,14 +25881,9 @@ void saveIntoEnvironment(Environment e) {
   // nAGQ^neta*neta*2 doubles into R to write back what is already correct.
   arma::vec fullTheta(op_focei.fullTheta, op_focei.nFullThetaSave);
   e[".fullTheta"] = fullTheta;
-  // no eta
-  if (op_focei.neta == 0) {
-    arma::vec gthetaGrad(op_focei.fullTheta, op_focei.nFullThetaSave);
-    e[".gthetaGrad"] = gthetaGrad;
-  } else {
-    arma::vec etaUpper(op_focei.etaUpper, op_focei.etaBufferN);
-    e[".etaUpper"] = etaUpper;
-  }
+  // a theta reset needs etas (thetaReset0()), so there is always an eta buffer
+  arma::vec etaUpper(op_focei.etaUpper, op_focei.etaBufferN);
+  e[".etaUpper"] = etaUpper;
   arma::Col<int> gillRet(op_focei.gillRet, op_focei.nGillRet);
   e[".gillRet"] = gillRet;
   arma::vec gillDf(op_focei.gillDf, op_focei.nGillDf);
@@ -25647,29 +25900,33 @@ static inline void foceiCheckRestoreN(size_t saved, size_t expected, const char 
   }
 }
 
+// The restart after a theta reset keeps the first attempt's scaling (initPar,
+// scaleC), step searches and per-subject warm-start state, but starts where the
+// reset left off: foceiSetup_() has just installed the reset's thetas, omega and
+// etas (thetaIni, rxInv$theta and etaMat from R) and the bounds on their own
+// scale, which foceiOuter() scales.  So fullTheta|theta, the per-subject etas and
+// the bounds are not restored.
 void restoreFromEnvironment(Environment e) {
   arma::Col<int> etaTrans = e[".etaTrans"];
   foceiCheckRestoreN(etaTrans.n_elem, op_focei.nEtaTrans, "eta translation");
   std::copy(etaTrans.begin(), etaTrans.end(), op_focei.etaTrans);
   arma::vec fullTheta = e[".fullTheta"];
   foceiCheckRestoreN(fullTheta.n_elem, op_focei.nFullThetaSave, "theta");
-  std::copy(fullTheta.begin(), fullTheta.end(), op_focei.fullTheta);
-  // no eta
-  if (op_focei.neta == 0) {
-    arma::vec gthetaGrad = e[".gthetaGrad"];
-    foceiCheckRestoreN(gthetaGrad.n_elem, op_focei.nFullThetaSave, "theta gradient");
-    std::copy(gthetaGrad.begin(), gthetaGrad.end(), op_focei.fullTheta);
-  } else {
-    arma::vec etaUpper = e[".etaUpper"];
-    foceiCheckRestoreN(etaUpper.n_elem, op_focei.etaBufferN, "eta buffer");
-    std::copy(etaUpper.begin(), etaUpper.end(), op_focei.etaUpper);
-  }
+  size_t scaleOff = op_focei.initPar - op_focei.fullTheta;
+  std::copy(fullTheta.begin() + scaleOff, fullTheta.end(), op_focei.initPar);
+  arma::vec etaUpper = e[".etaUpper"];
+  foceiCheckRestoreN(etaUpper.n_elem, op_focei.etaBufferN, "eta buffer");
+  size_t etaOff = op_focei.geta - op_focei.etaUpper, etaEnd = etaOff + op_focei.gEtaGTransN;
+  std::copy(etaUpper.begin(), etaUpper.begin() + etaOff, op_focei.etaUpper);
+  std::copy(etaUpper.begin() + etaEnd, etaUpper.end(), op_focei.etaUpper + etaEnd);
   arma::Col<int> gillRet = e[".gillRet"];
   foceiCheckRestoreN(gillRet.n_elem, op_focei.nGillRet, "gill return code buffer");
   std::copy(gillRet.begin(), gillRet.end(), op_focei.gillRet);
   arma::vec gillDf = e[".gillDf"];
   foceiCheckRestoreN(gillDf.n_elem, op_focei.nGillDf, "gill forward difference buffer");
-  std::copy(gillDf.begin(), gillDf.end(), op_focei.gillDf);
+  size_t boundOff = op_focei.lower - op_focei.gillDf, boundEnd = boundOff + 2*(size_t)op_focei.npars;
+  std::copy(gillDf.begin(), gillDf.begin() + boundOff, op_focei.gillDf);
+  std::copy(gillDf.begin() + boundEnd, gillDf.end(), op_focei.gillDf + boundEnd);
 }
 
 struct FoceiHessianCall {
@@ -25753,7 +26010,7 @@ static void foceiHessianScale(FoceiHessianCall &d, const FoceiGradPooledSetup &g
   double scale = op_focei.scaleObjective == 2 ? op_focei.scaleObjectiveTo/op_focei.initObjective : 1;
   d.hessian.set_size(d.x.n_elem,d.x.n_elem);
   for (unsigned int j = 0; j < d.x.n_elem; ++j) for (unsigned int k = 0; k < d.x.n_elem; ++k)
-    d.hessian(j,k) = 2*scale*information(g.gMap[j],g.gMap[k])*dUnscaleParDx(j)*dUnscaleParDx(k);
+    d.hessian(j,k) = 2*scale*information(g.gMap[j],g.gMap[k])*scaleAdjustGradScale(&op_focei, 1.0, j)*scaleAdjustGradScale(&op_focei, 1.0, k);
   if (d.hessian.is_finite()) d.status = 0;
 }
 

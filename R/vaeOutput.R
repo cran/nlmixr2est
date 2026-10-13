@@ -65,7 +65,8 @@
 #' @noRd
 .vaeInjectCov <- function(line, thName, etaName, termsTxt) {
   .repl <- str2lang(paste0(thName, " + ", termsTxt))
-  .done <- FALSE
+  .state <- new.env(parent = emptyenv())
+  .state$done <- FALSE
   .isAdd <- function(e) is.call(e) && is.name(e[[1L]]) && as.character(e[[1L]]) %in% c("+", "-")
   ## names reachable through a flattened +/- chain
   .addVars <- function(e) {
@@ -78,11 +79,11 @@
     character(0)
   }
   .sub <- function(x) {
-    if (.done) {
+    if (.state$done) {
       return(x)
     }
     if (is.name(x) && identical(as.character(x), thName)) {
-      .done <<- TRUE
+      .state$done <- TRUE
       return(.repl)
     }
     if (.isAdd(x)) {
@@ -93,7 +94,7 @@
     x
   }
   .rec <- function(e) {
-    if (.done || !is.call(e)) {
+    if (.state$done || !is.call(e)) {
       return(e)
     }
     if (.isAdd(e)) {
@@ -106,7 +107,7 @@
     e
   }
   .out <- .rec(line)
-  if (!.done) NULL else .out
+  if (!.state$done) NULL else .out
 }
 
 #' Which shape to write for a selected covariate column
@@ -377,40 +378,26 @@
   rxode2::assertRxUi(ui2$fun)
 }
 
-#' Translate the vaeControl into the foceiControl that drives the output step:
-#' no outer/inner optimization (the VAE estimates and encoder etas are final),
-#' the VAE's chosen inner likelihood (focei -> interaction=1; foce/focep ->
-#' interaction=0, focep = FOCE+ with R at the live conditional eta), and the
-#' covMethod passed through so the focei covariance step ("analytic", "r,s",
-#' "r", "s", "") runs directly on the frozen problem.
+#' Translate the vaeControl into the VAE fit's foceiControl: no outer/inner
+#' optimization (the VAE estimates and encoder etas are final), the VAE's chosen
+#' inner likelihood (focei -> interaction=1; foce/focep -> interaction=0, focep =
+#' FOCE+ with R at the live conditional eta), and the requested covMethod
+#' ("analytic", "r,s", "r", "s", ""), which `.foceiInstallOwnEtaCov()` computes
+#' at the VAE estimates once the output step has run.
 #' @noRd
 .vaeControlToFoceiControl <- function(env, assign = TRUE) {
   .control <- env$vaeControl
-  .lik <- .control$likelihood
-  .interaction <- if (.lik %in% c("foce", "focep")) 0L else 1L
-  .foce <- if (identical(.lik, "focep")) "foce+" else "nonmem"
-  .fc <- foceiControl(
-    rxControl = .control$rxControl,
-    maxOuterIterations = 0L,
-    maxInnerIterations = 0L,
+  .fc <- .foceiOwnEtaControl(
+    .control,
+    env$etaMat,
     covMethod = .control$covMethod,
-    etaMat = env$etaMat,
-    interaction = .interaction,
-    foce = .foce,
-    sumProd = .control$sumProd,
-    optExpression = .control$optExpression,
+    likelihood = .control$likelihood,
     literalFix = .control$literalFix,
     literalFixRes = .control$literalFixRes,
-    addProp = .control$addProp,
-    calcTables = .control$calcTables,
-    compress = .control$compress,
-    ci = .control$ci,
-    sigdigTable = .control$sigdigTable,
     stickyRecalcN = .control$stickyRecalcN,
     maxOdeRecalc = .control$maxOdeRecalc,
     odeRecalcFactor = .control$odeRecalcFactor,
     indTolRelax = .control$indTolRelax,
-    eventSens = .control$eventSens,
     fast = FALSE, # no outer optimizer -- skip the outer gradient model
     print = 0L
   )
@@ -418,6 +405,12 @@
     env$control <- .fc
   }
   .fc
+}
+
+#' @export
+#' @rdname nmObjGetFoceiControl
+nmObjGetFoceiControl.vae <- function(x, ...) {
+  .vaeControlToFoceiControl(x[[1]], assign = FALSE)
 }
 
 #' Assemble the standard nlmixr2FitData from a trained VAE with
@@ -428,9 +421,9 @@
 #' likelihood wholesale: multiple endpoints, multiple error structures,
 #' log-likelihood, M2/M3/M4 censoring, and MIXTURE hard-assignment (nSub*nMix
 #' per-component solves via setIndMixest -> mixNum/mixList) -- none of which is
-#' reimplemented here. The covariance is computed by the focei covariance step
-#' itself (covMethod passed through .vaeControlToFoceiControl) and returned on
-#' the fit. The model is first updated with the selected covariate effects; the
+#' reimplemented here. The output step reports the FOCE objective at the encoder
+#' etas; the requested covariance is computed afterwards at the VAE estimates
+#' (.foceiInstallOwnEtaCov). The model is first updated with the selected covariate effects; the
 #' ORIGINAL (pre-covariate) ui is stashed in $iniDf0 for the iniUi/iniDf0
 #' accessors.
 #' @noRd
@@ -506,7 +499,10 @@
     .ret$parHistData <- fit$parHist
   }
   nmObjHandleControlObject(.control, .ret) # stores $vaeControl for nmObjGetControl.vae
-  .vaeControlToFoceiControl(.ret)
+  ## the output step evaluates the encoder etas only; the covariance it would
+  ## have computed there held them fixed (.foceiInstallOwnEtaCov, below)
+  .covControl <- .vaeControlToFoceiControl(.ret)
+  .ret$control$covMethod <- 0L
   ## ---- foreign-method output contract -------------------------------------
   ## `.ret` is a fresh env, so it carries none of the state the output builder
   ## needs.  Supply it the way an out-of-tree method must (the reference is
@@ -519,36 +515,12 @@
   if (!exists("dataSav", envir = .ret, inherits = FALSE)) {
     .foceiPreProcessData(env$data, .ret, .ui2, .ret$control$rxControl)
   }
-  .idf2 <- .ui2$iniDf
-  .etaU <- .idf2$name[!is.na(.idf2$neta1) & .idf2$neta1 == .idf2$neta2]
-  ## 1. fullTheta -- every non-eta ini() entry, already carrying the VAE estimates
-  ##    (.vaeUpdateModel wrote them into .ui2)
-  if (!exists("fullTheta", envir = .ret, inherits = FALSE)) {
-    .ret$fullTheta <- setNames(.idf2$est[is.na(.idf2$neta1)], .idf2$name[is.na(.idf2$neta1)])
-  }
-  ## 2. etaObf -- ID + one column per UI eta + OBJI, in eta order
-  if (!exists("etaObf", envir = .ret, inherits = FALSE)) {
-    .ids <- unique(.ret$dataSav$ID)
-    .em <- .etaMat[, intersect(.etaU, colnames(.etaMat)), drop = FALSE]
-    if (nrow(.em) == length(.ids)) {
-      .eo <- as.data.frame(.em)
-      .eo$ID <- .ids
-      .eo <- .eo[, c("ID", colnames(.em)), drop = FALSE]
-      .eo$OBJI <- NA_real_
-      .ret$etaObf <- .eo
-    }
-  }
-  ## 3. omega -- dimnamed by the UI eta names, from the updated iniDf: the VAE
-  ##    estimates the full modeled block (diagonal + declared off-diagonals);
-  ##    an occasion eta keeps whatever the model fixed it at
-  if (!exists("omega", envir = .ret, inherits = FALSE)) {
-    .om <- .omegaBlockFromIniDf(.idf2, .etaU)$mat
-    .om[!is.finite(.om)] <- 0
-    .ret$omega <- .om
-  }
-  ## 4/5. cov + objective are deliberately NOT set: the builder derives them from
-  ##      the FOCEi inner pass at the VAE estimates, which is how the VAE reports
-  ##      its objective today.  Setting them here would change every fit.
+  ## theta and omega are not supplied: .vaeUpdateModel wrote the estimates into
+  ## .ui2, which the builder reports.  etaObf is not supplied either: the FOCEi
+  ## pass writes it from the inner problem.
+  ## cov + objective are deliberately NOT set: the builder derives the
+  ##      objective from the inner pass at the VAE estimates, which is how the VAE
+  ##      reports its objective today, and the covariance comes after it.
   ## 6. remaining metadata ($method/$extra/$est set above)
   if (!exists("message", envir = .ret, inherits = FALSE)) {
     .ret$message <- ""
@@ -575,5 +547,6 @@
   .e <- .fit$env
   .origUi <- if (!is.null(env$nlmixrPureInputUi)) env$nlmixrPureInputUi else .ui
   .e$iniDf0 <- rxode2::rxUiCompress(rxode2::rxUiDecompress(.origUi))
+  .foceiInstallOwnEtaCov(.fit, .covControl)
   .fit
 }

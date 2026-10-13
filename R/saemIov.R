@@ -280,14 +280,6 @@
 #' @noRd
 .saemIovIsCmp <- function(o) is.call(o) && identical(o[[1]], quote(`==`))
 
-#' Is this expression one of the model's diagonal etas?
-#'
-#' @param o language object
-#' @param etas names of the model's diagonal etas
-#' @return logical
-#' @noRd
-.saemIovIsEta <- function(o, etas) is.name(o) && as.character(o) %in% etas
-
 #' The eta of an `(occ == level) * eta` term
 #'
 #' @param term language object, one term of a `+` chain
@@ -936,6 +928,8 @@ preProcessHooksAdd(".uiApplyIovTwoLevel", .uiApplyIovTwoLevel)
     .parts <- .saemIovCollapsedParts(.om, ret$env$fixef, .info)
     .saemIovRestoreUi(ret$env, .info, .parts)
     .saemIovRestoreEst(ret$env, .info, .parts)
+    # the occasion etas are saem's own, not the rewrite's (nmObjGet.etaMat())
+    assign("iovNative", "collapsed", envir = ret$env)
   }
   if (inherits(ret, "data.frame")) {
     .w <- which(grepl("^rx[.]", names(ret)))

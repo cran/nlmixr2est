@@ -4,9 +4,13 @@
 #' @inheritParams stats::nlminb
 #' @inheritParams foceiControl
 #' @inheritParams saemControl
-#' @param covMethod Method for calculating the covariance.  \code{"r"} (the
-#'   default) uses nlmixr2's \code{nlmixr2Hess()} Hessian; \code{"nlminb"} uses
-#'   the optimizer's own Hessian; \code{""} skips the covariance step.
+#' @param covMethod Method for calculating the covariance.  \code{"r"} uses
+#'   nlmixr2's \code{nlmixr2Hess()} Hessian; \code{"nlminb"} uses central
+#'   differences of the analytic gradient at the final estimates, as
+#'   \code{nlmControl(covMethod = "nlm")} does; it needs
+#'   \code{solveType = "hessian"} or \code{"grad"}.  The default is
+#'   \code{"nlminb"} with \code{solveType = "hessian"} and \code{"r"}
+#'   otherwise.  \code{""} skips the covariance step.
 #' @param returnNlminb logical; when TRUE this will return the nlminb
 #'   result instead of the nlmixr2 fit object
 #' @param eval.max Maximum number of evaluations of the objective
@@ -158,17 +162,14 @@ nlminbControl <- function(
   checkmate::assertLogical(compress, len = 1, any.missing = TRUE)
   checkmate::assertLogical(adjObf, len = 1, any.missing = TRUE)
 
-  .solveTypeIdx <- c("hessian" = 3L, "grad" = 2L, "fun" = 1L)
-  if (checkmate::testIntegerish(solveType, len = 1, lower = 1, upper = 6, any.missing = FALSE)) {
-    solveType <- as.integer(solveType)
-  } else {
-    solveType <- setNames(.solveTypeIdx[match.arg(solveType)], NULL)
-  }
+  solveType <- .nlmCtlCode(solveType, c("hessian" = 3L, "grad" = 2L, "fun" = 1L), "solveType")
 
-  if (missing(covMethod) && any(solveType == 2:3)) {
+  # the Hessian a "hessian" fit already computes at the estimates, as nlmControl()
+  # uses nlm's own
+  if (missing(covMethod) && solveType == 3L) {
     covMethod <- "nlminb"
   } else {
-    covMethod <- match.arg(covMethod)
+    covMethod <- .nlmCtlCovMethod(covMethod, match.arg(covMethod))
   }
   if (covMethod == "nlminb" && !any(solveType == 2:3)) {
     warning(
@@ -178,22 +179,11 @@ nlminbControl <- function(
     covMethod <- "r"
   }
 
-  .eventTypeIdx <- c("central" = 2L, "forward" = 1L)
-  if (checkmate::testIntegerish(eventType, len = 1, lower = 1, upper = 6, any.missing = FALSE)) {
-    eventType <- as.integer(eventType)
-  } else {
-    eventType <- setNames(.eventTypeIdx[match.arg(eventType)], NULL)
-  }
+  eventType <- .nlmCtlCode(eventType, c("central" = 2L, "forward" = 1L), "eventType")
+  optimHessType <- .nlmCtlCode(optimHessType, c("central" = 2L, "forward" = 1L), "optimHessType")
 
-  .optimHessTypeIdx <- c("central" = 2L, "forward" = 1L)
-  if (checkmate::testIntegerish(optimHessType, len = 1, lower = 1, upper = 6, any.missing = FALSE)) {
-    optimHessType <- as.integer(optimHessType)
-  } else {
-    optimHessType <- setNames(.optimHessTypeIdx[match.arg(optimHessType)], NULL)
-  }
-
-  checkmate::assertNumeric(shiErr, lower = 0, any.missing = FALSE, len = 1)
-  checkmate::assertNumeric(hessErr, lower = 0, any.missing = FALSE, len = 1)
+  .assertPositiveEps(shiErr)
+  .assertPositiveEps(hessErr)
 
   checkmate::assertIntegerish(shi21maxFD, lower = 1, any.missing = FALSE, len = 1)
   checkmate::assertIntegerish(shi21maxHess, lower = 1, any.missing = FALSE, len = 1)
@@ -243,19 +233,9 @@ nlminbControl <- function(
     useColor = useColor,
     iterPrintControl = .xtra$iterPrintControl
   )
-  if (checkmate::testIntegerish(scaleType, len = 1, lower = 1, upper = 4, any.missing = FALSE)) {
-    scaleType <- as.integer(scaleType)
-  } else {
-    .scaleTypeIdx <- c("norm" = 1L, "nlmixr2" = 2L, "mult" = 3L, "multAdd" = 4L)
-    scaleType <- setNames(.scaleTypeIdx[match.arg(scaleType)], NULL)
-  }
+  scaleType <- .ctlIdx(scaleType, .scaleTypeIdx, match.arg(scaleType))
 
-  .normTypeIdx <- c("rescale2" = 1L, "rescale" = 2L, "mean" = 3L, "std" = 4L, "len" = 5L, "constant" = 6L)
-  if (checkmate::testIntegerish(normType, len = 1, lower = 1, upper = 6, any.missing = FALSE)) {
-    normType <- as.integer(normType)
-  } else {
-    normType <- setNames(.normTypeIdx[match.arg(normType)], NULL)
-  }
+  normType <- .ctlIdx(normType, .normTypeIdx, match.arg(normType))
   checkmate::assertNumeric(scaleCmax, lower = 0, any.missing = FALSE, len = 1)
   checkmate::assertNumeric(scaleCmin, lower = 0, any.missing = FALSE, len = 1)
   if (!is.null(scaleC)) {
@@ -325,9 +305,14 @@ nlminbControl <- function(
 
 #' @export
 rxUiDeparse.nlminbControl <- function(object, var) {
+  # covMethod's default follows solveType, so compare it with the default for the
+  # object's own solveType
   .default <- nlminbControl()
-  .w <- .deparseDifferent(.default, object, "genRxControl")
-  .deparseFinal(.default, object, .w, var)
+  .st <- tryCatch(nlminbControl(solveType = object$solveType)$covMethod, error = function(e) NULL)
+  if (!is.null(.st)) {
+    .default$covMethod <- .st
+  }
+  .deparseControl(object, var, .default)
 }
 
 #' A surrogate function for nlminb to call for ode solving
@@ -366,43 +351,15 @@ rxUiDeparse.nlminbControl <- function(object, var) {
 
 #' @rdname nmObjHandleControlObject
 #' @export
-nmObjHandleControlObject.nlminbControl <- function(control, env) {
-  assign("nlminbControl", control, envir = env)
-}
+nmObjHandleControlObject.nlminbControl <- function(control, env) assign("nlminbControl", control, envir = env)
 
 #' @rdname nmObjGetControl
 #' @export
-nmObjGetControl.nlminb <- function(x, ...) {
-  .env <- x[[1]]
-  if (exists("nlminbControl", .env, inherits = FALSE)) {
-    .control <- get("nlminbControl", .env, inherits = FALSE)
-    if (inherits(.control, "nlminbControl")) return(.control)
-  }
-  if (exists("control", .env, inherits = FALSE)) {
-    .control <- get("control", .env, inherits = FALSE)
-    if (inherits(.control, "nlminbControl")) return(.control)
-  }
-  stop("cannot find nlminb related control object", call. = FALSE)
-}
+nmObjGetControl.nlminb <- function(x, ...) .nmObjGetControlByClass(x, "nlminbControl")
 
 #' @rdname getValidNlmixrControl
 #' @export
-getValidNlmixrCtl.nlminb <- function(control) {
-  .ctl <- control[[1]]
-  if (is.null(.ctl)) {
-    .ctl <- nlminbControl()
-  }
-  if (is.null(attr(.ctl, "class")) && is(.ctl, "list")) {
-    .ctl <- do.call("nlminbControl", .ctl)
-  }
-  if (!inherits(.ctl, "nlminbControl")) {
-    .minfo("invalid control for `est=\"nlminb\"`, using default")
-    .ctl <- nlminbControl()
-  } else {
-    .ctl <- do.call(nlminbControl, .ctl)
-  }
-  .ctl
-}
+getValidNlmixrCtl.nlminb <- function(control) .getValidCtl(control, "nlminbControl", "nlminb")
 
 .nlminbFitModel <- function(ui, dataSav) {
   # Use nlmEnv and function for DRY principle
@@ -482,62 +439,14 @@ getValidNlmixrCtl.nlminb <- function(control) {
     }
   }
   .ret <- eval(.ret)
+  if (.ctl$covMethod == "nlminb") {
+    .ret$hessian <- .nlmGradHessian(.ret$par)
+  }
   .nlmFinalizeList(.env, .ret, par = "par", printLine = TRUE, hessianCov = TRUE)
 }
 
-#' Get the full theta for nlminb methods
-#'
-#' @param nlm enhanced nlminb return
-#' @param ui ui object
-#' @return named theta matrix
-#' @author Matthew L. Fidler
-#' @noRd
-.nlminbGetTheta <- function(nlm, ui) {
-  .iniDf <- ui$iniDf
-  setNames(
-    vapply(
-      seq_along(.iniDf$name),
-      function(i) {
-        if (.iniDf$fix[i]) {
-          .iniDf$est[i]
-        } else {
-          nlm$par[.iniDf$name[i]]
-        }
-      },
-      double(1),
-      USE.NAMES = FALSE
-    ),
-    .iniDf$name
-  )
-}
 .nlminbControlToFoceiControl <- function(env, assign = TRUE) {
-  .nlminbControl <- env$nlminbControl
-  .ui <- env$ui
-  .foceiControl <- foceiControl(
-    rxControl = env$nlminbControl$rxControl,
-    maxOuterIterations = 0L,
-    maxInnerIterations = 0L,
-    covMethod = 0L,
-    sumProd = .nlminbControl$sumProd,
-    optExpression = .nlminbControl$optExpression,
-    literalFix = .nlminbControl$literalFix,
-    literalFixRes = .nlminbControl$literalFixRes,
-    scaleTo = 0,
-    calcTables = .nlminbControl$calcTables,
-    addProp = .nlminbControl$addProp,
-    #skipCov=.ui$foceiSkipCov,
-    interaction = 0L,
-    compress = .nlminbControl$compress,
-    ci = .nlminbControl$ci,
-    sigdigTable = .nlminbControl$sigdigTable,
-    indTolRelax = .nlminbControl$indTolRelax,
-    eventSens = .nlminbControl$eventSens,
-    sensMethod = .nlminbControl$sensMethod
-  )
-  if (assign) {
-    env$control <- .foceiControl
-  }
-  .foceiControl
+  .nlmFamilyControlToFoceiControl(env, "nlminbControl", assign)
 }
 
 .nlminbFamilyFit <- function(env, ...) {
@@ -545,8 +454,8 @@ getValidNlmixrCtl.nlminb <- function(control) {
     env,
     "nlminb",
     .nlminbFitModel,
-    .nlminbGetTheta,
-    objective = function(.fit) 2 * as.numeric(.fit$objective),
+    "par",
+    objective = "objective",
     controlToFocei = .nlminbControlToFoceiControl,
     returnFlag = "returnNlminb"
   )
